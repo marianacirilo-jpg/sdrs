@@ -1,0 +1,20 @@
+{
+  "61311998549": {
+    "status": "pendente_claude",
+    "company": "Esquadrias Brasil Grupo Dom",
+    "generatedAt": "2026-06-26T19:16:00.211758+00:00",
+    "summary": "Investigação profunda ainda pendente. Usar as hipóteses abaixo até o Claude preencher a pesquisa com fontes.",
+    "hypotheses": [
+      "Contexto ainda fraco. Começar por segmento, cliente comprador, volume/recorrência, ERP, tabela por cliente e forma atual de pedido."
+    ],
+    "questions": [
+      "Qual ERP está em uso e quais regras comerciais ele concentra?",
+      "Quem compra hoje: revenda, lojista, indústria, franqueado ou consumidor corporativo?",
+      "Pedido nasce no WhatsApp, planilha, ligação, vendedor externo ou portal?",
+      "Há tabela de preço por cliente, condição de pagamento por grupo e limite de crédito?",
+      "Quais produtos têm recorrência e quais itens precisam aparecer na demo?"
+    ],
+    "claudePrompt": "Investigue a fundo a empresa Esquadrias Brasil Grupo Dom para uma apresentação comercial Zydon B2B: segmento, tipo de cliente comprador, canais de venda, recorrência/giro, provável ERP, dores de pedido por WhatsApp/tabela/preço, hipótese de demo e perguntas de diagnóstico. Não invente: se não achar fonte, marque como hipótese.",
+    "sources": []
+  }
+}

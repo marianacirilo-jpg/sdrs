@@ -1,0 +1,606 @@
+{
+  "envios": [
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+55318714-2102",
+      "text": "Boa noite, Sandro. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Paregesso Colamill — digitalização com Bling é imediata.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+5511947910266",
+      "text": "Boa noite, Cavalcante. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Master Hotelaria — se usar Olist/Tiny, conexão imediata.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+553599480860",
+      "text": "Boa noite, Eriksen. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Legadu Social — se usar Olist/Tiny, conexão imediata.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+5521997848224",
+      "text": "Boa noite, Eduardo. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Mercato — digitalização como trunfo competitivo.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+5527999205730",
+      "text": "Boa noite, Diogo. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Zimermann — operação com escala e ERP sob projeto.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+5511971840319",
+      "text": "Boa noite, Guilherme. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Sharp — pedidos desorganizados são oportunidade digital.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+5511991682560",
+      "text": "Boa noite, Ricardo. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Plásticos Piracicaba — digitalizar remove desperdício de tempo do comercial.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+5511976343617",
+      "text": "Boa noite, Nathalia. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Resoma Professional — checkout 24/7 eleva recompra.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:00",
+      "to": "+558599121111",
+      "text": "Boa noite, Alexandre. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Plastsan — digitalizar reduz dependência de poucos clientes grandes.",
+      "status": "sent"
+    },
+    {
+      "date": "2026-06-21 21:43",
+      "to": "558399806032@c.us",
+      "slug": "clima-sub",
+      "text": "Boa noite, Clima. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Clima Sub — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:43",
+      "to": "5511988235731@c.us",
+      "slug": "rank-rank-com-rcio-ltda",
+      "text": "Boa noite, Alex. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Rank Rank Comércio ltda — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:43",
+      "to": "5511967784019@c.us",
+      "slug": "s-o-paulo",
+      "text": "Boa noite, Mauricio. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da São Paulo — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:44",
+      "to": "5521988874011@c.us",
+      "slug": "marck-suprimentos",
+      "text": "Boa noite, André. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Marck Suprimentos — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:44",
+      "to": "5511977359380@c.us",
+      "slug": "glassway",
+      "text": "Boa noite, Fabio. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Glassway — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:44",
+      "to": "5511982028007@c.us",
+      "slug": "neogrid",
+      "text": "Boa noite, Robson. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Neogrid — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:44",
+      "to": "5512996381629@c.us",
+      "slug": "rct-soldas",
+      "text": "Boa noite, Washington. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da RCT Soldas — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-21 21:44",
+      "to": "5518996047656@c.us",
+      "slug": "topcolors",
+      "text": "Boa noite, Tiago. Aqui é a Mariana, da Zydon.\n\npreparei o diagnóstico da Topcolors — se usar Bling, Omie, Olist ou Sankhya, conexão imediata.",
+      "text_status": "ok",
+      "pdf_status": "ok"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "neogrid",
+      "email": "robson.munhoz@neogrid.com",
+      "to": "5511982028007@c.us",
+      "nome": "Robson Munhoz",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "mercato",
+      "email": "eduardo@globotechweb.com.br",
+      "to": "5521997848224@c.us",
+      "nome": "Eduardo Rebelo",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "legadu-social",
+      "email": "vendas@legadusocial.com.br",
+      "to": "5535999480860@c.us",
+      "nome": "Eriksen Picheli",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "onixxbrasil",
+      "email": "cristiano@onixxbrasil.com.br",
+      "to": "5516992091169@c.us",
+      "nome": "Cristiano Teixeira Mendes",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "grupo-american-pool",
+      "email": "atendimento@usapool.com.br",
+      "to": "5511964204759@c.us",
+      "nome": "Ricardo Lima",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "arumia-house",
+      "email": "contato@arumia.com.br",
+      "to": "5511964144885@c.us",
+      "nome": "Jung Mo Ahn",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "plasticos-piracicaba",
+      "email": "ricardo@plasticospiracicaba.com.br",
+      "to": "5519991682560@c.us",
+      "nome": "Ricardo Gianotti",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "rct-soldas",
+      "email": "contato@rctaubate.com.br",
+      "to": "5512996381629@c.us",
+      "nome": "Washington S",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "dona-parede",
+      "email": "ceo@donaparede.com",
+      "to": "551999717341@c.us",
+      "nome": "Camila Amim Parizani",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "zimermann",
+      "email": "diogo@grupozimermann.com",
+      "to": "5527999205730@c.us",
+      "nome": "Diogo Zimermann",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "dussara",
+      "email": "rafa.silveira01@dussara.com.br",
+      "to": "5511920040718@c.us",
+      "nome": "Rafaela Silveira",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22 02:02",
+      "slug": "gift-do-brasil",
+      "email": "nilson@oralgift.com",
+      "to": "5541999879119@c.us",
+      "nome": "Nilson Souza",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T02:33:32Z",
+      "slug": "bodebrown",
+      "email": "alexandr.spier@bodebrown.com.br",
+      "to": "5541999604442@s.whatsapp.net",
+      "nome": "Alexandre Spier",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T02:33:32Z",
+      "slug": "avetextil",
+      "email": "amanda@avetextil.com.br",
+      "to": "5548991744106@s.whatsapp.net",
+      "nome": "Amanda",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T10:38:26Z",
+      "slug": "pontes-multi",
+      "email": "raphael@pontesmulti.com.br",
+      "to": "5521982170983@c.us",
+      "nome": "Raphael Pontes",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead",
+      "mql": true,
+      "erp": "Omie",
+      "segmento": "industria/distribuicao-alimentos"
+    },
+    {
+      "date": "2026-06-22T10:38:26Z",
+      "slug": "madeira-abc",
+      "email": "joao@madeiraabc.com.br",
+      "to": "5511973318421@c.us",
+      "nome": "Joao Dangelo",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead",
+      "mql": true,
+      "erp": "Bling",
+      "segmento": "distribuidor-madeiras"
+    },
+    {
+      "date": "2026-06-22T10:52:35Z",
+      "slug": "tetraplus",
+      "email": "leonardo.menezes@tetraplus.com.br",
+      "to": "5531993699000@s.whatsapp.net",
+      "nome": "Leonardo",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T10:52:35Z",
+      "slug": "pontes-multi",
+      "email": "raphael@pontesmulti.com.br",
+      "to": "5521982170983@s.whatsapp.net",
+      "nome": "Raphael",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T10:52:35Z",
+      "slug": "madeira-abc",
+      "email": "joao@madeiraabc.com.br",
+      "to": "5511973318421@s.whatsapp.net",
+      "nome": "Joao",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T10:52:35Z",
+      "slug": "brightgear",
+      "email": "daniel.haberer@brightgearcorp.com",
+      "to": "5511981228818@s.whatsapp.net",
+      "nome": "Daniel",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T10:52:35Z",
+      "slug": "zooz",
+      "email": "daniel.haberer@zoozpets.com",
+      "to": "5511981228818@s.whatsapp.net",
+      "nome": "Daniel",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T10:57:29Z",
+      "slug": "ib-silva",
+      "email": "vando.barbosa@guiafornecedoresic.com.br",
+      "to": "grupo",
+      "status": "nao_mql_grupo"
+    },
+    {
+      "date": "2026-06-22T11:15:25Z",
+      "slug": "airtudo",
+      "email": "airtudo@airtudo.com",
+      "to": "5571992870953@s.whatsapp.net",
+      "nome": "Vagner Santos",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "slug": "disfrio",
+      "email": "ecommerce@disfrio.com.br",
+      "jid": "5548999220826@c.us",
+      "grupo": "120363408131718880@g.us",
+      "status": "enviado_mql",
+      "mql": true,
+      "ts": "2026-06-22T11:36:23Z",
+      "nome": "Alexsander",
+      "erp": "Outro",
+      "segmento": "distribuidor"
+    },
+    {
+      "slug": "smec",
+      "email": "smec@smeciramaia.com.br",
+      "grupo": "120363408131718880@g.us",
+      "status": "nao_mql_grupo",
+      "mql": false,
+      "ts": "2026-06-22T11:36:23Z",
+      "motivo": "varejo fora ICP"
+    },
+    {
+      "slug": "nitro",
+      "email": "deividbm21@nitro.com",
+      "grupo": "120363408131718880@g.us",
+      "status": "nao_mql_grupo",
+      "mql": false,
+      "ts": "2026-06-22T11:36:23Z",
+      "motivo": "form incompleto"
+    },
+    {
+      "date": "2026-06-22T11:46:30Z",
+      "slug": "caffeine-army",
+      "email": "amanda.borges@caffeinearmy.com.br",
+      "to": "5571993247570@s.whatsapp.net",
+      "nome": "Amanda Borges",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T13:16:44Z",
+      "email": "vendas@copperbras.com.br",
+      "grupo": "120363408131718880@g.us",
+      "status": "nao_mql_grupo",
+      "mql": false,
+      "ts": "2026-06-22T13:16:44Z"
+    },
+    {
+      "date": "2026-06-22T13:16:44Z",
+      "email": "lorini@premiercom.com.br",
+      "grupo": "120363408131718880@g.us",
+      "status": "nao_mql_grupo",
+      "mql": false,
+      "ts": "2026-06-22T13:16:44Z"
+    },
+    {
+      "date": "2026-06-22T13:33:09Z",
+      "slug": "copperbras",
+      "email": "vendas@copperbras.com.br",
+      "to": "5532987070005@s.whatsapp.net",
+      "nome": "Leonardo Schmidt",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T14:47:25Z",
+      "slug": "dr-farol",
+      "email": "caio@drfarol.com.br",
+      "to": "5516991417176@c.us",
+      "nome": "Caio Teixeira",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T14:47:25Z",
+      "slug": "el-bando",
+      "email": "bressan@elbando.com.br",
+      "to": "5561984011486@c.us",
+      "nome": "Flávio Bressan",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T16:07:11Z",
+      "slug": "brotitos-alimentos",
+      "email": "williamalmeida@brotitos.com.br",
+      "to": "5531985247783@c.us",
+      "nome": "William Almeida",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T16:07:11Z",
+      "slug": "retifica-fronza",
+      "email": "compras@retificafronza.com.br",
+      "to": "5548998640038@c.us",
+      "nome": "Vitor",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T17:27:29Z",
+      "slug": "dl-distribuidora",
+      "email": "dldistripecas@dl.com.br",
+      "to": "5581984619957@s.whatsapp.net",
+      "nome": "Daniel Pessoa",
+      "empresa": "DL Distribuidora",
+      "erp": "Bling",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "text_messageId": "3EB08C2145293EBE817540",
+      "pdf_messageId": "3EB0CEF2E31085C44828E7",
+      "group_text_messageId": "3EB0839221D0DD47E9BEB9",
+      "group_pdf_messageId": "3EB0E884AA1678D1C0F9D3",
+      "status": "enviado_lead"
+    },
+    {
+      "date": "2026-06-22T17:53:38Z",
+      "lead": "american-steel",
+      "email": "contato@americansteelincorporation.com.br",
+      "lead_jid": "5531985550860@s.whatsapp.net",
+      "group_jid": "120363408131718880@g.us",
+      "lead_text_status": "sent",
+      "lead_text_messageId": "3EB0C21D5ED7F4175B788C",
+      "lead_pdf_status": "sent",
+      "lead_pdf_messageId": "3EB077A021948E5BAC9033",
+      "group_mirror_status": "FAILED - bridge session lost (auth_info_multi cleared after restart)",
+      "pdf_path": "pdfs/Potencial-Digitalizacao-american-steel.pdf",
+      "notes": "Bridge QR rescan needed. Lead received content before bridge broke."
+    },
+    {
+      "email": "tadeu@intelbam.com.br",
+      "empresa": "Intelbam",
+      "nome": "Luiz Tadeu",
+      "telefone": "5593991224022",
+      "status": "nao_mql_grupo",
+      "motivo": "Fora do ICP: integradora de serviços de TI/telecom, não é atacado/distribuição/indústria",
+      "data": "2026-06-22T18:47:58.402049Z",
+      "porta": 4600,
+      "conta": "553484255965"
+    },
+    {
+      "email": "conforto@chinelosconforto.com.br",
+      "empresa": "Pantufas & Cia",
+      "nome": "PANTUFAS & CIA",
+      "telefone": "5511942833845",
+      "status": "enviado_lead",
+      "data": "2026-06-22T19:00:04.285569+00:00",
+      "porta": 4600,
+      "conta": "553484255965",
+      "messageId_texto": "3EB073DE9A9CB38FC59B41",
+      "messageId_pdf": "3EB0A8D675423A75ABF764",
+      "note": "Telefone do HubSpot era fixo (1146938070). WhatsApp pesquisado no site: 5511942833845"
+    },
+    {
+      "email": "moises.gil@sustenpack.com.br",
+      "empresa": "Sustenpack",
+      "nome": "Moises Gil",
+      "telefone": "5511987555583",
+      "status": "enviado_lead",
+      "data": "2026-06-22T20:31:33Z",
+      "porta": 4600,
+      "conta": "553484255965",
+      "messageId_texto": "3EB0AC3372497BF6431924D",
+      "messageId_pdf": "3EB042C08DA17E1205854D",
+      "createdate": "2026-06-22T19:49:31Z",
+      "grupo": "120363408131718880@g.us"
+    },
+    {
+      "email": "comercial@lightshipembalagens.com.br",
+      "slug": "lightship-embalagens",
+      "lead_id": "230392474240",
+      "status": "enviado_lead",
+      "tel": "5511982867609",
+      "jid": "5511982867609@s.whatsapp.net",
+      "text_messageId": "3EB07B551E9530DEE04D90",
+      "pdf_messageId": "3EB0B1808C7B3EC65B3B55",
+      "enviado_em": "2026-06-22T20:42:48.718233+00:00",
+      "empresa": "LightShip Embalagens",
+      "contato": "Eduardo"
+    },
+    {
+      "date": "2026-06-22 20:50",
+      "slug": "sustenpack",
+      "email": "moises.gil@sustenpack.com.br",
+      "to": "5511994045828@c.us",
+      "nome": "Moises Gil",
+      "empresa": "Sustenpack",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead",
+      "porta": 4600
+    },
+    {
+      "date": "2026-06-22 20:50",
+      "slug": "plasthome",
+      "email": "comercial@plasthome.com.br",
+      "to": "5519997635591@c.us",
+      "nome": "Paulo Granussio",
+      "empresa": "Plasthome",
+      "text_status": "ok",
+      "pdf_status": "ok",
+      "status": "enviado_lead",
+      "porta": 4600
+    },
+    {
+      "email": "bruno@kwalifyacademy.com",
+      "slug": "kwalify-academy",
+      "empresa": "Kwalify Academy",
+      "nome": "Bruno Oliveira",
+      "tel": "61995945005",
+      "data": "2026-06-22 21:02",
+      "createdate": "2026-06-22T20:56:27.228Z",
+      "status": "nao_mql_grupo",
+      "motivo": "fora do ICP - educacao/servicos (nao atacado/distribuidor/industria); form sem dados",
+      "deal_id": "61438394430",
+      "contact_id": "230414095968",
+      "mql": false
+    },
+    {
+      "date": "2026-06-23 00:35",
+      "to": "5521972011406@c.us",
+      "slug": "editora-reinante",
+      "sdr": "Sarah",
+      "status": "enviado"
+    },
+    {
+      "date": "2026-06-23 00:35",
+      "to": "5548996169983@c.us",
+      "slug": "libera-pro",
+      "sdr": "Breno",
+      "status": "enviado"
+    },
+    {
+      "date": "2026-06-23 00:35",
+      "to": "5544999443183@c.us",
+      "slug": "coop-caixas-sul",
+      "sdr": "Mariana",
+      "status": "enviado"
+    },
+    {
+      "date": "2026-06-23 00:35",
+      "to": "5534991068253@c.us",
+      "slug": "reptec",
+      "sdr": "Lucas",
+      "status": "enviado"
+    }
+  ]
+}

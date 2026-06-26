@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Mini-channel WhatsApp multi-SDR Zydon.
+
+Painel responsivo com visão por usuário, conversas por chip e resposta de texto.
+Lê históricos gerados pelo /root/.hermes/whatsapp-extra/single-extra.js aprimorado.
+"""
+from __future__ import annotations
+import argparse, json, os, secrets, subprocess, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+PROJECT = Path('/root/.hermes/zydon-prospeccao')
+WA_EXTRA = Path('/root/.hermes/whatsapp-extra')
+DATA_DIR = WA_EXTRA / 'channel_data'
+USERS_FILE = PROJECT / 'controle' / 'channel_users.json'
+MEDIA_PROXY_PREFIX = '/media/'
+GROUP_JID = '120363408131718880@g.us'
+
+PORTS = {
+    4600: {'label':'Mariana', 'owner':'mariana', 'role':'institucional'},
+    4601: {'label':'Sarah 1', 'owner':'sarah', 'role':'sdr'},
+    4602: {'label':'Breno 1', 'owner':'breno', 'role':'sdr'},
+    4603: {'label':'Lucas Batista', 'owner':'lucas_batista', 'role':'sdr'},
+    4604: {'label':'Sarah 2', 'owner':'sarah', 'role':'sdr'},
+    4605: {'label':'Breno 2', 'owner':'breno', 'role':'sdr'},
+    4606: {'label':'Lucas Resende', 'owner':'lucas_resende', 'role':'institucional'},
+    4607: {'label':'Rafael', 'owner':'rafael', 'role':'institucional'},
+}
+DEFAULT_USERS = {
+    'rafael': {'name':'Rafael', 'ports':[4600,4601,4602,4603,4604,4605,4606,4607], 'admin': True},
+    'mariana': {'name':'Mariana', 'ports':[4600], 'admin': False},
+    'breno': {'name':'Breno', 'ports':[4602,4605], 'admin': False},
+    'sarah': {'name':'Sarah', 'ports':[4601,4604], 'admin': False},
+    'lucas_batista': {'name':'Lucas Batista', 'ports':[4603], 'admin': False},
+    'lucas_resende': {'name':'Lucas Resende', 'ports':[4606], 'admin': False},
+}
+
+def ensure_users():
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if USERS_FILE.exists():
+        data = json.loads(USERS_FILE.read_text(encoding='utf-8'))
+    else:
+        data = {}
+    changed=False
+    for uid, cfg in DEFAULT_USERS.items():
+        if uid not in data:
+            data[uid] = {**cfg, 'token': secrets.token_urlsafe(18)}; changed=True
+        else:
+            for k,v in cfg.items():
+                if k not in data[uid]: data[uid][k]=v; changed=True
+            if not data[uid].get('token'):
+                data[uid]['token']=secrets.token_urlsafe(18); changed=True
+    if changed:
+        USERS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        try: os.chmod(USERS_FILE, 0o600)
+        except Exception: pass
+    return data
+
+USERS = ensure_users()
+
+def user_from_request(path):
+    qs=parse_qs(urlparse(path).query)
+    uid=(qs.get('u') or qs.get('user') or [''])[0]
+    tok=(qs.get('t') or qs.get('token') or [''])[0]
+    if not uid or uid not in USERS: return None
+    if not tok or not secrets.compare_digest(tok, USERS[uid].get('token','')): return None
+    return uid
+
+def read_history(port:int):
+    p=DATA_DIR / f'history_{port}.json'
+    try:
+        data=json.loads(p.read_text(encoding='utf-8')) if p.exists() else []
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def load_all(uid):
+    allowed=set(USERS[uid]['ports'])
+    items=[]
+    for port in allowed:
+        for m in read_history(int(port)):
+            if not isinstance(m, dict): continue
+            m=dict(m); m['port']=int(m.get('port') or port); m['portLabel']=PORTS.get(int(port),{}).get('label',str(port));
+            items.append(m)
+    items.sort(key=lambda x: float(x.get('timestamp') or 0))
+    return items
+
+def clean_title_value(v):
+    v = str(v or '').strip()
+    if not v or v.lower() in {'none','null','sem empresa','sem nome'}:
+        return ''
+    return v
+
+
+def short_phone(chat):
+    digits=''.join(ch for ch in str(chat or '') if ch.isdigit())
+    if len(digits) >= 12:
+        return f"+{digits[:2]} {digits[2:4]} {digits[4:-4]}-{digits[-4:]}"
+    return str(chat or '')
+
+
+def source_label(m):
+    typ=str(m.get('type') or '')
+    if typ == 'cron-sdr-primeiro-contato': return '1º contato SDR'
+    if typ == 'cron-mql-texto': return 'Diagnóstico · texto'
+    if typ == 'cron-mql-pdf': return 'Diagnóstico · PDF'
+    if typ == 'cron-naomql-grupo': return 'Não-MQL interno'
+    if not m.get('fromMe'): return 'Resposta recebida'
+    return 'WhatsApp'
+
+
+def conversations(uid):
+    conv={}
+    is_admin = bool(USERS.get(uid, {}).get('admin'))
+    for m in load_all(uid):
+        chat=m.get('chat') or ''
+        if not chat:
+            continue
+        # Grupo interno polui a visão de conversas/leads e gera falsas "respostas".
+        # O Channel é para conversas individuais; auditoria de grupo fica no dashboard de envios.
+        if chat == GROUP_JID or chat.endswith('@g.us'):
+            continue
+        key=f"{m.get('port')}::{chat}"
+        c=conv.setdefault(key, {'id':key,'chat':chat,'title':'','subtitle':'','port':m.get('port'),'portLabel':m.get('portLabel'),'messages':0,'last':None,'lastTime':0,'unread':0,'responses':0,'lastIncoming':None,'lastSource':''})
+        c['messages'] += 1
+        ts = float(m.get('timestamp') or 0)
+        if ts >= float(c.get('lastTime') or 0):
+            c['lastTime'] = ts
+            c['last'] = m
+            c['lastSource'] = source_label(m)
+        if not m.get('fromMe'):
+            c['unread'] += 1
+            c['responses'] += 1
+            if ts >= float((c.get('lastIncoming') or {}).get('timestamp') or 0):
+                c['lastIncoming'] = m
+        # melhor título da conversa inteira: empresa > nome > slug > telefone
+        best = clean_title_value(m.get('empresa') or m.get('lead'))
+        if best and (not c.get('title') or c.get('title') == short_phone(chat) or c.get('title') == chat):
+            c['title'] = best
+        name = clean_title_value(m.get('nome'))
+        sdr = clean_title_value(m.get('sdr'))
+        if name and name.lower() not in str(c.get('title','')).lower():
+            c['subtitle'] = name + (f" · {sdr}" if sdr else '')
+        elif sdr and not c.get('subtitle'):
+            c['subtitle'] = sdr
+    out=[]
+    for c in conv.values():
+        if not c.get('title'):
+            c['title'] = short_phone(c.get('chat'))
+        if not c.get('subtitle'):
+            c['subtitle'] = short_phone(c.get('chat'))
+        out.append(c)
+    out.sort(key=lambda c: float(c.get('lastTime') or 0), reverse=True)
+    return out
+
+def messages_for(uid, conv_id):
+    if '::' not in conv_id: return []
+    p_s, chat = conv_id.split('::',1)
+    try: port=int(p_s)
+    except: return []
+    if port not in USERS[uid]['ports']: return []
+    return [m for m in load_all(uid) if int(m.get('port') or 0)==port and m.get('chat')==chat]
+
+def post_json(url, payload, timeout=20):
+    data=json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    req=urllib.request.Request(url, data=data, headers={'Content-Type':'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8') or '{}')
+
+def bridge_status(port):
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/status', timeout=2) as r:
+            return json.loads(r.read().decode())
+    except Exception as e: return {'connected':False,'error':str(e)}
+
+HTML = r'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Zydon Channel</title>
+<style>
+:root{--bg:#070b0f;--panel:#0e151d;--panel2:#121c26;--line:#223040;--txt:#ecf4ff;--muted:#8ea1b5;--green:#cdeb00;--in:#172434;--out:#244015;--danger:#ff6d6d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,-apple-system,Segoe UI,Arial,sans-serif;height:100vh;overflow:hidden}.app{display:grid;grid-template-columns:360px 1fr 300px;height:100vh}.sidebar,.info{background:var(--panel);border-right:1px solid var(--line);min-width:0}.info{border-left:1px solid var(--line);border-right:0}.top{height:64px;display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(10,16,23,.96)}.brand{font-weight:800}.pill{font-size:12px;border:1px solid var(--line);padding:4px 8px;border-radius:999px;color:var(--muted)}input,select,textarea{background:#0a1118;color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:11px;font:inherit}button{background:var(--green);border:0;border-radius:12px;padding:11px 14px;font-weight:800;color:#111;cursor:pointer}.ghost{background:#162231;color:var(--txt);border:1px solid var(--line)}.search{padding:12px;border-bottom:1px solid var(--line);display:grid;gap:8px}.convlist{overflow:auto;height:calc(100vh - 165px)}.conv{padding:13px 14px;border-bottom:1px solid #172230;cursor:pointer}.conv:hover,.conv.active{background:#121d29}.conv .name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.conv .last{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.conv .meta{display:flex;justify-content:space-between;gap:8px;margin-top:6px}.badge{font-size:11px;border-radius:999px;padding:3px 7px;background:#1d2b3b;color:#bcd}.unread{background:var(--green);color:#111}.chat{display:flex;flex-direction:column;min-width:0;background:linear-gradient(180deg,#091018,#070b0f)}.chathead{height:64px;border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;justify-content:space-between}.messages{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:10px}.bubble{max-width:72%;padding:10px 12px;border:1px solid var(--line);border-radius:16px;white-space:pre-wrap;line-height:1.35}.bubble.in{align-self:flex-start;background:var(--in);border-top-left-radius:4px}.bubble.out{align-self:flex-end;background:var(--out);border-top-right-radius:4px}.time{font-size:11px;color:var(--muted);margin-top:6px}.composer{border-top:1px solid var(--line);padding:12px;display:grid;grid-template-columns:1fr auto;gap:10px;background:rgba(10,16,23,.98)}textarea{min-height:46px;max-height:140px;resize:vertical}.info{padding:16px;overflow:auto}.kv{margin:12px 0;padding:12px;background:var(--panel2);border:1px solid var(--line);border-radius:14px}.kv b{display:block;margin-bottom:5px}.small{font-size:12px;color:var(--muted)}a{color:var(--green)}.login{max-width:460px;margin:12vh auto;background:var(--panel);padding:24px;border:1px solid var(--line);border-radius:20px}.mobileBack{display:none}@media(max-width:980px){.app{grid-template-columns:1fr}.sidebar{display:block}.chat,.info{display:none}.app.open .sidebar{display:none}.app.open .chat{display:flex;height:100vh}.mobileBack{display:inline-block}.bubble{max-width:88%}.info{display:none}}
+</style></head><body><div id="root"></div><script>
+const qs=new URLSearchParams(location.search), user=qs.get('u')||'', token=qs.get('t')||'';
+const auth=`u=${encodeURIComponent(user)}&t=${encodeURIComponent(token)}`; let convs=[], active=null, msgs=[];
+function esc(s){return (s??'').toString().replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+function dt(ts){try{return new Date((+ts)*1000).toLocaleString('pt-BR')}catch{return ''}}
+async function api(path, opts){const r=await fetch(path+(path.includes('?')?'&':'?')+auth, opts); if(!r.ok) throw new Error(await r.text()); return r.json()}
+function renderShell(){document.getElementById('root').innerHTML=`<div class="app" id="app"><aside class="sidebar"><div class="top"><div><div class="brand">Zydon Channel</div><div class="small" id="who"></div></div></div><div class="search"><input id="q" placeholder="Buscar conversa"><select id="port"><option value="">Todos os chips</option></select></div><div class="convlist" id="convs"></div></aside><main class="chat"><div class="chathead"><div><button class="ghost mobileBack" onclick="closeChat()">←</button> <b id="chatTitle">Selecione uma conversa</b><div class="small" id="chatSub"></div></div><button class="ghost" onclick="loadAll()">Atualizar</button></div><div class="messages" id="msgs"><div class="small">Escolha uma conversa na esquerda.</div></div><div class="composer"><textarea id="reply" placeholder="Responder por este chip..."></textarea><button onclick="sendReply()">Enviar</button></div></main><aside class="info"><h3>Detalhes</h3><div id="details" class="small">Selecione uma conversa.</div></aside></div>`; document.getElementById('q').oninput=drawConvs; document.getElementById('port').onchange=drawConvs;}
+function label(m){if(!m) return ''; if(!m.fromMe) return 'RESPOSTA DO LEAD'; if(m.type==='cron-sdr-primeiro-contato') return '1º CONTATO SDR'; if(m.type==='cron-mql-texto') return 'DIAGNÓSTICO'; if(m.type==='cron-mql-pdf') return 'PDF'; return 'ENVIADA'}
+function drawConvs(){let q=(document.getElementById('q')?.value||'').toLowerCase(), p=document.getElementById('port')?.value||''; let list=convs.filter(c=>(!p||String(c.port)===p)&&(!q||JSON.stringify(c).toLowerCase().includes(q))); document.getElementById('convs').innerHTML=list.map(c=>{let preview=(c.last?.text)||c.last?.mediaName||c.last?.mediaType||''; return `<div class="conv ${active===c.id?'active':''}" onclick="openConv('${esc(c.id)}')"><div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start"><div class="name">${esc(c.title||c.chat)}</div><div class="small" style="white-space:nowrap">${dt(c.lastTime)}</div></div><div class="small">${esc(c.subtitle||c.chat)}</div><div class="last"><b>${esc(c.lastSource||label(c.last))}</b> · ${esc(preview)}</div><div class="meta"><span class="badge">${esc(c.portLabel)} · ${c.messages} msg</span>${c.responses?`<span class="badge unread">${c.responses} resp.</span>`:''}</div></div>`}).join('')||'<div class="small" style="padding:16px">Sem conversas ainda.</div>'}
+function drawMsgs(){document.getElementById('msgs').innerHTML=msgs.map(m=>`<div class="bubble ${m.fromMe?'out':'in'}"><div class="small" style="font-weight:800;color:${m.fromMe?'#cdeb00':'#9bd1ff'}">${esc(label(m))}</div>${esc(m.text||'')}${m.mediaPath?`<div><a target="_blank" href="/api/local-file?port=${m.port}&id=${encodeURIComponent(m.id)}&${auth}">📎 ${esc(m.mediaName||m.mediaType||'arquivo')}</a></div>`:''}${m.mediaUrl?`<div><a target="_blank" href="/api/media?port=${m.port}&file=${encodeURIComponent((m.mediaUrl||'').split('/').pop())}&${auth}">📎 ${esc(m.mediaName||m.mediaType||'arquivo')}</a></div>`:''}<div class="time">${esc(m.portLabel||m.port)} · ${dt(m.timestamp)}</div></div>`).join('')||'<div class="small">Sem mensagens nesta conversa.</div>'; let el=document.getElementById('msgs'); el.scrollTop=el.scrollHeight;}
+async function loadAll(){try{let d=await api('/api/conversations'); convs=d.conversations||[]; document.getElementById('who').textContent=d.user.name+' · '+d.user.ports.map(p=>p.label).join(', '); let sel=document.getElementById('port'), cur=sel.value; sel.innerHTML='<option value="">Todos os chips</option>'+d.user.ports.map(p=>`<option value="${p.port}">${esc(p.label)} (${p.port})</option>`).join(''); sel.value=cur; drawConvs(); if(active) await openConv(active, true);}catch(e){document.getElementById('root').innerHTML='<div class="login"><h2>Acesso negado/offline</h2><p>'+esc(e.message)+'</p><p>Use seu link individual.</p></div>'}}
+async function openConv(id, keep){active=id; let d=await api('/api/messages?conv='+encodeURIComponent(id)); msgs=d.messages||[]; let c=convs.find(x=>x.id===id)||{}; document.getElementById('chatTitle').textContent=c.title||c.chat||id; document.getElementById('chatSub').textContent=(c.subtitle||c.chat||'')+' · '+(c.portLabel||'')+' · última: '+dt(c.lastTime); document.getElementById('details').innerHTML=`<div class="kv"><b>Lead/Conversa</b>${esc(c.title||c.chat)}</div><div class="kv"><b>Contato</b>${esc(c.subtitle||c.chat)}</div><div class="kv"><b>Chat/JID</b>${esc(c.chat)}</div><div class="kv"><b>Chip</b>${esc(c.portLabel)} / ${esc(c.port)}</div><div class="kv"><b>Mensagens</b>${esc(c.messages)} total · ${esc(c.responses||0)} respostas recebidas</div><div class="kv"><b>Última mensagem</b>${dt(c.lastTime)}<br>${esc(c.lastSource||'')}</div>`; document.getElementById('app').classList.add('open'); drawConvs(); drawMsgs();}
+function closeChat(){document.getElementById('app').classList.remove('open')}
+async function sendReply(){if(!active) return alert('Selecione uma conversa'); const text=document.getElementById('reply').value.trim(); if(!text) return; const [port,chat]=active.split('::'); const r=await api('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:+port,chat,text})}); document.getElementById('reply').value=''; await loadAll(); await openConv(active,true);}
+renderShell(); loadAll(); setInterval(loadAll,15000);
+</script></body></html>'''
+
+class H(BaseHTTPRequestHandler):
+    server_version='ZydonChannel/0.1'
+    def log_message(self, fmt, *args): print('[%s] '%datetime.now().isoformat(timespec='seconds') + fmt%args)
+    def sendb(self, code, body, ctype='application/json; charset=utf-8'):
+        self.send_response(code); self.send_header('Content-Type', ctype); self.send_header('Cache-Control','no-store'); self.send_header('X-Robots-Tag','noindex,nofollow'); self.end_headers(); self.wfile.write(body)
+    def auth(self): return user_from_request(self.path)
+    def do_GET(self):
+        parsed=urlparse(self.path); path=parsed.path; uid=self.auth()
+        if path=='/health': return self.sendb(200, json.dumps({'ok':True,'users':list(USERS),'time':datetime.now().isoformat()}).encode())
+        if not uid: return self.sendb(403, b'Acesso negado. Use seu link individual.\n', 'text/plain; charset=utf-8')
+        if path in ('/','/index.html'): return self.sendb(200, HTML.encode(), 'text/html; charset=utf-8')
+        if path=='/api/conversations':
+            u=USERS[uid]; ports=[{'port':p, **PORTS.get(int(p),{})} for p in u['ports']]
+            return self.sendb(200, json.dumps({'user':{'id':uid,'name':u['name'],'admin':u.get('admin'), 'ports':ports}, 'conversations':conversations(uid)}, ensure_ascii=False).encode())
+        if path=='/api/messages':
+            qs=parse_qs(parsed.query); conv=(qs.get('conv') or [''])[0]
+            return self.sendb(200, json.dumps({'messages':messages_for(uid, conv)}, ensure_ascii=False).encode())
+        if path=='/api/media':
+            qs=parse_qs(parsed.query); port=int((qs.get('port') or [0])[0]); fname=os.path.basename((qs.get('file') or [''])[0])
+            if port not in USERS[uid]['ports']: return self.sendb(403,b'Forbidden','text/plain')
+            f=DATA_DIR/'media'/str(port)/fname
+            if not f.exists(): return self.sendb(404,b'Not found','text/plain')
+            self.send_response(200); self.send_header('Content-Type','application/octet-stream'); self.send_header('Content-Disposition',f'inline; filename="{fname}"'); self.end_headers(); self.wfile.write(f.read_bytes()); return
+        return self.sendb(404,b'Not found','text/plain')
+    def do_POST(self):
+        parsed=urlparse(self.path); uid=self.auth()
+        if not uid: return self.sendb(403,b'Acesso negado','text/plain')
+        if parsed.path=='/api/send':
+            try:
+                n=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(n).decode() or '{}')
+                port=int(body.get('port')); chat=str(body.get('chat') or ''); text=str(body.get('text') or '').strip()
+                if port not in USERS[uid]['ports']: return self.sendb(403,b'Porta nao permitida','text/plain')
+                if not chat or not text: return self.sendb(400,b'Missing chat/text','text/plain')
+                resp=post_json(f'http://127.0.0.1:{port}/send', {'to':chat,'text':text})
+                return self.sendb(200,json.dumps({'ok':True,'bridge':resp},ensure_ascii=False).encode())
+            except Exception as e:
+                return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())
+        return self.sendb(404,b'Not found','text/plain')
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--host',default='0.0.0.0'); ap.add_argument('--port',type=int,default=8790); ap.add_argument('--print-links',action='store_true')
+    args=ap.parse_args();
+    if args.print_links:
+        for uid,cfg in USERS.items(): print(f"{cfg['name']}: http://127.0.0.1:{args.port}/?u={uid}&t={cfg['token']}")
+        return
+    httpd=ThreadingHTTPServer((args.host,args.port),H); print(f'Channel rodando em {args.host}:{args.port}', flush=True); httpd.serve_forever()
+if __name__=='__main__': main()

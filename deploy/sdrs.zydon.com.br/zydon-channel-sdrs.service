@@ -1,0 +1,24 @@
+[Unit]
+Description=Zydon Channel SDRs (sdrs.zydon.com.br)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.hermes/zydon-prospeccao
+EnvironmentFile=/etc/zydon-channel/sdrs.env
+ExecStart=/usr/bin/python3 /root/.hermes/zydon-prospeccao/scripts/channel_panel_v2.py --host 127.0.0.1 --port 8791
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# Hardening leve sem quebrar acesso aos arquivos/bridges locais
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/root/.hermes/zydon-prospeccao /root/.hermes/whatsapp-extra /root/.hermes/credentials
+
+[Install]
+WantedBy=multi-user.target

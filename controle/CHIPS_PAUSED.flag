@@ -1,0 +1,9 @@
+# 4602 = Breno 1 antigo (Breno já tem chip ativo em 4605)
+# 4604 = Sarah 2 antigo (Sarah oficial vai usar 4601)
+# Chips pausados por solicitação Rafael 24/06/2026.
+# Um chip por linha. O watchdog deve PULAR o start_bridge destes.
+4500
+4602
+4604
+4608
+4609

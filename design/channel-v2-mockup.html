@@ -1,0 +1,949 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Zydon Channel · Inbox Comercial</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   ZYDON CHANNEL V2 — MOCKUP DE DESIGN PREMIUM
+   Self-contained. Inspirado em Linear/Superhuman + Intercom.
+   Dark profundo + accent verde Zydon #CDEB00 usado com parcimônia.
+   ============================================================ */
+:root{
+  --bg:#06080A;
+  --bg-elev:#08090A;
+  --panel:#0E1114;
+  --panel-2:#0B0E11;
+  --surface:rgba(255,255,255,0.035);
+  --surface-2:rgba(255,255,255,0.055);
+  --surface-hi:rgba(255,255,255,0.08);
+  --line:rgba(255,255,255,0.08);
+  --line-soft:rgba(255,255,255,0.05);
+  --line-strong:rgba(255,255,255,0.14);
+  --txt:#F4F7F5;
+  --txt-2:#A7B0AA;
+  --muted:#68736D;
+  --accent:#CDEB00;
+  --accent-dim:rgba(205,235,0,0.12);
+  --accent-soft:rgba(205,235,0,0.08);
+  --success:#20C997;
+  --success-soft:rgba(32,201,151,0.12);
+  --warning:#F7B955;
+  --warning-soft:rgba(247,185,85,0.12);
+  --danger:#FF6B6B;
+  --danger-soft:rgba(255,107,107,0.12);
+  --info:#7AA2FF;
+  --info-soft:rgba(122,162,255,0.12);
+  --radius:14px;
+  --radius-sm:10px;
+  --radius-lg:18px;
+  --shadow:0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 30px -12px rgba(0,0,0,0.7);
+  --ff:'Inter', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --sidebar-w:248px;
+  --list-w:392px;
+  --context-w:340px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--txt);
+  font-family:var(--ff);font-size:14px;line-height:1.45;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  overflow:hidden;letter-spacing:-0.006em;
+}
+::selection{background:var(--accent-dim);color:var(--txt)}
+button{font-family:inherit;cursor:pointer;color:inherit}
+input,textarea,select{font-family:inherit}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.07);border-radius:99px;border:3px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,0.13);background-clip:padding-box}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- App shell ---------- */
+.app{
+  display:grid;
+  grid-template-columns:var(--sidebar-w) var(--list-w) minmax(0,1fr) var(--context-w);
+  height:100vh;height:100dvh;
+}
+.col{min-width:0;min-height:0;display:flex;flex-direction:column;position:relative}
+.sidebar{background:linear-gradient(180deg,#0A0C0F,#060809);border-right:1px solid var(--line-soft)}
+.list{background:var(--panel-2);border-right:1px solid var(--line-soft)}
+.conversation{background:radial-gradient(120% 80% at 50% -10%, #0c1013 0%, var(--bg) 60%)}
+.context{background:linear-gradient(180deg,#0A0C0F,#070809);border-left:1px solid var(--line-soft)}
+
+/* zones reusable header */
+.zone-head{height:60px;flex:0 0 60px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line-soft)}
+.scroll{overflow-y:auto;overflow-x:hidden;flex:1;min-height:0}
+
+/* ---------- Sidebar ---------- */
+.brand{display:flex;align-items:center;gap:11px;padding:18px 18px 14px}
+.brand .logo{
+  width:34px;height:34px;border-radius:10px;flex:0 0 auto;display:grid;place-items:center;
+  background:linear-gradient(155deg,#1a1f10,#0c0f06);border:1px solid var(--line);
+  box-shadow:0 0 0 1px rgba(205,235,0,0.06), 0 6px 18px -8px rgba(205,235,0,0.25);
+}
+.brand .logo svg{width:18px;height:18px}
+.brand .name{font-weight:700;font-size:15px;letter-spacing:-0.02em;line-height:1.1}
+.brand .name span{display:block;font-size:11px;font-weight:500;color:var(--muted);letter-spacing:0.02em}
+
+.nav{padding:6px 10px 4px;flex:1;overflow-y:auto;min-height:0}
+.nav-label{font-size:10.5px;font-weight:600;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);padding:14px 10px 7px}
+.q{
+  display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--radius-sm);
+  color:var(--txt-2);font-weight:500;font-size:13.5px;cursor:pointer;position:relative;
+  transition:background .12s, color .12s;user-select:none;
+}
+.q:hover{background:var(--surface);color:var(--txt)}
+.q.active{background:var(--surface-2);color:var(--txt)}
+.q.active::before{content:"";position:absolute;left:-10px;top:50%;transform:translateY(-50%);width:3px;height:18px;border-radius:0 3px 3px 0;background:var(--accent)}
+.q .ic{width:17px;height:17px;flex:0 0 auto;color:currentColor;opacity:.85}
+.q .qlabel{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.q .count{font-size:11.5px;font-weight:600;color:var(--muted);min-width:18px;text-align:right;font-variant-numeric:tabular-nums}
+.q.active .count{color:var(--txt-2)}
+.q .count.hot{color:var(--accent)}
+.q .dot{width:7px;height:7px;border-radius:50%;background:var(--danger);flex:0 0 auto}
+
+/* chips health */
+.chips{border-top:1px solid var(--line-soft);padding:12px 14px 14px}
+.chips h4{font-size:10.5px;font-weight:600;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);margin:2px 2px 10px;display:flex;justify-content:space-between;align-items:center}
+.chips h4 .legend{font-weight:500;letter-spacing:0;text-transform:none;color:var(--muted);font-size:10.5px}
+.chip-row{display:flex;align-items:center;gap:9px;padding:5px 4px;font-size:12.5px}
+.chip-row .st{width:7px;height:7px;border-radius:50%;flex:0 0 auto;position:relative}
+.st.on{background:var(--success);box-shadow:0 0 0 3px var(--success-soft)}
+.st.warn{background:var(--warning);box-shadow:0 0 0 3px var(--warning-soft)}
+.st.off{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}
+.chip-row .who{flex:1;color:var(--txt-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip-row .vol{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+
+.me{display:flex;align-items:center;gap:10px;padding:11px 14px;border-top:1px solid var(--line-soft)}
+.avatar{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;flex:0 0 auto;color:#0a0a0a}
+.me .nm{flex:1;min-width:0}
+.me .nm b{display:block;font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.me .nm span{font-size:11px;color:var(--muted)}
+.icon-btn{width:30px;height:30px;border-radius:8px;border:1px solid var(--line);background:var(--surface);display:grid;place-items:center;color:var(--txt-2);transition:.12s}
+.icon-btn:hover{background:var(--surface-2);color:var(--txt);border-color:var(--line-strong)}
+.icon-btn svg{width:15px;height:15px}
+
+/* ---------- Conversation list ---------- */
+.list .zone-head{gap:8px}
+.search{flex:1;display:flex;align-items:center;gap:9px;background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:0 11px;height:38px;transition:.14s}
+.search:focus-within{border-color:var(--line-strong);background:var(--surface-2);box-shadow:0 0 0 3px rgba(255,255,255,0.03)}
+.search svg{width:15px;height:15px;color:var(--muted);flex:0 0 auto}
+.search input{flex:1;background:none;border:0;outline:0;color:var(--txt);font-size:13.5px}
+.search input::placeholder{color:var(--muted)}
+.search kbd{font-size:10.5px;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-family:var(--ff);background:var(--bg)}
+
+.list-sub{display:flex;align-items:center;gap:8px;padding:11px 14px 9px;border-bottom:1px solid var(--line-soft)}
+.list-sub .title{font-weight:600;font-size:13.5px;letter-spacing:-0.01em}
+.list-sub .n{font-size:11.5px;color:var(--muted);font-weight:500}
+.list-sub .spacer{flex:1}
+.seg{display:flex;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:2px;gap:2px}
+.seg button{border:0;background:none;color:var(--txt-2);font-size:11.5px;font-weight:600;padding:4px 9px;border-radius:7px;transition:.12s}
+.seg button.on{background:var(--surface-hi);color:var(--txt)}
+.seg button:hover{color:var(--txt)}
+
+.filters{display:flex;gap:7px;padding:9px 14px;overflow-x:auto;border-bottom:1px solid var(--line-soft);scrollbar-width:none}
+.filters::-webkit-scrollbar{display:none}
+.fchip{flex:0 0 auto;font-size:12px;font-weight:500;color:var(--txt-2);background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:5px 11px;display:flex;align-items:center;gap:6px;transition:.12s;white-space:nowrap}
+.fchip:hover{background:var(--surface-2);color:var(--txt)}
+.fchip.on{background:var(--accent-dim);border-color:rgba(205,235,0,0.32);color:var(--accent)}
+.fchip .av{width:16px;height:16px;border-radius:50%;font-size:8.5px;display:grid;place-items:center;font-weight:700;color:#0a0a0a}
+
+/* conversation cards */
+.cards{padding:7px 9px}
+.card{
+  display:block;width:100%;text-align:left;border:1px solid transparent;background:none;
+  border-radius:var(--radius);padding:12px 12px 11px;margin-bottom:3px;position:relative;
+  transition:background .12s, border-color .12s;
+}
+.card:hover{background:var(--surface)}
+.card.active{background:var(--surface-2);border-color:var(--line)}
+.card.active::after{content:"";position:absolute;inset:0;border-radius:var(--radius);box-shadow:0 0 0 1px rgba(255,255,255,0.04), 0 10px 30px -16px rgba(0,0,0,.8);pointer-events:none}
+.card.reply{background:linear-gradient(100deg, rgba(205,235,0,0.05), transparent 60%)}
+.card.reply:hover{background:linear-gradient(100deg, rgba(205,235,0,0.08), var(--surface) 60%)}
+.card .row1{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+.card .company{font-weight:650;font-size:14px;letter-spacing:-0.012em;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.card .time{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;flex:0 0 auto}
+.card .time.urgent{color:var(--accent);font-weight:600}
+.card .contact{font-size:12.5px;color:var(--txt-2);margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .contact .role{color:var(--muted)}
+.card .preview{font-size:12.5px;color:var(--muted);line-height:1.4;display:flex;gap:6px;margin-bottom:9px}
+.card .preview .from{font-weight:600;flex:0 0 auto}
+.card .preview .from.lead{color:var(--accent)}
+.card .preview .from.sdr{color:var(--txt-2)}
+.card .preview .from.auto{color:var(--info)}
+.card .preview .txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--txt-2)}
+.card.unreadcard .preview .txt{color:var(--txt);font-weight:500}
+.card .row3{display:flex;align-items:center;gap:6px}
+.card .row3 .spacer{flex:1}
+
+.badge{font-size:10.5px;font-weight:600;letter-spacing:.01em;border-radius:6px;padding:2.5px 7px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.badge svg{width:11px;height:11px}
+.b-diag{background:var(--info-soft);color:#9fb8ff}
+.b-pc{background:var(--warning-soft);color:var(--warning)}
+.b-mql{background:var(--accent-soft);color:var(--accent)}
+.b-reply{background:var(--success-soft);color:var(--success)}
+.b-meet{background:rgba(180,140,255,0.13);color:#c2a4ff}
+.b-done{background:var(--surface-hi);color:var(--txt-2)}
+
+.sla{font-size:10.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.sla .pulse{width:6px;height:6px;border-radius:50%;background:currentColor;position:relative}
+.sla.now{color:var(--accent)}
+.sla.now .pulse{box-shadow:0 0 0 0 rgba(205,235,0,.5);animation:pulse 1.8s infinite}
+.sla.warn{color:var(--warning)}
+.sla.ok{color:var(--muted)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(205,235,0,.5)}70%{box-shadow:0 0 0 6px rgba(205,235,0,0)}100%{box-shadow:0 0 0 0 rgba(205,235,0,0)}}
+
+.owner{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--muted)}
+.owner .av{width:16px;height:16px;border-radius:50%;font-size:8px;display:grid;place-items:center;font-weight:700;color:#0a0a0a}
+.chiptag{font-size:10px;color:var(--muted);background:var(--surface);border:1px solid var(--line-soft);border-radius:5px;padding:1.5px 6px;font-variant-numeric:tabular-nums}
+
+.empty{padding:60px 28px;text-align:center;color:var(--muted)}
+.empty svg{width:34px;height:34px;opacity:.5;margin-bottom:14px}
+.empty b{display:block;color:var(--txt-2);font-weight:600;font-size:14px;margin-bottom:5px}
+.empty span{font-size:12.5px}
+
+/* ---------- Conversation pane ---------- */
+.conv-head{display:flex;align-items:center;gap:12px}
+.back-btn{display:none}
+.conv-head .ttl{flex:1;min-width:0}
+.conv-head .ttl b{font-weight:650;font-size:15px;letter-spacing:-0.015em;display:flex;align-items:center;gap:8px}
+.conv-head .ttl .sub{font-size:12px;color:var(--txt-2);margin-top:1px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.conv-head .ttl .sub .dotsep{width:3px;height:3px;border-radius:50%;background:var(--muted)}
+.conv-head .ttl .sub a{color:var(--txt-2);text-decoration:none}
+.head-actions{display:flex;align-items:center;gap:7px}
+.btn{
+  border:1px solid var(--line);background:var(--surface);color:var(--txt);
+  font-size:12.5px;font-weight:600;border-radius:9px;padding:7px 12px;display:inline-flex;align-items:center;gap:6px;transition:.12s;white-space:nowrap;
+}
+.btn:hover{background:var(--surface-2);border-color:var(--line-strong)}
+.btn svg{width:14px;height:14px}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0a0c00}
+.btn.primary:hover{background:#d8f51a;filter:brightness(1.02)}
+.btn.ghost{background:none;border-color:transparent;padding:7px 9px;color:var(--txt-2)}
+.btn.ghost:hover{background:var(--surface);color:var(--txt)}
+
+.timeline{flex:1;overflow-y:auto;padding:22px 8% 18px;display:flex;flex-direction:column;gap:5px;min-height:0}
+.day-sep{display:flex;align-items:center;gap:14px;margin:18px 0 12px}
+.day-sep::before,.day-sep::after{content:"";flex:1;height:1px;background:var(--line-soft)}
+.day-sep span{font-size:11px;font-weight:600;color:var(--muted);letter-spacing:0.02em;background:var(--surface);border:1px solid var(--line-soft);border-radius:99px;padding:3px 12px}
+
+/* automation event card */
+.event{align-self:center;max-width:min(560px,92%);width:100%;margin:6px 0}
+.event-card{
+  border:1px solid var(--line);background:linear-gradient(180deg,var(--surface),transparent);
+  border-radius:var(--radius);padding:12px 13px;display:flex;gap:11px;align-items:flex-start;
+}
+.event-card .eic{width:30px;height:30px;border-radius:9px;flex:0 0 auto;display:grid;place-items:center;background:var(--info-soft);color:var(--info)}
+.event-card.warn .eic{background:var(--warning-soft);color:var(--warning)}
+.event-card .eic svg{width:16px;height:16px}
+.event-card .ebody{flex:1;min-width:0}
+.event-card .etitle{font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px}
+.event-card .etitle .et{font-size:10px;color:var(--muted);font-weight:500}
+.event-card .edesc{font-size:12px;color:var(--txt-2);margin-top:2px}
+
+/* PDF card */
+.pdf{
+  margin-top:9px;border:1px solid var(--line);background:var(--panel);border-radius:11px;
+  padding:10px 11px;display:flex;align-items:center;gap:11px;max-width:330px;transition:.12s;cursor:pointer;
+}
+.pdf:hover{border-color:var(--line-strong);background:var(--surface)}
+.pdf .pic{width:38px;height:46px;border-radius:7px;flex:0 0 auto;display:grid;place-items:center;background:linear-gradient(160deg,#3a1414,#1c0c0c);border:1px solid rgba(255,107,107,.25);position:relative}
+.pdf .pic span{font-size:8px;font-weight:800;color:#ff8b8b;letter-spacing:.04em}
+.pdf .pmeta{flex:1;min-width:0}
+.pdf .pmeta b{display:block;font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pdf .pmeta span{font-size:11px;color:var(--muted)}
+.pdf .dl{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;color:var(--txt-2);border:1px solid var(--line)}
+
+/* bubbles */
+.brow{display:flex;flex-direction:column;max-width:74%;gap:2px}
+.brow.out{align-self:flex-end;align-items:flex-end}
+.brow.in{align-self:flex-start;align-items:flex-start}
+.bmeta{font-size:10.5px;color:var(--muted);padding:0 4px;display:flex;align-items:center;gap:6px}
+.bmeta .who{font-weight:600;color:var(--txt-2)}
+.bubble{
+  padding:9px 13px;border-radius:15px;font-size:13.5px;line-height:1.5;white-space:pre-wrap;
+  border:1px solid var(--line-soft);position:relative;
+}
+.brow.out .bubble{background:var(--surface-2);border-top-right-radius:5px;color:var(--txt)}
+.brow.in .bubble{background:var(--panel);border-top-left-radius:5px;color:var(--txt)}
+.brow.lead .bubble{
+  background:linear-gradient(180deg, rgba(205,235,0,0.10), rgba(205,235,0,0.045));
+  border-color:rgba(205,235,0,0.28);color:var(--txt);
+  box-shadow:0 0 0 1px rgba(205,235,0,0.05), 0 8px 24px -14px rgba(205,235,0,0.4);
+}
+.brow.lead .bmeta .who{color:var(--accent)}
+.btime{font-size:10px;color:var(--muted)}
+.bubble .check{display:inline-flex;vertical-align:-2px;margin-left:6px;color:var(--info)}
+.bubble .check svg{width:14px;height:14px}
+
+.lead-flag{align-self:center;display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;color:var(--accent);background:var(--accent-dim);border:1px solid rgba(205,235,0,0.25);border-radius:99px;padding:5px 13px;margin:10px 0 4px}
+.lead-flag svg{width:13px;height:13px}
+
+/* composer */
+.composer{flex:0 0 auto;border-top:1px solid var(--line-soft);background:linear-gradient(180deg,transparent,rgba(255,255,255,0.015));padding:12px 16px 14px}
+.quick{display:flex;gap:7px;margin-bottom:10px;overflow-x:auto;scrollbar-width:none;padding-bottom:1px}
+.quick::-webkit-scrollbar{display:none}
+.quick button{flex:0 0 auto;font-size:12px;font-weight:500;color:var(--txt-2);background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:5px 11px;transition:.12s;display:flex;align-items:center;gap:6px}
+.quick button:hover{background:var(--surface-2);color:var(--txt);border-color:var(--line-strong)}
+.quick button.ai{color:var(--accent);border-color:rgba(205,235,0,0.25);background:var(--accent-soft)}
+.quick button svg{width:12px;height:12px}
+.cbox{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);transition:.14s}
+.cbox:focus-within{border-color:var(--line-strong);box-shadow:0 0 0 3px rgba(255,255,255,0.03)}
+.cbox.note{border-color:rgba(247,185,85,0.35);background:linear-gradient(180deg,rgba(247,185,85,0.05),transparent)}
+.ctabs{display:flex;gap:2px;padding:6px 8px 0}
+.ctab{font-size:11.5px;font-weight:600;color:var(--muted);padding:6px 11px;border-radius:8px 8px 0 0;transition:.12s;background:none;border:0}
+.ctab.on{color:var(--txt);background:var(--surface)}
+.ctab.on.noteon{color:var(--warning)}
+.cbox textarea{width:100%;background:none;border:0;outline:0;color:var(--txt);font-size:13.5px;line-height:1.5;resize:none;padding:10px 13px 6px;min-height:46px;max-height:160px}
+.cbox textarea::placeholder{color:var(--muted)}
+.cbar{display:flex;align-items:center;gap:4px;padding:6px 8px 8px}
+.cbar .spacer{flex:1}
+.cbar .tool{width:32px;height:32px;border-radius:8px;display:grid;place-items:center;color:var(--txt-2);border:0;background:none;transition:.12s}
+.cbar .tool:hover{background:var(--surface);color:var(--txt)}
+.cbar .tool svg{width:17px;height:17px}
+.send{background:var(--accent);color:#0a0c00;border:0;border-radius:9px;height:32px;padding:0 14px;font-weight:700;font-size:12.5px;display:flex;align-items:center;gap:7px;transition:.12s}
+.send:hover{filter:brightness(1.05)}
+.send svg{width:14px;height:14px}
+.send.note{background:var(--warning)}
+.cbar .hint{font-size:10.5px;color:var(--muted);margin-right:4px}
+
+/* ---------- Context panel ---------- */
+.context .scroll{padding:0}
+.ctx-id{padding:18px 16px 14px;border-bottom:1px solid var(--line-soft)}
+.ctx-id .top{display:flex;align-items:center;gap:11px}
+.ctx-id .ava{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-weight:700;font-size:15px;color:#0a0a0a;flex:0 0 auto}
+.ctx-id .nm{min-width:0}
+.ctx-id .nm b{display:block;font-size:14.5px;font-weight:650;letter-spacing:-0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ctx-id .nm span{font-size:12px;color:var(--txt-2)}
+.score{display:flex;align-items:center;gap:10px;margin-top:14px}
+.score .ring{position:relative;width:46px;height:46px;flex:0 0 auto}
+.score .ring svg{transform:rotate(-90deg)}
+.score .ring .val{position:absolute;inset:0;display:grid;place-items:center;font-size:13px;font-weight:700}
+.score .sc-meta{min-width:0}
+.score .sc-meta b{font-size:12.5px;font-weight:600;display:block}
+.score .sc-meta span{font-size:11px;color:var(--muted)}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:13px}
+.tag{font-size:11px;font-weight:500;color:var(--txt-2);background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:3px 8px}
+.tag.hot{color:var(--accent);background:var(--accent-soft);border-color:rgba(205,235,0,0.25)}
+
+.section{padding:15px 16px;border-bottom:1px solid var(--line-soft)}
+.section h5{font-size:10.5px;font-weight:600;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);margin:0 0 11px;display:flex;align-items:center;gap:7px}
+.section h5 .hs{margin-left:auto;font-size:10px;font-weight:600;color:#ff7a59;background:rgba(255,122,89,0.1);border:1px solid rgba(255,122,89,0.25);border-radius:5px;padding:1.5px 6px;letter-spacing:0;text-transform:none}
+.kv{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 0;font-size:12.5px}
+.kv .k{color:var(--muted)}
+.kv .v{color:var(--txt);font-weight:500;text-align:right}
+.kv .v .stage{display:inline-flex;align-items:center;gap:6px;background:var(--info-soft);color:#9fb8ff;border-radius:6px;padding:2px 8px;font-size:11.5px}
+.kv .v .av{width:17px;height:17px;border-radius:50%;font-size:8px;display:inline-grid;place-items:center;font-weight:700;color:#0a0a0a;vertical-align:-4px;margin-right:5px}
+
+.next{margin:0;border:1px solid rgba(205,235,0,0.25);background:linear-gradient(180deg,var(--accent-soft),transparent);border-radius:var(--radius);padding:13px}
+.next .nh{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:var(--accent);margin-bottom:8px}
+.next .nh svg{width:14px;height:14px}
+.next p{margin:0 0 11px;font-size:13px;line-height:1.5;color:var(--txt)}
+.next .nbtns{display:flex;gap:7px}
+.next .nbtns .btn{flex:1;justify-content:center}
+
+.note-item{border:1px solid var(--line-soft);background:var(--surface);border-radius:11px;padding:10px 11px;margin-bottom:8px}
+.note-item .nm{display:flex;align-items:center;gap:7px;margin-bottom:5px}
+.note-item .nm .av{width:18px;height:18px;border-radius:50%;font-size:8px;display:grid;place-items:center;font-weight:700;color:#0a0a0a}
+.note-item .nm b{font-size:11.5px;font-weight:600}
+.note-item .nm span{font-size:10.5px;color:var(--muted);margin-left:auto}
+.note-item p{margin:0;font-size:12.5px;color:var(--txt-2);line-height:1.45}
+.add-note{width:100%;text-align:left;font-size:12px;color:var(--muted);background:var(--surface);border:1px dashed var(--line);border-radius:10px;padding:9px 11px;display:flex;align-items:center;gap:8px;transition:.12s}
+.add-note:hover{color:var(--txt-2);border-color:var(--line-strong)}
+.add-note svg{width:14px;height:14px}
+
+.auto-log{position:relative;padding-left:18px}
+.auto-log::before{content:"";position:absolute;left:4px;top:4px;bottom:4px;width:1px;background:var(--line)}
+.auto-item{position:relative;padding:0 0 13px}
+.auto-item:last-child{padding-bottom:0}
+.auto-item .ad{position:absolute;left:-17px;top:3px;width:9px;height:9px;border-radius:50%;background:var(--panel);border:2px solid var(--muted)}
+.auto-item.ok .ad{border-color:var(--success)}
+.auto-item.info .ad{border-color:var(--info)}
+.auto-item b{font-size:12.5px;font-weight:600;display:block}
+.auto-item span{font-size:11px;color:var(--muted)}
+
+.health{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.hcell{border:1px solid var(--line-soft);background:var(--surface);border-radius:10px;padding:10px 11px}
+.hcell .hl{font-size:10.5px;color:var(--muted);margin-bottom:5px;display:flex;align-items:center;gap:6px}
+.hcell .hv{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-0.01em}
+.hcell .hv small{font-size:11px;font-weight:500;color:var(--muted)}
+.bar{height:5px;border-radius:99px;background:var(--surface-hi);margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;border-radius:99px;background:var(--success)}
+.bar.warn i{background:var(--warning)}
+
+/* ---------- mobile ---------- */
+.mobile-tabbar{display:none}
+@media (max-width:1180px){
+  :root{--sidebar-w:74px;--context-w:0px}
+  .app{grid-template-columns:var(--sidebar-w) var(--list-w) minmax(0,1fr)}
+  .brand .name,.nav-label,.q .qlabel,.q .count,.chips,.me .nm,.me .icon-btn{display:none}
+  .brand{justify-content:center;padding:16px 0}
+  .q{justify-content:center;padding:10px}
+  .q.active::before{left:-10px}
+  .nav{padding:6px}
+  .me{justify-content:center;padding:12px 0}
+  .context{position:fixed;top:0;right:0;height:100vh;height:100dvh;width:340px;max-width:88vw;z-index:40;transform:translateX(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);box-shadow:-20px 0 60px -20px rgba(0,0,0,.7)}
+  .app.ctx-open .context{transform:translateX(0)}
+  .scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:35;backdrop-filter:blur(2px)}
+  .app.ctx-open .scrim{display:block}
+}
+@media (max-width:820px){
+  .app{grid-template-columns:1fr}
+  .sidebar{display:none}
+  .list{display:flex}
+  .conversation{position:fixed;inset:0;z-index:30;transform:translateX(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1)}
+  .app.conv-open .conversation{transform:translateX(0)}
+  .back-btn{display:grid}
+  .timeline{padding:18px 16px}
+  .brow{max-width:86%}
+  .mobile-tabbar{display:flex;position:fixed;bottom:0;left:0;right:0;height:58px;background:rgba(8,9,10,.96);backdrop-filter:blur(14px);border-top:1px solid var(--line);z-index:25;align-items:center;justify-content:space-around;padding-bottom:env(safe-area-inset-bottom)}
+  .mobile-tabbar button{display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:0;color:var(--muted);font-size:10px;font-weight:500}
+  .mobile-tabbar button.on{color:var(--accent)}
+  .mobile-tabbar svg{width:20px;height:20px}
+  .list .scroll{padding-bottom:64px}
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="col sidebar">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M5 4h14L9 13h10l-10 7" stroke="#CDEB00" stroke-width="2.1" stroke-linejoin="round" stroke-linecap="round"/></svg>
+      </div>
+      <div class="name">Zydon Channel<span>Inbox comercial</span></div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="nav-label">Filas</div>
+      <!-- queues injected -->
+    </nav>
+
+    <div class="chips">
+      <h4>Saúde dos chips <span class="legend" id="chipsOnline"></span></h4>
+      <div id="chipsList"></div>
+    </div>
+
+    <div class="me">
+      <div class="avatar" style="background:linear-gradient(140deg,#CDEB00,#8ba600)">RC</div>
+      <div class="nm"><b>Rafael Calixto</b><span>Admin · 8 chips</span></div>
+      <button class="icon-btn" title="Configurações">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ============ CONVERSATION LIST ============ -->
+  <section class="col list">
+    <div class="zone-head">
+      <div class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+        <input id="search" placeholder="Buscar empresa, contato, telefone…">
+        <kbd>/</kbd>
+      </div>
+    </div>
+
+    <div class="list-sub">
+      <span class="title" id="queueTitle">Responder agora</span>
+      <span class="n" id="queueCount">3 conversas</span>
+      <span class="spacer"></span>
+      <div class="seg">
+        <button class="on" data-sort="prio">Prioridade</button>
+        <button data-sort="recent">Recentes</button>
+      </div>
+    </div>
+
+    <div class="filters" id="filters"></div>
+    <div class="scroll"><div class="cards" id="cards"></div></div>
+  </section>
+
+  <!-- ============ CONVERSATION PANE ============ -->
+  <main class="col conversation">
+    <div class="zone-head conv-head">
+      <button class="icon-btn back-btn" onclick="mobileBack()" title="Voltar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>
+      </button>
+      <div class="avatar" id="convAva" style="background:linear-gradient(140deg,#7AA2FF,#4d6fd1);width:36px;height:36px;border-radius:11px;flex:0 0 auto">LE</div>
+      <div class="ttl">
+        <b id="convCompany">LightShip Embalagens <span class="badge b-diag">Diagnóstico</span></b>
+        <div class="sub" id="convSub">
+          <span>Marcelo Tavares · Diretor de Operações</span>
+          <span class="dotsep"></span>
+          <a href="#">+55 11 9•••• ••32</a>
+          <span class="dotsep"></span>
+          <span class="owner"><span class="av" style="background:#F7B955">S</span> Sarah · Chip Sarah 2</span>
+        </div>
+      </div>
+      <div class="head-actions">
+        <button class="btn ghost" title="Buscar na conversa"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg></button>
+        <button class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>Agendar</button>
+        <button class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>Resolver</button>
+        <button class="icon-btn" onclick="toggleCtx()" title="Contexto comercial"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+      </div>
+    </div>
+
+    <div class="timeline" id="timeline"></div>
+
+    <div class="composer">
+      <div class="quick" id="quick"></div>
+      <div class="cbox" id="cbox">
+        <div class="ctabs">
+          <button class="ctab on" id="tabReply" onclick="setMode('reply')">Responder</button>
+          <button class="ctab" id="tabNote" onclick="setMode('note')">Nota interna</button>
+        </div>
+        <textarea id="composer" placeholder="Responder como Sarah pelo chip Sarah 2…" rows="1"></textarea>
+        <div class="cbar">
+          <button class="tool" title="Anexar arquivo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
+          <button class="tool" title="Enviar PDF/diagnóstico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></button>
+          <button class="tool" title="Emoji"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/></svg></button>
+          <span class="spacer"></span>
+          <span class="hint">Enter envia · Shift+Enter quebra linha</span>
+          <button class="send" id="sendBtn"><span id="sendLabel">Enviar</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ============ CONTEXT PANEL ============ -->
+  <aside class="col context" id="context">
+    <div class="zone-head" style="justify-content:space-between">
+      <b style="font-size:13.5px;font-weight:650">Contexto comercial</b>
+      <button class="icon-btn" onclick="toggleCtx()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="scroll" id="ctxBody"></div>
+  </aside>
+
+  <div class="scrim" onclick="toggleCtx(false)"></div>
+
+  <!-- mobile tabbar -->
+  <nav class="mobile-tabbar">
+    <button class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Inbox</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>Buscar</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Chips</button>
+    <button><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M6 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/></svg>Eu</button>
+  </nav>
+</div>
+
+<script>
+/* =================================================================
+   DADOS MOCKADOS — representativos do Zydon Channel.
+   Estrutura espelha o que channel_panel.py já produz por conversa
+   (empresa/contato/port/chip/respostas/última msg) + camada comercial
+   nova (stage, SLA, score, HubSpot, próxima ação, notas, automações).
+   ================================================================= */
+const SDR = {
+  sarah:  {name:'Sarah',  initials:'S', color:'#F7B955'},
+  breno:  {name:'Breno',  initials:'B', color:'#7AA2FF'},
+  lucasb: {name:'Lucas Batista', initials:'L', color:'#20C997'},
+  lucasr: {name:'Lucas Resende', initials:'LR', color:'#c2a4ff'},
+  mariana:{name:'Mariana',initials:'M', color:'#FF6B6B'},
+};
+
+const QUEUES = [
+  {id:'responder', label:'Responder agora', count:3, hot:true, icon:'bolt'},
+  {id:'meus',      label:'Meus leads',       count:12, icon:'user'},
+  {id:'semresp',   label:'Sem resposta',     count:9, icon:'clock'},
+  {id:'diag',      label:'Diagnóstico enviado', count:14, icon:'doc'},
+  {id:'pc',        label:'1º contato SDR',    count:21, icon:'hand'},
+  {id:'resolvidas',label:'Resolvidas',        count:48, icon:'check'},
+  {id:'erros',     label:'Erros / Offline',   count:2, alert:true, icon:'alert'},
+];
+
+const CHIPS = [
+  {label:'Sarah 1', port:4601, st:'on',  vol:'38/dia'},
+  {label:'Sarah 2', port:4604, st:'on',  vol:'41/dia'},
+  {label:'Breno 1', port:4602, st:'on',  vol:'34/dia'},
+  {label:'Breno 2', port:4605, st:'warn',vol:'52/dia'},
+  {label:'Lucas B.',port:4603, st:'on',  vol:'29/dia'},
+  {label:'Lucas R.',port:4606, st:'on',  vol:'22/dia'},
+  {label:'Mariana', port:4600, st:'on',  vol:'17/dia'},
+  {label:'Rafael',  port:4607, st:'off', vol:'0/dia'},
+];
+
+const CONV = [
+  {
+    id:'c1', company:'Grupo Maranno', contact:'Patrícia Lemes', role:'Gerente Comercial',
+    phone:'+55 21 9•••• ••07', sdr:'sarah', chip:'Sarah 2', port:4604,
+    stage:'reply', badge:{cls:'b-reply', label:'Respondeu'}, hasReply:true, unread:true,
+    queues:['responder','meus'], sla:{cls:'now', label:'Responder agora'},
+    last:{from:'lead', text:'Tenho interesse, consigo ver amanhã?'}, time:'há 4 min', urgent:true,
+    score:88, scoreLabel:'Lead quente', tags:[{t:'Interesse explícito',hot:true},{t:'MQL'},{t:'Reunião provável'}],
+    hubspot:{owner:'Sarah Andrade', stage:'Qualificação', lifecycle:'MQL', activity:'Resposta WhatsApp · há 4 min'},
+    nextAction:'Lead pediu reunião para amanhã. Ofereça 2 horários e confirme o e-mail antes de enviar o convite.',
+    notes:[{who:'sarah',name:'Sarah',time:'há 2 d',text:'Já tinha baixado material no site. Empresa de embalagens com 3 plantas.'}],
+    automations:[
+      {cls:'ok', t:'Diagnóstico enviado (PDF)', s:'Cron MQL · há 2 dias'},
+      {cls:'info', t:'1º contato SDR', s:'Sarah 2 · há 2 dias'},
+      {cls:'ok', t:'Resposta do lead recebida', s:'há 4 min'},
+    ],
+    health:{vol:41, cap:60, rate:'19%', risk:'Baixo'},
+    msgs:[
+      {kind:'day', label:'Quinta · 22 jun'},
+      {kind:'event', cls:'', ic:'doc', title:'Diagnóstico enviado', et:'09:12', desc:'Diagnóstico de digitalização gerado e enviado por automação MQL.'},
+      {kind:'pdf', side:'out', name:'Diagnóstico-Grupo-Maranno.pdf', meta:'PDF · 1.2 MB · enviado', who:'Automação Zydon', time:'09:12'},
+      {kind:'bubble', side:'out', who:'Sarah · Sarah 2', text:'Oi Patrícia, tudo bem? Sou a Sarah, da Zydon. Preparei um diagnóstico rápido sobre digitalização pra operação do Grupo Maranno — te enviei em PDF acima. Posso te mostrar onde dá pra ganhar tempo?', time:'09:13', read:true},
+      {kind:'day', label:'Hoje · 24 jun'},
+      {kind:'leadflag'},
+      {kind:'bubble', side:'in', lead:true, who:'Patrícia Lemes', text:'Tenho interesse, consigo ver amanhã?', time:'14:38'},
+    ],
+  },
+  {
+    id:'c2', company:'LightShip Embalagens', contact:'Marcelo Tavares', role:'Diretor de Operações',
+    phone:'+55 11 9•••• ••32', sdr:'sarah', chip:'Sarah 2', port:4604,
+    stage:'diag', badge:{cls:'b-diag', label:'Diagnóstico'}, hasReply:false, unread:false,
+    queues:['diag','meus','semresp','responder'], sla:{cls:'warn', label:'há 3 h sem resposta'},
+    last:{from:'sdr', text:'…te mostrar onde dá pra ganhar tempo na operação?'}, time:'há 3 h',
+    score:64, scoreLabel:'Em qualificação', tags:[{t:'MQL'},{t:'Operação'},{t:'Sem resposta'}],
+    hubspot:{owner:'Sarah Andrade', stage:'Diagnóstico enviado', lifecycle:'MQL', activity:'PDF enviado · há 3 h'},
+    nextAction:'Diagnóstico entregue, sem resposta há 3h. Envie um follow-up curto com 1 insight do PDF para reabrir a conversa.',
+    notes:[],
+    automations:[
+      {cls:'ok', t:'Diagnóstico enviado (PDF)', s:'Cron MQL · há 3 h'},
+      {cls:'info', t:'1º contato SDR', s:'Sarah 2 · há 3 h'},
+    ],
+    health:{vol:41, cap:60, rate:'19%', risk:'Baixo'},
+    msgs:[
+      {kind:'day', label:'Hoje · 24 jun'},
+      {kind:'event', cls:'', ic:'doc', title:'Diagnóstico enviado', et:'11:40', desc:'Diagnóstico de digitalização gerado para LightShip Embalagens.'},
+      {kind:'pdf', side:'out', name:'Diagnóstico-LightShip.pdf', meta:'PDF · 1.1 MB · enviado', who:'Automação Zydon', time:'11:40'},
+      {kind:'event', cls:'', ic:'hand', title:'1º contato SDR', et:'11:41', desc:'Mensagem de abertura enviada pelo chip Sarah 2.'},
+      {kind:'bubble', side:'out', who:'Sarah · Sarah 2', text:'Oi Marcelo, tudo certo? Sou a Sarah, da Zydon. Montei um diagnóstico rápido de digitalização pra LightShip (mandei o PDF acima). Posso te mostrar onde dá pra ganhar tempo na operação?', time:'11:41', read:false},
+    ],
+  },
+  {
+    id:'c3', company:'IA Crono', contact:'Rodrigo Salles', role:'Founder',
+    phone:'+55 31 9•••• ••18', sdr:'breno', chip:'Breno 1', port:4602,
+    stage:'pc', badge:{cls:'b-pc', label:'1º contato'}, hasReply:false, unread:false,
+    queues:['pc','semresp'], sla:{cls:'ok', label:'há 1 d sem resposta'},
+    last:{from:'sdr', text:'Faz sentido a gente trocar uma ideia essa semana?'}, time:'ontem',
+    score:52, scoreLabel:'Primeiro contato', tags:[{t:'1º contato'},{t:'Tech'},{t:'Aguardando'}],
+    hubspot:{owner:'Breno Lima', stage:'Primeiro contato', lifecycle:'Lead', activity:'Mensagem enviada · ontem'},
+    nextAction:'1º contato sem retorno há 1 dia. Aguardar mais 24h antes do follow-up para não saturar o chip.',
+    notes:[{who:'breno',name:'Breno',time:'ontem',text:'Startup de IA, veio de indicação. Vale insistir com cuidado.'}],
+    automations:[{cls:'info', t:'1º contato SDR', s:'Breno 1 · ontem'}],
+    health:{vol:34, cap:60, rate:'12%', risk:'Baixo'},
+    msgs:[
+      {kind:'day', label:'Ontem · 23 jun'},
+      {kind:'event', cls:'', ic:'hand', title:'1º contato SDR', et:'16:20', desc:'Abertura enviada por Breno pelo chip Breno 1.'},
+      {kind:'bubble', side:'out', who:'Breno · Breno 1', text:'Fala Rodrigo! Aqui é o Breno, da Zydon. Acompanho o que vocês estão construindo na IA Crono e acho que tem sinergia com o que fazemos. Faz sentido a gente trocar uma ideia essa semana?', time:'16:20', read:false},
+    ],
+  },
+  {
+    id:'c4', company:'HIPER STOK', contact:'Juliana Prado', role:'Head de Logística',
+    phone:'+55 47 9•••• ••55', sdr:'lucasb', chip:'Lucas B.', port:4603,
+    stage:'pc', badge:{cls:'b-pc', label:'1º contato'}, hasReply:false, unread:false,
+    queues:['pc','semresp'], sla:{cls:'ok', label:'há 5 h sem resposta'},
+    last:{from:'sdr', text:'Posso te mandar um diagnóstico rápido do estoque de vocês?'}, time:'há 5 h',
+    score:58, scoreLabel:'Primeiro contato', tags:[{t:'1º contato'},{t:'Logística'},{t:'ICP forte'}],
+    hubspot:{owner:'Lucas Batista', stage:'Primeiro contato', lifecycle:'Lead', activity:'Mensagem enviada · há 5 h'},
+    nextAction:'ICP forte (logística/estoque). Se não responder até amanhã, ofereça o diagnóstico em PDF como gancho.',
+    notes:[],
+    automations:[{cls:'info', t:'1º contato SDR', s:'Lucas B. · há 5 h'}],
+    health:{vol:29, cap:60, rate:'14%', risk:'Baixo'},
+    msgs:[
+      {kind:'day', label:'Hoje · 24 jun'},
+      {kind:'event', cls:'', ic:'hand', title:'1º contato SDR', et:'09:50', desc:'Abertura enviada por Lucas pelo chip Lucas B.'},
+      {kind:'bubble', side:'out', who:'Lucas · Lucas B.', text:'Oi Juliana, tudo bem? Sou o Lucas, da Zydon. A gente ajuda operações de logística a enxergar gargalos de estoque sem trocar de sistema. Posso te mandar um diagnóstico rápido do estoque de vocês?', time:'09:50', read:false},
+    ],
+  },
+  {
+    id:'c5', company:'Caffeine Army', contact:'Diego Moraes', role:'Sócio',
+    phone:'+55 11 9•••• ••90', sdr:'breno', chip:'Breno 2', port:4605,
+    stage:'reply', badge:{cls:'b-reply', label:'Respondeu'}, hasReply:true, unread:true,
+    queues:['responder','meus'], sla:{cls:'now', label:'Responder agora'},
+    last:{from:'lead', text:'Qual o investimento? Me chama no comercial@…'}, time:'há 22 min',
+    score:79, scoreLabel:'Lead quente', tags:[{t:'Pediu preço',hot:true},{t:'MQL'},{t:'E-commerce'}],
+    hubspot:{owner:'Breno Lima', stage:'Qualificação', lifecycle:'MQL', activity:'Resposta WhatsApp · há 22 min'},
+    nextAction:'Lead pediu preço. Não jogue valor seco: qualifique volume e agende 15 min para apresentar a proposta certa.',
+    notes:[],
+    automations:[
+      {cls:'ok', t:'Diagnóstico enviado (texto)', s:'Cron MQL · há 1 d'},
+      {cls:'ok', t:'Resposta do lead recebida', s:'há 22 min'},
+    ],
+    health:{vol:52, cap:60, rate:'21%', risk:'Médio'},
+    msgs:[
+      {kind:'day', label:'Hoje · 24 jun'},
+      {kind:'bubble', side:'out', who:'Breno · Breno 2', text:'Oi Diego! Montei um diagnóstico rápido pra Caffeine Army sobre digitalização do comercial. Quer que eu te mostre?', time:'13:55', read:true},
+      {kind:'leadflag'},
+      {kind:'bubble', side:'in', lead:true, who:'Diego Moraes', text:'Qual o investimento? Me chama no comercial@caffeinearmy.com.br', time:'14:20'},
+    ],
+  },
+  {
+    id:'c6', company:'Copperbras Metais', contact:'Antônio Rezende', role:'Diretor',
+    phone:'+55 31 9•••• ••11', sdr:'lucasr', chip:'Lucas R.', port:4606,
+    stage:'meet', badge:{cls:'b-meet', label:'Reunião'}, hasReply:true, unread:false,
+    queues:['meus','resolvidas'], sla:{cls:'ok', label:'Reunião sex 16h'},
+    last:{from:'sdr', text:'Perfeito, confirmado pra sexta às 16h. Te mando o convite!'}, time:'há 1 d',
+    score:84, scoreLabel:'Reunião marcada', tags:[{t:'Reunião',hot:true},{t:'Indústria'}],
+    hubspot:{owner:'Lucas Resende', stage:'Reunião agendada', lifecycle:'SQL', activity:'Meeting criado · há 1 d'},
+    nextAction:'Reunião confirmada para sexta 16h. Envie 1 lembrete na sexta de manhã e prepare o caso de indústria.',
+    notes:[{who:'lucasr',name:'Lucas R.',time:'há 1 d',text:'Decisor direto. Quer ver ROI em 90 dias.'}],
+    automations:[
+      {cls:'ok', t:'Diagnóstico enviado (PDF)', s:'Cron MQL · há 3 d'},
+      {cls:'ok', t:'Reunião agendada', s:'há 1 d'},
+    ],
+    health:{vol:22, cap:60, rate:'24%', risk:'Baixo'},
+    msgs:[
+      {kind:'day', label:'Ontem · 23 jun'},
+      {kind:'bubble', side:'in', lead:true, who:'Antônio Rezende', text:'Consigo na sexta de tarde.', time:'10:02'},
+      {kind:'bubble', side:'out', who:'Lucas R. · Lucas R.', text:'Perfeito, confirmado pra sexta às 16h. Te mando o convite!', time:'10:05', read:true},
+      {kind:'event', cls:'', ic:'cal', title:'Reunião agendada', et:'10:06', desc:'Sexta, 27 jun · 16h00 — registrada no HubSpot.'},
+    ],
+  },
+  {
+    id:'c7', company:'Schmidt Alimentos', contact:'+55 11 9•••• ••03', role:'',
+    phone:'+55 11 9•••• ••03', sdr:'breno', chip:'Breno 2', port:4605,
+    stage:'erro', badge:{cls:'b-done', label:'Falha no envio'}, hasReply:false, unread:false,
+    queues:['erros'], sla:{cls:'warn', label:'Reenvio pendente'},
+    last:{from:'auto', text:'Falha ao enviar: chip Breno 2 instável (rate limit).'}, time:'há 40 min',
+    score:0, scoreLabel:'—', tags:[{t:'Erro de envio'},{t:'Chip instável'}],
+    hubspot:{owner:'Breno Lima', stage:'—', lifecycle:'Lead', activity:'Falha de envio · há 40 min'},
+    nextAction:'Envio falhou por instabilidade do chip Breno 2. Reenvie por outro chip ou aguarde a janela do chip normalizar.',
+    notes:[],
+    automations:[{cls:'info', t:'Tentativa de 1º contato', s:'Breno 2 · falhou · há 40 min'}],
+    health:{vol:52, cap:60, rate:'21%', risk:'Médio'},
+    msgs:[
+      {kind:'day', label:'Hoje · 24 jun'},
+      {kind:'event', cls:'warn', ic:'alert', title:'Falha no envio', et:'13:58', desc:'Chip Breno 2 retornou erro de rate limit. Mensagem não entregue.'},
+    ],
+  },
+];
+
+/* ---------- ícones ---------- */
+const ICONS = {
+  bolt:'<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
+  user:'<circle cx="12" cy="8" r="4"/><path d="M6 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/>',
+  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  doc:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
+  hand:'<path d="M18 11V6a2 2 0 0 0-4 0v5M14 10V4a2 2 0 0 0-4 0v6M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2a8 8 0 0 1-7.4-5l-.6-1.5a2 2 0 0 1 3.5-2L8 14"/>',
+  check:'<path d="M20 6 9 17l-5-5"/>',
+  alert:'<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+  cal:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+};
+function svg(p, w){return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w||2}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`}
+
+/* ---------- estado ---------- */
+let activeQueue = 'responder';
+let activeConv = 'c1';
+let sdrFilter = null;
+let mode = 'reply';
+const QLABEL = Object.fromEntries(QUEUES.map(q=>[q.id,q.label]));
+
+/* ---------- render sidebar ---------- */
+function renderNav(){
+  document.getElementById('nav').innerHTML = '<div class="nav-label">Filas</div>' + QUEUES.map(q=>`
+    <div class="q ${q.id===activeQueue?'active':''}" data-q="${q.id}" onclick="selectQueue('${q.id}')" title="${q.label}">
+      <span class="ic">${svg(ICONS[q.icon],1.9)}</span>
+      <span class="qlabel">${q.label}</span>
+      ${q.alert?'<span class="dot"></span>':''}
+      <span class="count ${q.hot?'hot':''}">${q.count}</span>
+    </div>`).join('');
+}
+function renderChips(){
+  const on = CHIPS.filter(c=>c.st==='on').length;
+  document.getElementById('chipsOnline').textContent = `${on}/${CHIPS.length} online`;
+  document.getElementById('chipsList').innerHTML = CHIPS.map(c=>`
+    <div class="chip-row">
+      <span class="st ${c.st}"></span>
+      <span class="who">${c.label}</span>
+      <span class="vol">${c.vol}</span>
+    </div>`).join('');
+}
+
+/* ---------- render filters ---------- */
+function renderFilters(){
+  const sdrs = [...new Set(CONV.map(c=>c.sdr))];
+  document.getElementById('filters').innerHTML =
+    `<button class="fchip ${!sdrFilter?'on':''}" onclick="setSdr(null)">Todos</button>` +
+    sdrs.map(s=>`<button class="fchip ${sdrFilter===s?'on':''}" onclick="setSdr('${s}')"><span class="av" style="background:${SDR[s].color}">${SDR[s].initials}</span>${SDR[s].name}</button>`).join('') +
+    `<button class="fchip" onclick="return false">Todos os chips ▾</button>`;
+}
+
+/* ---------- render list ---------- */
+function visibleConvs(){
+  const term = (document.getElementById('search').value||'').toLowerCase().trim();
+  return CONV.filter(c=>{
+    if(!c.queues.includes(activeQueue)) return false;
+    if(sdrFilter && c.sdr!==sdrFilter) return false;
+    if(term){
+      const hay = (c.company+' '+c.contact+' '+c.role+' '+c.phone+' '+c.last.text).toLowerCase();
+      if(!hay.includes(term)) return false;
+    }
+    return true;
+  }).sort((a,b)=> (b.hasReply?1:0)-(a.hasReply?1:0));
+}
+function renderCards(){
+  const list = visibleConvs();
+  document.getElementById('queueTitle').textContent = QLABEL[activeQueue];
+  document.getElementById('queueCount').textContent = `${list.length} ${list.length===1?'conversa':'conversas'}`;
+  const el = document.getElementById('cards');
+  if(!list.length){
+    el.innerHTML = `<div class="empty">${svg('<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/>',1.6)}<b>Nada para responder agora</b><span>Você está em dia com esta fila. 🎉</span></div>`;
+    return;
+  }
+  el.innerHTML = list.map(c=>{
+    const s = SDR[c.sdr];
+    const fromCls = c.last.from==='lead'?'lead':c.last.from==='auto'?'auto':'sdr';
+    const fromLbl = c.last.from==='lead'?'Lead':c.last.from==='auto'?'Auto':s.name;
+    return `<button class="card ${c.id===activeConv?'active':''} ${c.hasReply?'reply':''} ${c.unread?'unreadcard':''}" onclick="selectConv('${c.id}')">
+      <div class="row1">
+        <span class="company">${esc(c.company)}</span>
+        <span class="time ${c.urgent?'urgent':''}">${c.time}</span>
+      </div>
+      <div class="contact">${esc(c.contact)}${c.role?` · <span class="role">${esc(c.role)}</span>`:''}</div>
+      <div class="preview"><span class="from ${fromCls}">${fromLbl}:</span><span class="txt">${esc(c.last.text)}</span></div>
+      <div class="row3">
+        <span class="badge ${c.badge.cls}">${c.badge.label}</span>
+        <span class="owner"><span class="av" style="background:${s.color}">${s.initials}</span>${s.name}</span>
+        <span class="spacer"></span>
+        <span class="sla ${c.sla.cls}"><span class="pulse"></span>${c.sla.label}</span>
+      </div>
+    </button>`;
+  }).join('');
+}
+
+/* ---------- render conversation ---------- */
+function renderConv(){
+  const c = CONV.find(x=>x.id===activeConv);
+  if(!c) return;
+  const s = SDR[c.sdr];
+  document.getElementById('convAva').textContent = initials(c.company);
+  document.getElementById('convCompany').innerHTML = `${esc(c.company)} <span class="badge ${c.badge.cls}">${c.badge.label}</span>`;
+  document.getElementById('convSub').innerHTML =
+    `<span>${esc(c.contact)}${c.role?' · '+esc(c.role):''}</span>
+     <span class="dotsep"></span>
+     <a href="#">${esc(c.phone)}</a>
+     <span class="dotsep"></span>
+     <span class="owner"><span class="av" style="background:${s.color}">${s.initials}</span> ${s.name} · Chip ${c.chip}</span>`;
+  document.getElementById('composer').placeholder = `Responder como ${s.name} pelo chip ${c.chip}…`;
+
+  document.getElementById('timeline').innerHTML = c.msgs.map(m=>renderMsg(m, c)).join('');
+  const tl = document.getElementById('timeline'); tl.scrollTop = tl.scrollHeight;
+  renderQuick(c);
+  renderContext(c);
+}
+function renderMsg(m, c){
+  if(m.kind==='day') return `<div class="day-sep"><span>${esc(m.label)}</span></div>`;
+  if(m.kind==='leadflag') return `<div class="lead-flag">${svg('<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',2)} Resposta do lead</div>`;
+  if(m.kind==='event'){
+    return `<div class="event"><div class="event-card ${m.cls}">
+      <div class="eic">${svg(ICONS[m.ic],2)}</div>
+      <div class="ebody"><div class="etitle">${esc(m.title)}<span class="et">${esc(m.et)}</span></div>
+      <div class="edesc">${esc(m.desc)}</div></div></div></div>`;
+  }
+  if(m.kind==='pdf'){
+    return `<div class="brow ${m.side}"><div class="bmeta"><span class="who">${esc(m.who)}</span> · ${esc(m.time)}</div>
+      <div class="pdf"><div class="pic"><span>PDF</span></div>
+      <div class="pmeta"><b>${esc(m.name)}</b><span>${esc(m.meta)}</span></div>
+      <div class="dl">${svg('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',2)}</div></div></div>`;
+  }
+  // bubble
+  const cls = m.lead?'lead':m.side;
+  const read = m.side==='out' ? `<span class="check">${svg('<path d="M18 7 9.5 15.5 6 12"/><path d="M22 7l-8.5 8.5"/>', m.read?2:2)}</span>` : '';
+  return `<div class="brow ${m.side} ${m.lead?'lead':''}">
+    <div class="bmeta"><span class="who">${esc(m.who)}</span></div>
+    <div class="bubble">${esc(m.text)}</div>
+    <div class="btime">${esc(m.time)}${m.side==='out'?(m.read?' · lida':' · entregue'):''}</div>
+  </div>`;
+}
+function renderQuick(c){
+  const qrs = c.hasReply
+    ? ['👋 Agradecer interesse','📅 Oferecer 2 horários','💬 Pedir e-mail','✨ Sugestão IA']
+    : ['🔁 Follow-up gentil','📄 Reforçar diagnóstico','📅 Propor conversa','✨ Sugestão IA'];
+  document.getElementById('quick').innerHTML = qrs.map(q=>{
+    const ai = q.includes('IA');
+    return `<button class="${ai?'ai':''}">${ai?svg('<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',2):''}${q}</button>`;
+  }).join('');
+}
+
+/* ---------- render context ---------- */
+function renderContext(c){
+  const s = SDR[c.sdr];
+  const scoreColor = c.score>=75?'var(--accent)':c.score>=50?'var(--warning)':'var(--muted)';
+  const dash = c.score>0 ? (c.score/100)*125.6 : 0;
+  document.getElementById('ctxBody').innerHTML = `
+    <div class="ctx-id">
+      <div class="top">
+        <div class="ava" style="background:linear-gradient(140deg,${s.color},#0008)">${initials(c.company)}</div>
+        <div class="nm"><b>${esc(c.company)}</b><span>${esc(c.contact)}${c.role?' · '+esc(c.role):''}</span></div>
+      </div>
+      ${c.score>0?`<div class="score">
+        <div class="ring"><svg width="46" height="46"><circle cx="23" cy="23" r="20" stroke="var(--surface-hi)" stroke-width="4" fill="none"/><circle cx="23" cy="23" r="20" stroke="${scoreColor}" stroke-width="4" fill="none" stroke-linecap="round" stroke-dasharray="${dash} 999"/></svg><span class="val" style="color:${scoreColor}">${c.score}</span></div>
+        <div class="sc-meta"><b>${esc(c.scoreLabel)}</b><span>Score de prioridade</span></div>
+      </div>`:''}
+      <div class="tags">${c.tags.map(t=>`<span class="tag ${t.hot?'hot':''}">${esc(t.t)}</span>`).join('')}</div>
+    </div>
+
+    <div class="section">
+      <div class="next">
+        <div class="nh">${svg('<path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',2)} Próxima ação sugerida</div>
+        <p>${esc(c.nextAction)}</p>
+        <div class="nbtns">
+          <button class="btn primary">${svg('<path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/>',2)} Responder</button>
+          <button class="btn">${svg(ICONS.check,2)} Criar tarefa</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h5>HubSpot CRM <span class="hs">Conectado</span></h5>
+      <div class="kv"><span class="k">Owner</span><span class="v"><span class="av" style="background:${s.color}">${s.initials}</span>${esc(c.hubspot.owner)}</span></div>
+      <div class="kv"><span class="k">Deal stage</span><span class="v"><span class="stage">${esc(c.hubspot.stage)}</span></span></div>
+      <div class="kv"><span class="k">Lifecycle</span><span class="v">${esc(c.hubspot.lifecycle)}</span></div>
+      <div class="kv"><span class="k">Última atividade</span><span class="v">${esc(c.hubspot.activity)}</span></div>
+    </div>
+
+    <div class="section">
+      <h5>Notas internas</h5>
+      ${c.notes.map(n=>`<div class="note-item"><div class="nm"><span class="av" style="background:${SDR[n.who].color}">${SDR[n.who].initials}</span><b>${esc(n.name)}</b><span>${esc(n.time)}</span></div><p>${esc(n.text)}</p></div>`).join('')}
+      <button class="add-note">${svg('<path d="M12 5v14M5 12h14"/>',2)} Adicionar nota interna…</button>
+    </div>
+
+    <div class="section">
+      <h5>Histórico de automações</h5>
+      <div class="auto-log">
+        ${c.automations.map(a=>`<div class="auto-item ${a.cls}"><span class="ad"></span><b>${esc(a.t)}</b><span>${esc(a.s)}</span></div>`).join('')}
+      </div>
+    </div>
+
+    <div class="section" style="border-bottom:0">
+      <h5>Saúde do chip · ${esc(c.chip)} <span style="margin-left:auto;font-size:10px;color:var(--muted);letter-spacing:0;text-transform:none">porta ${c.port}</span></h5>
+      <div class="health">
+        <div class="hcell"><div class="hl">Volume hoje</div><div class="hv">${c.health.vol}<small>/${c.health.cap}</small></div><div class="bar ${c.health.vol/c.health.cap>0.8?'warn':''}"><i style="width:${Math.round(c.health.vol/c.health.cap*100)}%"></i></div></div>
+        <div class="hcell"><div class="hl">Taxa de resposta</div><div class="hv">${esc(c.health.rate)}</div><div class="bar"><i style="width:${c.health.rate}"></i></div></div>
+        <div class="hcell"><div class="hl">Risco de bloqueio</div><div class="hv" style="font-size:14px;color:${c.health.risk==='Baixo'?'var(--success)':'var(--warning)'}">${esc(c.health.risk)}</div></div>
+        <div class="hcell"><div class="hl">Status</div><div class="hv" style="font-size:14px;color:var(--success)">Online</div></div>
+      </div>
+    </div>`;
+}
+
+/* ---------- helpers ---------- */
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function initials(s){const w=String(s).trim().split(/\s+/);return ((w[0]||'')[0]||'')+((w[1]||'')[0]||'').toUpperCase()}
+
+/* ---------- interações ---------- */
+function selectQueue(q){activeQueue=q;renderNav();renderCards();const list=visibleConvs();if(list.length&&!list.find(c=>c.id===activeConv)){selectConv(list[0].id)}}
+function setSdr(s){sdrFilter=s;renderFilters();renderCards()}
+function selectConv(id){activeConv=id;const c=CONV.find(x=>x.id===id);if(c)c.unread=false;renderCards();renderConv();document.getElementById('app').classList.add('conv-open')}
+function setMode(m){mode=m;document.getElementById('cbox').classList.toggle('note',m==='note');document.getElementById('tabReply').classList.toggle('on',m==='reply');document.getElementById('tabNote').classList.toggle('on',m==='note');document.getElementById('tabNote').classList.toggle('noteon',m==='note');document.getElementById('sendLabel').textContent=m==='note'?'Salvar nota':'Enviar';document.getElementById('sendBtn').classList.toggle('note',m==='note');const t=document.getElementById('composer');t.placeholder=m==='note'?'Nota interna (só o time vê)…':t.placeholder}
+function toggleCtx(force){const a=document.getElementById('app');if(force===false)a.classList.remove('ctx-open');else a.classList.toggle('ctx-open')}
+function mobileBack(){document.getElementById('app').classList.remove('conv-open')}
+
+document.getElementById('search').addEventListener('input',renderCards);
+document.querySelectorAll('.seg button').forEach(b=>b.addEventListener('click',e=>{document.querySelectorAll('.seg button').forEach(x=>x.classList.remove('on'));e.target.classList.add('on')}));
+const ta=document.getElementById('composer');
+ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px'});
+document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='TEXTAREA'){e.preventDefault();document.getElementById('search').focus()}});
+
+/* ---------- boot ---------- */
+renderNav();renderChips();renderFilters();renderCards();renderConv();
+</script>
+</body>
+</html>

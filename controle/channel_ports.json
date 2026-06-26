@@ -1,0 +1,50 @@
+{
+  "4600": {
+    "label": "Mariana",
+    "owner": "mariana",
+    "role": "comunicador",
+    "auth": "auth_single"
+  },
+  "4601": {
+    "label": "Sarah 1",
+    "owner": "sarah",
+    "role": "sdr",
+    "auth": "auth_4601"
+  },
+  "4603": {
+    "label": "Lucas Batista",
+    "owner": "lucas_batista",
+    "role": "sdr",
+    "auth": "auth_4603"
+  },
+  "4605": {
+    "label": "Breno 2",
+    "owner": "breno",
+    "role": "sdr",
+    "auth": "auth_4605_breno2"
+  },
+  "4606": {
+    "label": "Lucas Resende",
+    "owner": "lucas_resende",
+    "role": "comunicador",
+    "auth": "auth_4606_lucas_institucional"
+  },
+  "4607": {
+    "label": "Rafael",
+    "owner": "rafael",
+    "role": "comunicador",
+    "auth": "auth_4607_rafael_institucional"
+  },
+  "4609": {
+    "label": "João Pedro",
+    "owner": "joao_pedro",
+    "role": "comunicador",
+    "auth": "auth_4609_comunicador_2"
+  },
+  "4610": {
+    "label": "Gustavo",
+    "owner": "gustavo",
+    "role": "comunicador",
+    "auth": "auth_4610_gustavo"
+  }
+}

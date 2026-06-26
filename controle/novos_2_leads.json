@@ -1,0 +1,26 @@
+[
+  {
+    "company": "BodeBrown",
+    "de_qual_forma_mais_vende_hoje_em_dia": "Vendedor",
+    "email": "alexandre.spier@bodebrown.com.br",
+    "firstname": "Alexandre",
+    "lifecyclestage": "marketingqualifiedlead",
+    "qual_erp_utiliza_": "Outro",
+    "qual_o_faturamento_anual_da_sua_empresa_": "De R$1 milhão a R$5 milhões ao ano",
+    "quantas_pessoas_atuam_na_sua_empresa": "21_a_100_",
+    "vende_em_loja_virtual_": "Sim"
+  },
+  {
+    "company": "Ave Têxtil ",
+    "de_qual_forma_mais_vende_hoje_em_dia": "WhatsApp",
+    "email": "amanda@avetextil.com.br",
+    "firstname": "Amanda",
+    "lastname": "Valente",
+    "lifecyclestage": "lead",
+    "phone": "+55(48)99174-4106",
+    "qual_erp_utiliza_": "Outro",
+    "qual_o_faturamento_anual_da_sua_empresa_": "De R$1 milhão a R$5 milhões ao ano",
+    "quantas_pessoas_atuam_na_sua_empresa": "1_a_10",
+    "vende_em_loja_virtual_": "não"
+  }
+]

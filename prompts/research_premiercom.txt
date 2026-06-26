@@ -1,0 +1,14 @@
+Pesquise na web a empresa "Premier Comunicação" ligada ao email lorini@premiercom.com.br (contato Ilson Lorini), e o contexto de "cooperativas" no segmento.
+
+Dados que o lead preencheu no formulário HubSpot:
+- Empresa: Premier Comunicação
+- Segmento declarado: "Cooperativas"
+- ERP utilizado: "Outro"
+
+Preciso saber:
+1. O que é a Premier Comunicação (premiercom.com.br)? É telecom, distribuidora, varejo, representante?
+2. Trata-se de uma cooperativa de crédito, cooperativa de consumo/distribuição, ou outro tipo?
+3. Qual o porte real e a operação? Vende B2B (para outras empresas) ou varejo?
+4. É uma distribuidora/atacadista/indústria (nosso ICP) ou está fora (varejo/serviços)?
+
+Responda de forma objetiva em até 6 linhas. No final, dê UM insight curto e específico (1 frase, SEM mencionar ERP, sistema de gestão, integração, API ou go-live) sobre o potencial de digitalização B2B, no formato "dá pra [benefício tangível]". Se a empresa for claramente varejo/serviços/fora do ICP atacado-distribuidor-indústria, diga explicitamente "FORA DO ICP" no final.

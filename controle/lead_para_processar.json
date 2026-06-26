@@ -1,0 +1,33 @@
+{
+  "lead": {
+    "properties": {
+      "firstname": "Guilherme",
+      "lastname": "Bim",
+      "email": "guilherme.bim@sharpmetal.com.br",
+      "company": "Sharp",
+      "phone": "11971840319",
+      "hs_searchable_calculated_phone_number": "11971840319",
+      "createdate": "2026-06-21T17:59:29Z",
+      "lifecyclestage": "lead",
+      "hs_meeting_booked": "",
+      "qual_documento_ou_identificador_da_reuni_o_": "",
+      "qual_a_rea_de_atuao_de_sua_empresa_ex_nicho_de_autopeas_nicho_de_supermercados": "",
+      "de_qual_forma_mais_vende_hoje_em_dia": "",
+      "qual_erp_utiliza_": "",
+      "selecione_o_sistema_de_gesto_erp": "",
+      "quantos_vendedores_internos_sua_empresa_possui": "",
+      "quantas_pessoas_atuam_na_sua_empresa": "",
+      "qual_o_faturamento_anual_da_sua_empresa_": "",
+      "selecione_a_faixa_de_faturamento": "",
+      "e_qual_faturamento_anual_da_sua_empresa": "",
+      "selecione_a_faixa_de_faturamento_atual_por_ano_da_sua_empresa": "",
+      "voc_vende_para_quem_ex_padarias_restaurantes_petshop_autopeas_supermercados": "",
+      "vende_em_loja_virtual_": "",
+      "qual_seria_o_maior_problema_que_voc_enfrenta_em_sua_operao_atualmente": "",
+      "voc_acredita_que_o_seu_cliente_compraria_sozinho_na_sua_loja_24h_por_dia_sem_precisar_de_vendedor": "",
+      "hs_object_id": ""
+    }
+  },
+  "email": "guilherme.bim@sharpmetal.com.br",
+  "phone": "11971840319"
+}

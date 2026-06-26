@@ -1,0 +1,14 @@
+Pesquise na web a empresa "Luma Ville" ligada ao email financeiro@lumaville.com.br (contato Lucilene de Oliveira).
+
+Dados que o lead preencheu no formulário HubSpot:
+- Empresa: Luma Ville
+- Segmento declarado: "Lojas de roupas"
+- ERP utilizado: "Bling"
+
+Preciso saber:
+1. O que é a Luma Ville? É uma rede de lojas de roupas (varejo), uma confecção/indústria têxtil, ou um atacadista/distribuidor de moda?
+2. Qual o porte real (número de lojas, faturamento aproximado)?
+3. A empresa faz atacado/distribuição B2B (vende para outras lojas/revendas) ou é só varejo (loja vendendo para consumidor final)?
+4. É uma cadeia/rede com múltiplas lojas (que teria operação B2B de abastecimento) ou loja única de varejo?
+
+Responda de forma objetiva em até 6 linhas. No final, dê UM insight curto e específico (1 frase, SEM mencionar ERP, sistema de gestão, integração, API ou go-live) sobre o potencial de digitalização B2B, no formato "dá pra [benefício tangível]". Se a empresa for claramente varejo de loja única (fora do ICP atacado-distribuidor-indústria), diga explicitamente "FORA DO ICP". Se for uma rede/atacadista de moda (dentro do ICP), diga "DENTRO DO ICP".
