@@ -10,11 +10,11 @@ NÃO substitui o painel atual: roda em paralelo (porta default 8791) e consome
 exatamente os mesmos dados reais. Não toca em bridges, crons ou watchdog.
 """
 from __future__ import annotations
-import argparse, base64, binascii, hashlib, hmac, html, http.cookies, json, mimetypes, os, re, secrets, subprocess, threading, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import argparse, base64, binascii, faulthandler, hashlib, hmac, html, http.cookies, json, mimetypes, os, re, secrets, signal, subprocess, threading, time, unicodedata, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
 
 PROJECT = Path('/root/.hermes/zydon-prospeccao')
 WA_EXTRA = Path('/root/.hermes/whatsapp-extra')
@@ -23,6 +23,7 @@ UPLOADS_DIR = DATA_DIR / 'uploads'
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # CH-018: limite simples de 20MB decodificado
 USERS_FILE = PROJECT / 'controle' / 'channel_users.json'
 WPP_ENVIOS_FILE = PROJECT / 'controle' / 'wpp_envios.json'
+OUTBOUND_AUDIT_FILE = PROJECT / 'controle' / 'channel_outbound_audit.jsonl'
 MEDIA_PROXY_PREFIX = '/media/'
 GROUP_JID = '120363408131718880@g.us'
 # CH-057: conversas iniciadas por chips institucionais/gestores também devem
@@ -59,9 +60,9 @@ INSTITUTIONAL_PRIVATE_PORTS = {p for p, meta in PORTS.items()} if False else set
 
 DEFAULT_PORTS = {
     4600: {'label':'Mariana', 'owner':'mariana', 'role':'comunicador', 'auth':'auth_single'},
-    4601: {'label':'Sarah 1', 'owner':'sarah', 'role':'sdr', 'auth':'auth_4601'},
+    4601: {'label':'Sarah', 'owner':'sarah', 'role':'sdr', 'auth':'auth_4601'},
     4603: {'label':'Lucas Batista', 'owner':'lucas_batista', 'role':'sdr', 'auth':'auth_4603'},
-    4605: {'label':'Breno 2', 'owner':'breno', 'role':'sdr', 'auth':'auth_4605_breno2'},
+    4605: {'label':'Breno', 'owner':'breno', 'role':'sdr', 'auth':'auth_4605_breno2'},
     4606: {'label':'Lucas Resende', 'owner':'lucas_resende', 'role':'comunicador', 'auth':'auth_4606_lucas_institucional'},
     4607: {'label':'Rafael', 'owner':'rafael', 'role':'comunicador', 'auth':'auth_4607_rafael_institucional'},
     4609: {'label':'João Pedro', 'owner':'joao_pedro', 'role':'comunicador', 'auth':'auth_4609_comunicador_2'},
@@ -212,20 +213,64 @@ def is_institutional_dispatch_msg(m):
         return has_meta
     return False
 
+def is_operational_channel_msg(m):
+    """Mensagem que prova que a conversa pertence ao fluxo operacional Zydon.
+
+    A inbox não é espelho dos WhatsApps: só entra conversa iniciada/registrada
+    por automação/envio nosso (wpp_envios, cron, api-send ou metadados de lead/deal).
+    """
+    if not isinstance(m, dict):
+        return False
+    typ=str(m.get('type') or '')
+    src=str(m.get('source') or '')
+    status=str(m.get('status') or m.get('msg_status') or '').lower()
+    sender=str(m.get('sender') or '')
+    if typ.startswith('cron-') or typ in ('seed-wpp-envios','api-send') or sender == 'cron-import':
+        return True
+    if 'wpp_envios' in src or 'controle/' in src or 'operational' in src or 'fastlane' in src:
+        return True
+    if status.startswith('enviado') or status.startswith('correcao_') or status.startswith('nao_mql') or status.startswith('não_mql'):
+        return True
+    for k in ('automation','sdr','empresa','lead','email','slug','owner_id','hubspot_owner_id','deal_id','deal_ids','contact_id','bridge_port','group_bridge_port','dispatchPort','leadOwnerId'):
+        if m.get(k):
+            return True
+    return False
+
+def operational_rows_for_chat(port, chat, max_age_hours=24*90):
+    rows=[]
+    try:
+        for m in wpp_envios_fastlane_events([int(port)], max_age_hours=max_age_hours):
+            if isinstance(m, dict) and message_matches_chat(m, chat) and is_operational_channel_msg(m):
+                rows.append(m)
+    except Exception:
+        pass
+    return rows
+
+def operational_conversation_has_origin(port, chat):
+    if is_institutional_port(port):
+        return bool(_institutional_dispatch_rows_for_chat(port, chat))
+    for m in _raw_history_for_chat(port, chat):
+        if is_operational_channel_msg(m):
+            return True
+    return bool(operational_rows_for_chat(port, chat))
+
 def institutional_dispatch_owner_uid_from_msgs(msgs):
     for m in msgs:
         uid = _conversation_sdr_hint_from_msg(m)
-        if uid in SDR_OWNER_UIDS:
+        # Normalmente é um SDR, mas alguns envios operacionais legítimos são do
+        # próprio comunicador/supervisor (ex.: Lucas Resende 4606). Se o evento já
+        # passou pelo filtro operacional, esse uid é seguro para auditoria.
+        if uid in USERS:
             return uid
     return ''
 
 DEFAULT_USERS = {
     'rafael': {'name':'Rafael', 'ports':[4600,4601,4603,4605,4606,4607,4609,4610], 'admin': True, 'view_all': True, 'role':'supervisor'},
-    'mariana': {'name':'Mariana', 'ports':[4600], 'admin': False, 'view_all': True, 'role':'comunicador'},
+    'mariana': {'name':'Mariana', 'ports':[4600,4601,4603,4605,4606,4607,4609,4610], 'admin': True, 'view_all': True, 'role':'supervisor'},
     'breno': {'name':'Breno', 'ports':[4605], 'admin': False, 'role':'sdr', 'hubspot_owner_id':'86265630'},
     'sarah': {'name':'Sarah', 'ports':[4601], 'admin': False, 'role':'sdr', 'hubspot_owner_id':'88063842'},
     'lucas_batista': {'name':'Lucas Batista', 'ports':[4603], 'admin': False, 'role':'sdr', 'hubspot_owner_id':'85778446'},
-    'lucas_resende': {'name':'Lucas Resende', 'ports':[4606], 'admin': False, 'view_all': True, 'role':'comunicador'},
+    'lucas_resende': {'name':'Lucas Resende', 'ports':[4600,4601,4603,4605,4606,4607,4609,4610], 'admin': True, 'view_all': True, 'role':'supervisor'},
     'gustavo': {'name':'Gustavo', 'ports':[4610], 'admin': False, 'role':'comunicador'},
     'joao_pedro': {'name':'João Pedro', 'ports':[4609], 'admin': False, 'role':'comunicador'},
 }
@@ -342,12 +387,27 @@ VALID_STATUSES = ('open', 'pending', 'resolved', 'archived')
 APP_ROUTES = {'/': 'conversas', '/index.html': 'conversas', '/conversas': 'conversas', '/foco': 'foco', '/gestao': 'gestao'}
 NOTE_PREVIEW_LEN = 160
 CONVERSATIONS_API_CACHE = {}
+CONVERSATIONS_PREWARM_FILE = PROJECT / 'controle' / 'channel_conversations_prewarm_operational_only_v3_identity.json'
 CONVERSATIONS_API_LOCK = threading.Lock()
 CONVERSATIONS_REFRESHING = set()
-CONVERSATIONS_API_TTL = 60
+CONVERSATIONS_API_TTL = 120
+CONVERSATIONS_MIN_REFRESH_INTERVAL = 120
+CONVERSATIONS_DEP_FILES = (WPP_ENVIOS_FILE,)
 MESSAGES_API_CACHE = {}
 MESSAGES_API_LOCK = threading.Lock()
 MESSAGES_REFRESHING = set()
+# CH-API-MSG-SINGLEFLIGHT: conjunto de conversas com cálculo síncrono em voo.
+# /api/messages já servia stale-while-revalidate quando havia cache, mas a PRIMEIRA
+# carga fria não tinha coalescing: durante disparo em lote (wpp_envios.json muda a
+# cada segundos e invalida _WPP_FASTLANE_CACHE) várias threads pediam a MESMA conv
+# fria e cada uma rodava messages_for síncrono (varredura de ledger de 14 dias p/
+# porta institucional). Isso empilhava dezenas de threads no processo único 8280
+# (visto: 134 threads / 110% CPU) e arrastava TODAS as rotas para 3-14s. Igual ao
+# singleflight que /api/conversations já tem, coalescemos por (uid, conv): só uma
+# thread computa, as demais aguardam o resultado quente. Sem mascarar nada — mesma
+# resposta, só sem recomputo redundante.
+MESSAGES_COMPUTING = set()
+OUTBOUND_AUDIT_LOCK = threading.Lock()
 MESSAGES_API_TTL = 15
 DISPATCH_ROWS_CACHE = {}
 DISPATCH_ROWS_TTL = 30
@@ -377,6 +437,7 @@ def invalidate_channel_api_cache(uid=None, conv_id=None):
             MESSAGES_API_CACHE.clear()
             CONVERSATION_PERMISSION_CACHE.clear()
             DISPATCH_ROWS_CACHE.clear()
+            _HISTORY_MERGED_CACHE.clear()
     except Exception:
         pass
     try:
@@ -394,6 +455,27 @@ def invalidate_channel_api_cache(uid=None, conv_id=None):
                 CONVERSATIONS_API_CACHE[k]['ts']=0
     except Exception:
         pass
+
+def conversations_dependency_mtime():
+    """Versão leve das fontes que alimentam /api/conversations.
+
+    A inbox depende tanto do ledger operacional (`wpp_envios.json`) quanto dos
+    `history_*.json` da bridge. Respostas/continuações reais do WhatsApp chegam no
+    history sem necessariamente tocar o ledger; se o cache olhar só o ledger, o
+    detalhe mostra a última mensagem mas o card fica preso no preview/horário antigo.
+    """
+    mtimes = []
+    paths = list(CONVERSATIONS_DEP_FILES)
+    try:
+        paths.extend(DATA_DIR.glob('history_*.json'))
+    except Exception:
+        pass
+    for p in paths:
+        try:
+            mtimes.append(float(p.stat().st_mtime))
+        except Exception:
+            mtimes.append(0.0)
+    return max(mtimes) if mtimes else 0.0
 
 _state_lock = threading.Lock()
 
@@ -503,7 +585,7 @@ ALLOWED_EMAIL_DOMAINS = ('zydon.com.br',)
 # localpart diferente do uid (ex.: rafael.calixto@zydon.com.br -> rafael).
 EMAIL_TO_UID = {
     'rafael': 'rafael', 'rafael.calixto': 'rafael', 'rafaelcalixto': 'rafael', 'calixto': 'rafael',
-    'mariana': 'mariana', 'mariana.silva': 'mariana', 'marianasilva': 'mariana',
+    'mariana': 'mariana', 'mariana.silva': 'mariana', 'marianasilva': 'mariana', 'mariana.cirilo': 'mariana', 'marianacirilo': 'mariana', 'cirilo': 'mariana',
     'breno': 'breno',
     'sarah': 'sarah',
     'lucas_batista': 'lucas_batista', 'lucas.batista': 'lucas_batista', 'lucasbatista': 'lucas_batista', 'batista': 'lucas_batista',
@@ -824,14 +906,63 @@ def denied_page_html(reason):
 def _event_message_id(m):
     for key in ('messageId','id'):
         v=str((m or {}).get(key) or '').strip()
-        if v and not v.startswith('wpp_'):
-            return v
+        if v and not v.startswith('wpp_') and not v.startswith('wpp_envios:'):
+            return re.sub(r'_(text|pdf|media|file|caption)$', '', v, flags=re.I)
     sr=(m or {}).get('send_response') or (m or {}).get('bridge') or {}
     if isinstance(sr, dict):
         v=str(sr.get('messageId') or sr.get('id') or '').strip()
         if v:
-            return v
+            return re.sub(r'_(text|pdf|media|file|caption)$', '', v, flags=re.I)
     return ''
+
+def _normalize_bridge_message_id(value):
+    v = str(value or '').strip()
+    if not v:
+        return ''
+    return re.sub(r'_(text|pdf|media|file|caption)$', '', v, flags=re.I)
+
+
+def bridge_message_ids(resp):
+    """Extrai IDs retornados pela bridge Baileys, inclusive respostas multipart."""
+    ids=[]
+    seen=set()
+    def add(v):
+        mid=_normalize_bridge_message_id(v)
+        if mid and mid not in seen:
+            seen.add(mid); ids.append(mid)
+    def walk(obj):
+        if isinstance(obj, dict):
+            add(obj.get('messageId'))
+            add(obj.get('id'))
+            for mid in obj.get('messageIds') or []:
+                add(mid)
+            for key in ('response','responses','result','results','bridge'):
+                if key in obj:
+                    walk(obj.get(key))
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+    walk(resp)
+    return ids
+
+
+def _split_send_message_ids(m):
+    """IDs reais quando o ledger representa um envio quebrado em partes."""
+    ids=[]
+    sr=(m or {}).get('send_response') or (m or {}).get('response') or {}
+    if isinstance(sr, dict):
+        for mid in sr.get('messageIds') or []:
+            if mid:
+                ids.append(str(mid))
+        for part in sr.get('responses') or []:
+            if not isinstance(part, dict):
+                continue
+            resp=part.get('response') if isinstance(part.get('response'), dict) else part
+            mid=(resp or {}).get('messageId') or (resp or {}).get('id')
+            if mid:
+                ids.append(str(mid))
+    return {re.sub(r'_(text|pdf|media|file|caption)$', '', x, flags=re.I) for x in ids if x}
+
 
 def _same_dispatch_payload(a, b):
     aid=_event_message_id(a); bid=_event_message_id(b)
@@ -843,7 +974,9 @@ def _same_dispatch_payload(a, b):
         return True
     am=str((a or {}).get('mediaName') or '').strip().lower()
     bm=str((b or {}).get('mediaName') or '').strip().lower()
-    return bool(am and bm and am == bm)
+    if am and bm and am == bm:
+        return True
+    return _same_diagnostic_pdf(a, b)
 
 def merge_institutional_ledger_with_real_messages(port, data):
     """Para chips institucionais, usa a hora REAL da bridge e metadados do ledger.
@@ -910,40 +1043,259 @@ def merge_institutional_ledger_with_real_messages(port, data):
                 best=(ei,ev); best_diff=diff
         if best:
             ei,ev=best; consumed_events.add(ei)
-            mm=dict(m)
-            # herda metadados de negócio/SDR, preservando id/timestamp reais da bridge
-            for k,v in ev.items():
-                if k in ('timestamp','timestampRaw','date'):
-                    continue
-                if k in ('id','messageId') and mm.get(k):
-                    continue
-                if v not in (None,'') and not mm.get(k):
-                    mm[k]=v
-            mm['type']=ev.get('type') or mm.get('type')
-            mm['source']='bridge+controle/wpp_envios.json'
-            mm['ledgerTimestamp']=ev.get('timestamp')
-            mm['timestampSource']='bridge'
-            out.append(mm)
+            # Privacidade máxima: não expor a bolha raw `append/notify` de saída do
+            # comunicador. Mesmo quando bate com o ledger operacional, exibimos o
+            # evento auditável do ledger com timestamp/id reais da bridge. Assim o
+            # painel mostra o envio operacional sem abrir conversa pessoal do chip.
+            ee=dict(ev)
+            if mt:
+                ee['timestamp']=mt
+                ee['timestampSource']='bridge'
+            else:
+                ee['timestampSource']='ledger'
+            if m.get('id') and not ee.get('bridgeMessageId'):
+                ee['bridgeMessageId']=m.get('id')
+            ee['source']='controle/wpp_envios.json+bridge:operational'
+            out.append(ee)
         else:
-            # Sem correspondência no ledger, a bolha pode ser conversa pessoal do chip.
-            # Não expor nem para supervisor; o evento operacional puro entra abaixo.
+            # Se o chat já tem ledger operacional, a conversa inteira daquele lead é
+            # contexto comercial read-only: respostas posteriores do comunicador e do
+            # cliente precisam aparecer na timeline E na inbox. Outros chats pessoais
+            # seguem ocultos porque não têm event_by_chat.
+            ev=event_by_chat.get(canonical_chat_for_message(m)) or {}
+            if ev:
+                mm=dict(m)
+                for k,v in ev.items():
+                    if k in ('timestamp','timestampRaw','date','id','messageId','text','mediaUrl','mediaName','mediaType','mimetype','mediaPath','fromMe','type'):
+                        continue
+                    if v not in (None,'') and not mm.get(k):
+                        mm[k]=v
+                mm['readOnlyInstitutionalThread']=True
+                if not mm.get('fromMe'):
+                    mm['readOnlyInstitutionalReply']=True
+                _enrich_dispatch_identity(mm)
+                mm['source']='bridge+controle/wpp_envios.json:operational-thread'
+                out.append(mm)
             continue
-    # eventos sem bolha real ainda entram como auditoria, mas marcados como ledger
+    # eventos sem bolha real ainda entram como auditoria, mas marcados como ledger.
+    # Exceção: envios divididos em 2-3 partes (`send_response.messageIds`) já têm
+    # as bolhas reais no history. Não re-injetar o ledger inteiro como uma mensagem
+    # longa duplicada no painel.
+    real_ids_by_chat = {}
+    for m in data:
+        if not isinstance(m, dict) or not m.get('fromMe'):
+            continue
+        mid = str(m.get('id') or m.get('messageId') or '').strip()
+        ck = canonical_chat_for_message(m)
+        if mid and ck:
+            real_ids_by_chat.setdefault(ck, set()).add(mid)
     for ei,ev in events:
         if ei not in consumed_events:
+            sr = ev.get('send_response') if isinstance(ev, dict) else None
+            mids = sr.get('messageIds') if isinstance(sr, dict) else None
+            ck = canonical_chat_for_message(ev)
+            if mids and ck and all(str(mid) in real_ids_by_chat.get(ck, set()) for mid in mids):
+                continue
             ee=dict(ev); ee['timestampSource']='ledger'
             out.append(ee)
     out.sort(key=lambda x: float((x or {}).get('timestamp') or 0))
     return out
 
-def read_history(port:int):
-    p=DATA_DIR / f'history_{port}.json'
+# Cache cru de history_{port}.json por mtime. O parse JSON desse arquivo é o custo
+# dominante de read_history()/_raw_history_for_chat() no caminho de /api/messages e
+# /api/conversations. Em horário de disparo o history fica grande e era reparseado a
+# cada request E a cada refresh em background, saturando CPU/GIL do processo público
+# 8280 (arrastava /health e timelines institucionais p/ >1.5s — incidente watchdog
+# 2026-06-29 BIOCOM 4607). Cacheamos só a LISTA CRUA por mtime; todo o
+# processamento/filtragem/cópia por mensagem continua por chamada, então a semântica
+# e a privacidade do comunicador não mudam. Mesma estratégia já usada em
+# _wpp_envios_rows(). Invalida sozinho quando a bridge regrava o arquivo (mtime muda).
+_HISTORY_RAW_CACHE = {}
+_HISTORY_RAW_LOCK = threading.Lock()
+_HISTORY_MERGED_CACHE = {}
+_HISTORY_MERGED_LOCK = threading.Lock()
+
+def _history_file_mtime(port):
+    p = DATA_DIR / f'history_{int(port)}.json'
     try:
-        data=json.loads(p.read_text(encoding='utf-8')) if p.exists() else []
-        data = data if isinstance(data, list) else []
-        return merge_institutional_ledger_with_real_messages(int(port), data)
+        return p.stat().st_mtime if p.exists() else 0.0
+    except Exception:
+        return 0.0
+
+def _wpp_envios_mtime():
+    try:
+        return WPP_ENVIOS_FILE.stat().st_mtime if WPP_ENVIOS_FILE.exists() else 0.0
+    except Exception:
+        return 0.0
+
+def _copy_rows(rows):
+    return [dict(x) if isinstance(x, dict) else x for x in (rows or [])]
+
+def _history_raw_rows(port):
+    """Lista crua de history_{port}.json, cacheada por mtime. Read-only."""
+    p = DATA_DIR / f'history_{int(port)}.json'
+    mtime = _history_file_mtime(int(port))
+    with _HISTORY_RAW_LOCK:
+        cached = _HISTORY_RAW_CACHE.get(int(port))
+        if cached is not None and cached.get('mtime') == mtime:
+            return cached.get('data') or []
+    try:
+        data = json.loads(p.read_text(encoding='utf-8')) if p.exists() else []
+    except Exception:
+        data = []
+    data = data if isinstance(data, list) else []
+    with _HISTORY_RAW_LOCK:
+        _HISTORY_RAW_CACHE[int(port)] = {'mtime': mtime, 'data': data}
+    return data
+
+def read_history(port:int):
+    try:
+        port_i=int(port)
+        h_mtime=_history_file_mtime(port_i)
+        # Comunicadores dependem do ledger operacional para privacidade/contexto;
+        # SDRs não precisam invalidar pelo ledger no histórico processado.
+        ledger_mtime=_wpp_envios_mtime() if is_institutional_port(port_i) else 0.0
+        with _HISTORY_MERGED_LOCK:
+            cached=_HISTORY_MERGED_CACHE.get(port_i)
+            if cached and cached.get('history_mtime') == h_mtime and cached.get('ledger_mtime') == ledger_mtime:
+                return _copy_rows(cached.get('data') or [])
+        data=merge_institutional_ledger_with_real_messages(port_i, _history_raw_rows(port_i))
+        data=data if isinstance(data, list) else []
+        with _HISTORY_MERGED_LOCK:
+            if len(_HISTORY_MERGED_CACHE) > 32:
+                _HISTORY_MERGED_CACHE.clear()
+            _HISTORY_MERGED_CACHE[port_i]={'history_mtime':h_mtime,'ledger_mtime':ledger_mtime,'data':_copy_rows(data)}
+        return _copy_rows(data)
     except Exception:
         return []
+
+_HISTORY_WARMUP_STARTED = False
+_HISTORY_WARMUP_LOCK = threading.Lock()
+
+def warm_history_caches_background():
+    """Aquece histories processados sem bloquear /health nem abrir a porta.
+
+    O prewarm de conversas carrega o snapshot da lista, mas não preenche
+    `_HISTORY_MERGED_CACHE`. Assim, o primeiro clique em ATUALIZAR CONVERSAS
+    (`force=1`) depois de restart ainda pagava o custo de merge dos histories
+    dos comunicadores. Este warmup roda em daemon e invalida naturalmente por
+    mtime dentro de `read_history()`.
+    """
+    global _HISTORY_WARMUP_STARTED
+    with _HISTORY_WARMUP_LOCK:
+        if _HISTORY_WARMUP_STARTED:
+            return
+        _HISTORY_WARMUP_STARTED = True
+    def _worker():
+        try:
+            warmed = 0
+            for port in sorted(PORTS.keys()):
+                read_history(int(port))
+                warmed += 1
+            print(f'Channel V2 history warmup: {warmed} portas aquecidas', flush=True)
+        except Exception as e:
+            try:
+                print(f'Channel V2 history warmup falhou: {e}', flush=True)
+            except Exception:
+                pass
+    threading.Thread(target=_worker, daemon=True, name='channel-history-warmup').start()
+
+
+def _audit_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _payload_sha256(payload):
+    try:
+        raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')
+    except Exception:
+        raw = str(payload or {}).encode('utf-8', errors='ignore')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _audit_text_preview(text, limit=240):
+    s = ' '.join(str(text or '').split())
+    return s[:limit]
+
+
+def _append_outbound_audit(row):
+    try:
+        OUTBOUND_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, ensure_ascii=False, sort_keys=True)
+        with OUTBOUND_AUDIT_LOCK:
+            with OUTBOUND_AUDIT_FILE.open('a', encoding='utf-8') as f:
+                f.write(line + '\n')
+    except Exception as e:
+        try:
+            log_oauth_error(f'outbound audit append failed: {e}')
+        except Exception:
+            pass
+
+
+def record_outbound_audit(uid, port, chat, target_jid, send_type, payload, bridge_resp, normalized_to_pn=False):
+    """Registro interno do envio confirmado pela bridge; não aparece na UI do SDR."""
+    ids = bridge_message_ids(bridge_resp)
+    audit_id = f"out_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{secrets.token_hex(5)}"
+    rec = {
+        'event': 'send',
+        'auditId': audit_id,
+        'ts': _audit_now_iso(),
+        'uid': str(uid or ''),
+        'port': int(port),
+        'chatOriginal': str(chat or ''),
+        'targetJid': canonical_chat_id(target_jid),
+        'targetKind': 'group' if str(target_jid).endswith('@g.us') else ('pn' if str(target_jid).endswith('@s.whatsapp.net') else ('lid' if is_lid(target_jid) else 'unknown')),
+        'normalizedToPN': bool(normalized_to_pn),
+        'sendType': str(send_type or ''),
+        'messageIds': ids,
+        'payloadSha256': _payload_sha256(payload),
+        'textPreview': _audit_text_preview((payload or {}).get('text') or (payload or {}).get('caption') or ''),
+        'fileName': os.path.basename(str((payload or {}).get('fileName') or '')),
+        'bridge': bridge_resp if isinstance(bridge_resp, dict) else {'raw': str(bridge_resp)},
+        'reconciliationStatus': 'pending',
+    }
+    _append_outbound_audit(rec)
+    return rec
+
+
+def reconcile_outbound_record(rec):
+    """Confere se o envio já aparece no history local da bridge."""
+    try:
+        port = int(rec.get('port'))
+    except Exception:
+        return {'status': 'missing', 'matchedBy': '', 'reason': 'port_invalid'}
+    target = canonical_chat_id(rec.get('targetJid') or rec.get('chatOriginal') or '')
+    ids = {_normalize_bridge_message_id(x) for x in (rec.get('messageIds') or []) if _normalize_bridge_message_id(x)}
+    text = _audit_text_preview(rec.get('textPreview') or '')
+    file_name = os.path.basename(str(rec.get('fileName') or '')).lower()
+    for m in read_history(port):
+        if not isinstance(m, dict) or not m.get('fromMe'):
+            continue
+        mchat = canonical_chat_for_message(m)
+        if target and mchat != target:
+            continue
+        mid = _event_message_id(m)
+        if mid and mid in ids:
+            return {'status': 'found', 'matchedBy': 'messageId', 'messageId': mid, 'historyTimestamp': m.get('timestamp') or m.get('ts')}
+        if text and _audit_text_preview(m.get('text') or m.get('caption') or '') == text:
+            return {'status': 'found', 'matchedBy': 'text', 'messageId': mid, 'historyTimestamp': m.get('timestamp') or m.get('ts')}
+        if file_name and os.path.basename(str(m.get('mediaName') or m.get('fileName') or '')).lower() == file_name:
+            return {'status': 'found', 'matchedBy': 'fileName', 'messageId': mid, 'historyTimestamp': m.get('timestamp') or m.get('ts')}
+    return {'status': 'missing', 'matchedBy': '', 'reason': 'not_in_history'}
+
+
+def schedule_outbound_reconciliation(rec, delay=8):
+    """Agenda uma reconciliação leve sem bloquear o envio."""
+    def run():
+        try:
+            time.sleep(max(0, float(delay)))
+            result = reconcile_outbound_record(rec)
+            row = {'event': 'reconcile', 'auditId': rec.get('auditId'), 'ts': _audit_now_iso(), **result}
+            _append_outbound_audit(row)
+        except Exception as e:
+            _append_outbound_audit({'event': 'reconcile', 'auditId': rec.get('auditId'), 'ts': _audit_now_iso(), 'status': 'error', 'error': str(e)[:500]})
+    threading.Thread(target=run, name='outbound-reconcile', daemon=True).start()
+
 
 
 def _parse_wpp_envio_ts(r):
@@ -1085,7 +1437,14 @@ def wpp_envios_fastlane_events(ports, max_age_hours=36):
         ts = _parse_wpp_envio_ts(r)
         if not ts or ts < now - max_age_hours * 3600 or ts > now + 300:
             continue
-        empresa = clean_title_value(r.get('empresa') or r.get('slug') or r.get('lead'))
+        empresa = clean_title_value(r.get('empresa') or r.get('deal') or r.get('slug') or r.get('lead'))
+        owner_raw = clean_title_value(r.get('owner') or r.get('ownerName') or r.get('sdr') or '')
+        owner_id_raw = str(r.get('owner_id') or r.get('hubspot_owner_id') or '').strip()
+        if not owner_id_raw:
+            m_owner = re.search(r'\b(\d{5,})\b', owner_raw)
+            if m_owner:
+                owner_id_raw = m_owner.group(1)
+        owner_label = HUBSPOT_OWNER_LABELS.get(owner_id_raw, '') or owner_raw or owner_id_raw
         ev = dict(r)
         ev.update({
             'id': 'wpp_envios:' + str(r.get('email') or r.get('slug') or chat) + ':' + str(int(ts)),
@@ -1097,11 +1456,20 @@ def wpp_envios_fastlane_events(ports, max_age_hours=36):
             'source': 'controle/wpp_envios.json:fastlane',
             'timestamp': ts,
             'timestampSource': 'wpp_envios_fastlane',
-            'dispatchPort': group_port or port,
-            'dispatchLabel': PORTS.get(group_port or port, {}).get('label', str(group_port or port)),
-            'leadOwnerId': str(r.get('owner_id') or r.get('hubspot_owner_id') or ''),
-            'leadOwnerLabel': HUBSPOT_OWNER_LABELS.get(str(r.get('owner_id') or r.get('hubspot_owner_id') or ''), str(r.get('owner_id') or r.get('hubspot_owner_id') or '')),
+            # Remetente do cliente é sempre o bridge_port (chip que enviou ao lead).
+            # group_bridge_port é só a notificação interna no grupo e não deve
+            # virar "Comunicador" do card (incidente Comercial SS/João Pedro).
+            'dispatchPort': port,
+            'dispatchLabel': PORTS.get(port, {}).get('label', str(port)),
+            'groupDispatchPort': group_port,
+            'groupDispatchLabel': PORTS.get(group_port, {}).get('label', str(group_port)) if group_port else '',
+            'leadOwnerId': owner_id_raw,
+            'leadOwnerLabel': owner_label,
         })
+        if owner_raw and not ev.get('sdr'):
+            ev['sdr'] = owner_raw
+        if r.get('lead_name') and not ev.get('nome'):
+            ev['nome'] = clean_title_value(r.get('lead_name'))
         _enrich_dispatch_identity(ev)
         if empresa and not ev.get('empresa'):
             ev['empresa'] = empresa
@@ -1121,8 +1489,342 @@ def wpp_envios_fastlane_events(ports, max_age_hours=36):
     return out
 
 
-def dispatch_stats(uid='rafael', days=14):
-    """Disparos WhatsApp por dia x chip/pessoa, read-only.
+def _dispatch_kind_for_row(r):
+    """Classifica envio do ledger para o gráfico de Gestão por tipo/cadência."""
+    msg_type = str((r or {}).get('msg_type') or (r or {}).get('type') or '').lower().strip()
+    status = str((r or {}).get('status') or '').lower().strip()
+    text = str((r or {}).get('text') or (r or {}).get('group_summary') or '').lower()
+    blob = ' '.join([msg_type, status, text])
+
+    def _attempt():
+        raw = (r or {}).get('attempt_number') or (r or {}).get('followup_number') or (r or {}).get('cadence_step') or ''
+        try:
+            n = int(str(raw).strip())
+            if 1 <= n <= 4:
+                return n
+        except Exception:
+            pass
+        import re as _re
+        m = _re.search(r'follow\s*[-_ ]?up\s*([1-4])', blob) or _re.search(r'follow\s*([1-4])', blob)
+        if m:
+            return int(m.group(1))
+        return 0
+
+    if 'follow' in blob:
+        n = _attempt()
+        if n:
+            return {'key': f'followup_{n}', 'label': f'Follow-up {n}', 'order': 20 + n}
+        if 'mql_sdr_followup' in blob or 'diagnostico' in blob or 'diagnóstico' in blob:
+            return {'key': 'followup_sem_numero', 'label': 'Follow-up pós-diagnóstico', 'order': 29}
+        return {'key': 'followup_sem_numero', 'label': 'Follow-up sem etapa marcada', 'order': 29}
+    if 'primeiro_contato' in blob:
+        return {'key': 'primeiro_contato', 'label': '1º contato', 'order': 40}
+    if 'sumico' in blob or 'cadencia' in blob:
+        return {'key': 'cadencia', 'label': 'Pausa por sumiço', 'order': 45}
+    if _is_diag_dispatch(r) or 'diagnostico' in msg_type or 'diagnóstico' in msg_type or status.startswith('enviado_lead'):
+        return {'key': 'diagnostico', 'label': 'Diagnóstico', 'order': 10}
+    if 'nao_mql' in blob or 'não_mql' in blob or 'nao mql' in blob or 'não mql' in blob:
+        return {'key': 'nao_mql', 'label': 'Tratativa não MQL', 'order': 50}
+    return {'key': 'outros', 'label': 'Outros', 'order': 99}
+
+
+def _message_has_visible_payload(m):
+    if not isinstance(m, dict):
+        return False
+    for k in ('text', 'body', 'caption', 'message', 'transcript', 'mediaName', 'mediaType', 'mimetype'):
+        if str(m.get(k) or '').strip():
+            return True
+    return False
+
+
+def _dispatch_approach_for_message(row, message, kind_key):
+    """Resumo comercial visível da abordagem usada no disparo."""
+    txt = ' '.join(str(message or '').split())
+    low = txt.lower()
+    label = 'Abordagem direta'
+    angle = ''
+    question = ''
+    structure = []
+    if kind_key == 'followup_sem_numero' and ('diagnóstico' in low or 'diagnostico' in low or 'puxei um ponto' in low):
+        label = 'Pós-diagnóstico personalizado'
+        structure = ['retomada do diagnóstico', 'insight específico da empresa', 'pergunta de operação atual', 'convite para responder no WhatsApp']
+    elif kind_key.startswith('followup_'):
+        label = 'Follow-up de cadência'
+        structure = ['retomada curta', 'contexto anterior', 'próximo passo']
+    elif kind_key == 'diagnostico':
+        label = 'Diagnóstico inicial'
+        structure = ['contexto do diagnóstico', 'oportunidade encontrada', 'pergunta de qualificação']
+    elif kind_key == 'primeiro_contato':
+        label = 'Primeiro contato'
+        structure = ['abertura', 'motivo do contato', 'pedido de resposta']
+    elif kind_key == 'nao_mql':
+        label = 'Tratativa não MQL'
+        structure = ['ajuste de rota', 'explicação', 'próxima orientação']
+    if 'catálogo' in low or 'catalogo' in low or 'pedido recorrente' in low or 'reposição' in low:
+        angle = 'catálogo / reposição / pedido recorrente'
+    elif 'atacado' in low or 'tabela' in low:
+        angle = 'atacado / tabela comercial'
+    elif 'instagram' in low or 'whatsapp' in low:
+        angle = 'captação WhatsApp/Instagram'
+    # Última pergunta explícita do texto, para mostrar a abordagem exata.
+    qs = [q.strip() for q in re.findall(r'[^.!?\n]*\?', txt) if q.strip()]
+    if qs:
+        question = qs[-1][-260:]
+    return {'label': label, 'angle': angle, 'question': question, 'structure': structure}
+
+
+def _dispatch_variant_text(message):
+    """Normaliza texto para agrupar variações reais de abordagem sem perder a frase."""
+    txt = str(message or '').strip()
+    txt = re.sub(r'\s+', ' ', txt)
+    if not txt:
+        return ''
+    # Mascara aberturas muito personalizadas, preservando a abordagem comercial.
+    txt = re.sub(r'^[A-ZÁÉÍÓÚÂÊÔÃÕÇ][\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\-\s]{1,40},\s+aqui é\s+[^.]{2,80}?\.\s*', 'Oi, {{nome}}, aqui é {{SDR}}. ', txt, flags=re.I)
+    txt = re.sub(r'\bda [A-ZÁÉÍÓÚÂÊÔÃÕÇ][\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\-\. ]{2,60}?\b', 'da {{empresa}}', txt)
+    return txt[:420]
+
+
+def _dispatch_is_meeting_reminder_text(message):
+    """Detecta lembrete/confirmação de agenda já marcada.
+
+    Esse tipo de mensagem pode ter meeting_id/meeting_start, mas não é a abordagem
+    que gerou a agenda. Se entrar no ranking de conversão para agenda, infla
+    "Diagnóstico inicial" com mensagens como "diagnóstico confirmado" ou "link".
+    """
+    low = _norm_text(message or '')
+    if not low:
+        return False
+    has_meeting_language = any(x in low for x in (
+        'diagnostico confirmado', 'diagnóstico confirmado', 'passando para lembrar',
+        'lembrar do nosso diagnostico', 'lembrar do nosso diagnóstico', 'link para acessar',
+        'meet.google.com', 'meetings.hubspot.com', 'diagnostico hoje', 'diagnóstico hoje',
+        'diagnostico marcado', 'diagnóstico marcado', 'agenda marcada', 'reuniao marcada', 'reunião marcada'
+    ))
+    has_time_or_link = bool(re.search(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b\d{1,2}:\d{2}\b|https?://', low))
+    return bool(has_meeting_language and has_time_or_link)
+
+
+def _dispatch_approach_key(ev):
+    ap = ev.get('approach') or {}
+    label = str(ap.get('label') or ev.get('approachLabel') or ev.get('kindLabel') or 'Abordagem').strip()
+    angle = str(ap.get('angle') or ev.get('angle') or '').strip()
+    base = _norm_text(label + ' ' + angle)[:80] or _norm_text(ev.get('message') or '')[:80] or 'abordagem'
+    kind = ev.get('kind') or 'outros'
+    # Tratativa não MQL tem várias personalizações/dias, mas é uma mesma família
+    # comercial para decisão de gestão. Rafael pediu agrupar similares em vez de
+    # quebrar por versão/data.
+    if kind == 'nao_mql':
+        return "nao_mql::tratativa nao mql"
+    # Lembrete/confirmação de reunião não é abordagem geradora de agenda; quando
+    # aparecer em métricas de resposta, manter agrupado fora das versões de diagnóstico.
+    if _dispatch_is_meeting_reminder_text(ev.get('message') or ''):
+        return f"agenda_reminder::{base or 'lembrete de agenda'}"
+    # Rafael versiona/muda follow-ups ao longo dos dias. A análise deve separar
+    # o F1 antigo do F1 novo, mas não criar um card para cada nome/empresa
+    # personalizada. A unidade correta é: tipo + abordagem comercial + dia da
+    # versão; as variações/textos reais ficam dentro do card.
+    ts = float(ev.get('ts') or 0)
+    if ts:
+        try:
+            vday = datetime.fromtimestamp(ts, BRT_TZ).date().isoformat()
+            return f"{kind}::{base}::v_{vday}"
+        except Exception:
+            pass
+    return f"{kind}::{base}"
+
+
+def _dispatch_response_attribution(dispatches, allowed_ports, window_hours=24*7):
+    """Atribui cada resposta recebida ao último disparo anterior daquele chat.
+
+    Métrica de retorno para Gestão: se o lead respondeu depois de uma mensagem,
+    atribuímos a resposta ao último touch antes da resposta. Assim F1 não recebe
+    crédito se F2/F3 foi enviado antes do lead retornar.
+    """
+    by_chat = {}
+    for ev in dispatches:
+        chat = canonical_chat_id(ev.get('to') or '')
+        port = int(ev.get('port') or 0)
+        ts = float(ev.get('ts') or 0)
+        if not chat or not port or not ts:
+            continue
+        by_chat.setdefault((port, chat), []).append(ev)
+    for rows in by_chat.values():
+        rows.sort(key=lambda x: float(x.get('ts') or 0))
+    window = float(window_hours or 0) * 3600
+    for port in sorted(int(p) for p in allowed_ports if int(p) in PORTS):
+        for m in _history_raw_rows(port):
+            if not isinstance(m, dict) or m.get('fromMe'):
+                continue
+            if not _message_has_visible_payload(m):
+                continue
+            chat = canonical_chat_for_message(m)
+            if not chat:
+                continue
+            rows = by_chat.get((int(port), canonical_chat_id(chat)))
+            if not rows:
+                continue
+            try:
+                rts = normalize_channel_timestamp(float(m.get('timestamp') or 0))
+            except Exception:
+                rts = 0
+            if not rts:
+                continue
+            # Último disparo anterior ainda dentro da janela.
+            best = None
+            for ev in rows:
+                ets = float(ev.get('ts') or 0)
+                if ets < rts and (not window or rts - ets <= window):
+                    best = ev
+                elif ets >= rts:
+                    break
+            if best and not best.get('responded'):
+                best['responded'] = True
+                best['responseTs'] = rts
+                best['responseHours'] = round((rts - float(best.get('ts') or 0)) / 3600, 1)
+    return dispatches
+
+
+
+def _meeting_outcome_is_realized(outcome):
+    val = str(outcome or '').strip().lower()
+    if not val:
+        return False
+    return val in {'completed', 'realizada', 'realizado', 'held', 'concluida', 'concluído', 'concluido'}
+
+
+def _meeting_outcome_is_cancelled(outcome):
+    val = str(outcome or '').strip().lower()
+    if not val:
+        return False
+    return val in {'canceled', 'cancelled', 'cancelada', 'cancelado', 'no_show', 'noshow'} or 'cancel' in val or 'no_show' in val
+
+
+def _dispatch_meeting_rows(days, allowed_ports):
+    """Agenda/reunião vinda do ledger operacional; read-only.
+
+    Conta agenda marcada a partir de meeting_id/meeting_start. A realização vem do
+    HubSpot (meeting outcome) quando disponível, para não confundir resposta com
+    reunião feita.
+    """
+    allowed=set(int(p) for p in allowed_ports if int(p) in PORTS)
+    tz = timezone(timedelta(hours=-3))
+    cutoff = datetime.now(tz).timestamp() - max(1, int(days or 14)) * 86400
+    rows=[]; meeting_ids=set()
+    for r in _wpp_envios_rows():
+        if not isinstance(r, dict):
+            continue
+        mid=str(r.get('meeting_id') or r.get('meetingId') or '').strip()
+        mstart=str(r.get('meeting_start') or r.get('meetingStart') or '').strip()
+        if not mid and not mstart:
+            continue
+        ts=_parse_wpp_envio_ts(r)
+        if not ts:
+            ts=_activity_dt_value(mstart)
+        if ts and ts < cutoff:
+            continue
+        port=_dispatch_port_for_row(r)
+        if not port or int(port) not in allowed:
+            continue
+        chat=str(r.get('to') or r.get('jid') or r.get('lead_jid') or '').strip()
+        if not chat:
+            continue
+        if mid:
+            meeting_ids.add(mid)
+        rows.append({
+            'meetingId': mid,
+            'meetingStart': mstart,
+            'meetingTs': _activity_dt_value(mstart),
+            'ts': ts,
+            'port': int(port),
+            'to': chat,
+            'empresa': clean_title_value(r.get('empresa') or r.get('slug') or r.get('lead') or r.get('deal') or '') or chat,
+            'sdr': str(r.get('sdr') or '').strip(),
+            'dealId': str(r.get('deal_id') or r.get('dealId') or '').strip(),
+            'message': str(r.get('text') or r.get('agenda_text') or r.get('message') or '').strip(),
+        })
+    outcomes={}
+    token=_hubspot_token()
+    if token and meeting_ids:
+        try:
+            data=_batch_read_simple(token, 'meetings', sorted(meeting_ids), ['hs_meeting_outcome','hs_meeting_start_time','hs_timestamp','hs_meeting_title','hubspot_owner_id'])
+            for mid, props in data.items():
+                outcomes[str(mid)]={
+                    'outcome': props.get('hs_meeting_outcome') or '',
+                    'start': props.get('hs_meeting_start_time') or props.get('hs_timestamp') or '',
+                    'title': props.get('hs_meeting_title') or 'Reunião',
+                    'ownerId': props.get('hubspot_owner_id') or '',
+                    'ownerName': HUBSPOT_OWNER_LABELS.get(props.get('hubspot_owner_id') or '', props.get('hubspot_owner_id') or ''),
+                }
+        except Exception:
+            outcomes={}
+    for row in rows:
+        meta=outcomes.get(str(row.get('meetingId') or '')) or {}
+        if meta:
+            row['hubspotOutcome']=meta.get('outcome') or ''
+            row['meetingTitle']=meta.get('title') or 'Reunião'
+            row['meetingOwner']=meta.get('ownerName') or ''
+            if meta.get('start') and not row.get('meetingStart'):
+                row['meetingStart']=meta.get('start')
+                row['meetingTs']=_activity_dt_value(meta.get('start'))
+        outcome=row.get('hubspotOutcome') or ''
+        row['realized']=_meeting_outcome_is_realized(outcome)
+        row['cancelled']=_meeting_outcome_is_cancelled(outcome)
+        row['future']=bool(row.get('meetingTs') and row.get('meetingTs') > time.time())
+    return rows
+
+
+def _dispatch_agenda_attribution(dispatches, allowed_ports, days=14, window_hours=24*14):
+    """Atribui agenda/reunião ao último envio anterior no mesmo chat.
+
+    Não credita a própria mensagem de confirmação de agenda quando houver touch
+    anterior: ela confirma o agendamento, mas o que queremos otimizar é a
+    abordagem que levou o lead até a agenda.
+    """
+    by_chat={}
+    for ev in dispatches:
+        chat=canonical_chat_id(ev.get('to') or '')
+        port=int(ev.get('port') or 0)
+        ts=float(ev.get('ts') or 0)
+        if chat and port and ts:
+            by_chat.setdefault((port, chat), []).append(ev)
+    for rows in by_chat.values():
+        rows.sort(key=lambda x: float(x.get('ts') or 0))
+    window=float(window_hours or 0)*3600
+    meetings=_dispatch_meeting_rows(days, allowed_ports)
+    for mt in meetings:
+        rows=by_chat.get((int(mt.get('port') or 0), canonical_chat_id(mt.get('to') or ''))) or []
+        mts=float(mt.get('ts') or mt.get('meetingTs') or 0)
+        best=None
+        for ev in rows:
+            ets=float(ev.get('ts') or 0)
+            if ets <= mts and (not window or mts - ets <= window):
+                typ=str(ev.get('type') or '').lower()
+                is_agenda=('agenda' in typ or 'meeting' in typ or ev.get('meetingId') or ev.get('meetingStart'))
+                is_reminder=_dispatch_is_meeting_reminder_text(ev.get('message') or '')
+                # Não creditar a própria confirmação/lembrete/link da reunião.
+                # Se não houver abordagem comercial anterior, a agenda fica sem
+                # atribuição em vez de inflar diagnóstico/agenda.
+                if not is_agenda and not is_reminder:
+                    best=ev
+            elif ets > mts:
+                break
+        target=best
+        if not target:
+            continue
+        target['scheduledMeeting'] = True
+        target['meetingId'] = mt.get('meetingId') or target.get('meetingId') or ''
+        target['meetingStart'] = mt.get('meetingStart') or target.get('meetingStart') or ''
+        target['meetingOutcome'] = mt.get('hubspotOutcome') or target.get('meetingOutcome') or ''
+        target['meetingRealized'] = bool(mt.get('realized'))
+        target['meetingCancelled'] = bool(mt.get('cancelled'))
+        target['meetingFuture'] = bool(mt.get('future'))
+        target['meetingEmpresa'] = mt.get('empresa') or target.get('empresa') or ''
+    return dispatches
+
+
+def dispatch_stats(uid='rafael', days=14, force=False):
+    """Disparos WhatsApp por dia x chip/pessoa e por tipo/cadência, read-only.
 
     Fonte: controle/wpp_envios.json, o ledger operacional de mensagens disparadas.
     Não lê conversa pessoal de comunicador e não chama bridges/HubSpot.
@@ -1131,6 +1833,10 @@ def dispatch_stats(uid='rafael', days=14):
         days = max(1, min(31, int(days or 14)))
     except Exception:
         days = 14
+    if not force:
+        snap=_dispatch_stats_snapshot_get(uid, days)
+        if snap:
+            return snap
     tz = timezone(timedelta(hours=-3))
     today = datetime.now(tz).date()
     day_keys = [(today - timedelta(days=i)).isoformat() for i in range(days-1, -1, -1)]
@@ -1138,8 +1844,23 @@ def dispatch_stats(uid='rafael', days=14):
     by_day = {d: {} for d in day_keys}
     details = {d: {} for d in day_keys}
     chip_totals = {}
+    by_type_day = {d: {} for d in day_keys}
+    type_details = {d: {} for d in day_keys}
+    type_totals = {
+        'diagnostico': {'key': 'diagnostico', 'label': 'Diagnóstico', 'order': 10, 'total': 0},
+        'followup_1': {'key': 'followup_1', 'label': 'Follow-up 1', 'order': 21, 'total': 0},
+        'followup_2': {'key': 'followup_2', 'label': 'Follow-up 2', 'order': 22, 'total': 0},
+        'followup_3': {'key': 'followup_3', 'label': 'Follow-up 3', 'order': 23, 'total': 0},
+        'followup_4': {'key': 'followup_4', 'label': 'Follow-up 4', 'order': 24, 'total': 0},
+        'followup_sem_numero': {'key': 'followup_sem_numero', 'label': 'Follow-up pós-diagnóstico', 'order': 29, 'total': 0},
+        'primeiro_contato': {'key': 'primeiro_contato', 'label': '1º contato', 'order': 40, 'total': 0},
+        'cadencia': {'key': 'cadencia', 'label': 'Pausa por sumiço', 'order': 45, 'total': 0},
+        'nao_mql': {'key': 'nao_mql', 'label': 'Tratativa não MQL', 'order': 50, 'total': 0},
+        'outros': {'key': 'outros', 'label': 'Outros', 'order': 99, 'total': 0},
+    }
     total = 0
     skipped = 0
+    dispatch_events = []
     for r in _wpp_envios_rows():
         if not _wpp_envio_is_sent_dispatch(r):
             skipped += 1
@@ -1159,16 +1880,24 @@ def dispatch_stats(uid='rafael', days=14):
         label = meta.get('label') or str(port)
         role = meta.get('role') or ''
         sdr = str(r.get('sdr') or '').strip()
+        kind = _dispatch_kind_for_row(r)
+        kkey = kind.get('key') or 'outros'
+        klabel = kind.get('label') or 'Outros'
+        korder = int(kind.get('order') or 99)
         rec = chip_totals.setdefault(str(port), {'port': port, 'label': label, 'role': role, 'sdr': sdr, 'total': 0})
         if sdr and not rec.get('sdr'):
             rec['sdr'] = sdr
         rec['total'] += 1
+        type_rec = type_totals.setdefault(kkey, {'key': kkey, 'label': klabel, 'order': korder, 'total': 0})
+        type_rec['total'] += 1
         by_day[dkey][str(port)] = by_day[dkey].get(str(port), 0) + 1
+        by_type_day[dkey][kkey] = by_type_day[dkey].get(kkey, 0) + 1
         chat = str(r.get('to') or r.get('jid') or r.get('lead_jid') or '').strip()
         msg = str(r.get('text') or r.get('text_response') or r.get('group_summary') or r.get('message') or '').strip()
         if not msg and r.get('pdf_path'):
             msg = 'PDF enviado: ' + os.path.basename(str(r.get('pdf_path') or ''))
         conv_id = f'{int(port)}::{chat}' if chat else ''
+        approach = _dispatch_approach_for_message(r, msg, kkey)
         event = {
             'time': datetime.fromtimestamp(ts, tz).strftime('%H:%M'),
             'empresa': clean_title_value(r.get('empresa') or r.get('slug') or r.get('lead') or '') or chat,
@@ -1179,40 +1908,482 @@ def dispatch_stats(uid='rafael', days=14):
             'port': port,
             'sdr': sdr,
             'type': str(r.get('msg_type') or r.get('status') or 'envio').strip(),
+            'dealId': str(r.get('deal_id') or r.get('dealId') or '').strip(),
+            'meetingId': str(r.get('meeting_id') or r.get('meetingId') or '').strip(),
+            'meetingStart': str(r.get('meeting_start') or r.get('meetingStart') or '').strip(),
+            'kind': kkey,
+            'kindLabel': klabel,
             'message': msg[:1200],
+            'approach': approach,
+            'approachLabel': approach.get('label') or '',
+            'angle': approach.get('angle') or '',
+            'question': approach.get('question') or '',
             'convId': conv_id,
             'link': '/conversas?conv=' + urllib.parse.quote(conv_id, safe='') if conv_id else '',
+            'ts': ts,
+            'responded': False,
         }
         details[dkey].setdefault(str(port), []).append(event)
+        type_details[dkey].setdefault(kkey, []).append(event)
+        dispatch_events.append(event)
         total += 1
     chips = sorted(chip_totals.values(), key=lambda x: (-x.get('total',0), int(x.get('port') or 0)))
+    type_series = sorted(type_totals.values(), key=lambda x: (int(x.get('order') or 99), str(x.get('label') or '')))
     rows = []
+    type_rows = []
     for d in day_keys:
         counts = by_day.get(d, {})
         rows.append({'date': d, 'total': sum(counts.values()), 'chips': counts, 'details': details.get(d, {})})
-    return {'ok': True, 'source': 'controle/wpp_envios.json', 'periodDays': days, 'total': total, 'chips': chips, 'days': rows, 'skipped': skipped, 'scope': 'consolidado' if user_can_view_all(uid) else 'seus chips'}
+        tcounts = by_type_day.get(d, {})
+        type_rows.append({'date': d, 'total': sum(tcounts.values()), 'types': tcounts, 'details': type_details.get(d, {})})
+    # Não mostrar uma parede de dias vazios à esquerda. O ledger começou agora;
+    # o gráfico deve começar no primeiro dia com volume real e ir crescendo com o tempo.
+    meaningful_idx = next((i for i, r in enumerate(rows) if int(r.get('total') or 0) > 1), None)
+    if meaningful_idx is None:
+        meaningful_idx = next((i for i, r in enumerate(rows) if int(r.get('total') or 0) > 0), None)
+    if meaningful_idx is not None:
+        rows = rows[meaningful_idx:]
+        type_rows = type_rows[meaningful_idx:]
+    elif rows:
+        rows = rows[-1:]
+        type_rows = type_rows[-1:]
+    visible_days = len(rows)
+    def _cap_dispatch_details_map(mp, limit=20):
+        out={}
+        for kk, vals in (mp or {}).items():
+            arr=vals if isinstance(vals, list) else []
+            out[kk]=arr[:limit]
+        return out
+    for _r in rows:
+        _r['details'] = _cap_dispatch_details_map(_r.get('details') or {}, 18)
+    for _r in type_rows:
+        _r['details'] = _cap_dispatch_details_map(_r.get('details') or {}, 18)
+    visible_day_keys = [r.get('date') for r in rows]
+    dispatch_events = _dispatch_response_attribution(dispatch_events, allowed)
+    dispatch_events = _dispatch_agenda_attribution(dispatch_events, allowed, days=days)
+    perf_by_type = {}
+    perf_by_day = {d: {} for d in visible_day_keys}
+    perf_by_approach = {}
+    for rec in type_totals.values():
+        perf_by_type[rec['key']] = {'key': rec['key'], 'label': rec['label'], 'order': rec.get('order', 99), 'sent': 0, 'returns': 0, 'meetings': 0, 'realizedMeetings': 0, 'meetingRate': 0.0, 'realizedMeetingRate': 0.0, 'responseRate': 0.0, '_hours': [], 'examples': [], 'meetingExamples': []}
+    for ev in dispatch_events:
+        k = ev.get('kind') or 'outros'
+        label = ev.get('kindLabel') or k
+        rec = perf_by_type.setdefault(k, {'key': k, 'label': label, 'order': 99, 'sent': 0, 'returns': 0, 'meetings': 0, 'realizedMeetings': 0, 'meetingRate': 0.0, 'realizedMeetingRate': 0.0, 'responseRate': 0.0, '_hours': [], 'examples': [], 'meetingExamples': []})
+        rec['sent'] += 1
+        akey = _dispatch_approach_key(ev)
+        ap = ev.get('approach') or {}
+        arec = perf_by_approach.setdefault(akey, {
+            'key': akey, 'parentKey': k, 'parentLabel': label,
+            'label': ap.get('label') or ev.get('approachLabel') or label,
+            'angle': ap.get('angle') or ev.get('angle') or '',
+            'question': ap.get('question') or ev.get('question') or '',
+            'structure': ap.get('structure') or [],
+            'sent': 0, 'returns': 0, 'meetings': 0, 'realizedMeetings': 0,
+            'responseRate': 0.0, 'meetingRate': 0.0, 'realizedMeetingRate': 0.0,
+            '_hours': [], 'examples': [], 'meetingExamples': [], '_variants': {}, '_firstTs': None, '_lastTs': None
+        })
+        arec['sent'] += 1
+        ev_ts = float(ev.get('ts') or 0)
+        if ev_ts:
+            if not arec.get('_firstTs') or ev_ts < float(arec.get('_firstTs') or 0):
+                arec['_firstTs'] = ev_ts
+            if not arec.get('_lastTs') or ev_ts > float(arec.get('_lastTs') or 0):
+                arec['_lastTs'] = ev_ts
+        vtext = _dispatch_variant_text(ev.get('message') or '')
+        if vtext:
+            vrec = arec['_variants'].setdefault(vtext, {'text': vtext, 'sent': 0, 'returns': 0, 'meetings': 0, 'realizedMeetings': 0, 'responseRate': 0.0, 'meetingRate': 0.0, 'realizedMeetingRate': 0.0})
+            vrec['sent'] += 1
+        else:
+            vrec = None
+        dkey = datetime.fromtimestamp(float(ev.get('ts') or 0), tz).date().isoformat() if ev.get('ts') else ''
+        drec = None
+        if dkey in perf_by_day:
+            drec = perf_by_day[dkey].setdefault(k, {'sent': 0, 'returns': 0, 'responseRate': 0.0})
+            drec['sent'] += 1
+        if ev.get('scheduledMeeting'):
+            meet_obj = {
+                'empresa': ev.get('meetingEmpresa') or ev.get('empresa') or ev.get('to') or 'Lead',
+                'message': ev.get('message') or '',
+                'approach': ev.get('approach') or {},
+                'approachLabel': ev.get('approachLabel') or '',
+                'angle': ev.get('angle') or '',
+                'question': ev.get('question') or '',
+                'time': ev.get('time') or '',
+                'chip': ev.get('chip') or '',
+                'sdr': ev.get('sdr') or '',
+                'link': ev.get('link') or '',
+                'meetingId': ev.get('meetingId') or '',
+                'meetingStart': ev.get('meetingStart') or '',
+                'meetingOutcome': ev.get('meetingOutcome') or '',
+                'realized': bool(ev.get('meetingRealized')),
+                'future': bool(ev.get('meetingFuture')),
+                'cancelled': bool(ev.get('meetingCancelled')),
+            }
+            rec['meetings'] += 1
+            arec['meetings'] += 1
+            if vrec is not None:
+                vrec['meetings'] += 1
+            if ev.get('meetingRealized'):
+                rec['realizedMeetings'] += 1
+                arec['realizedMeetings'] += 1
+                if vrec is not None:
+                    vrec['realizedMeetings'] += 1
+            if len(rec.get('meetingExamples') or []) < 4:
+                rec.setdefault('meetingExamples', []).append(dict(meet_obj))
+            if len(arec.get('meetingExamples') or []) < 5:
+                arec.setdefault('meetingExamples', []).append(dict(meet_obj))
+        if ev.get('responded'):
+            rec['returns'] += 1
+            if ev.get('responseHours') is not None:
+                rec['_hours'].append(float(ev.get('responseHours') or 0))
+            example_obj = {
+                'empresa': ev.get('empresa') or ev.get('to') or 'Lead',
+                'message': ev.get('message') or '',
+                'approach': ev.get('approach') or {},
+                'approachLabel': ev.get('approachLabel') or '',
+                'angle': ev.get('angle') or '',
+                'question': ev.get('question') or '',
+                'responseHours': ev.get('responseHours'),
+                'time': ev.get('time') or '',
+                'chip': ev.get('chip') or '',
+                'sdr': ev.get('sdr') or '',
+                'link': ev.get('link') or '',
+            }
+            if len(rec.get('examples') or []) < 4:
+                rec.setdefault('examples', []).append(dict(example_obj))
+            arec['returns'] += 1
+            if ev.get('responseHours') is not None:
+                arec['_hours'].append(float(ev.get('responseHours') or 0))
+            if vrec is not None:
+                vrec['returns'] += 1
+            if len(arec.get('examples') or []) < 5:
+                arec.setdefault('examples', []).append(dict(example_obj))
+            if drec is not None:
+                drec['returns'] += 1
+    for rec in perf_by_type.values():
+        sent = int(rec.get('sent') or 0)
+        returns = int(rec.get('returns') or 0)
+        rec['responseRate'] = round((returns / sent * 100) if sent else 0.0, 1)
+        meetings = int(rec.get('meetings') or 0)
+        realized = int(rec.get('realizedMeetings') or 0)
+        rec['meetingRate'] = round((meetings / sent * 100) if sent else 0.0, 1)
+        rec['realizedMeetingRate'] = round((realized / sent * 100) if sent else 0.0, 1)
+        hours = rec.pop('_hours', [])
+        rec['avgResponseHours'] = round(sum(hours) / len(hours), 1) if hours else None
+    for rec in perf_by_approach.values():
+        sent = int(rec.get('sent') or 0)
+        returns = int(rec.get('returns') or 0)
+        first_ts = rec.pop('_firstTs', None)
+        last_ts = rec.pop('_lastTs', None)
+        if first_ts:
+            first_dt = datetime.fromtimestamp(float(first_ts), BRT_TZ)
+            rec['firstSeenDate'] = first_dt.date().isoformat()
+            if rec.get('parentKey') != 'nao_mql':
+                rec['versionLabel'] = 'versão de ' + first_dt.strftime('%d/%m')
+            else:
+                rec['versionLabel'] = ''
+        if last_ts:
+            rec['lastSeenDate'] = datetime.fromtimestamp(float(last_ts), BRT_TZ).date().isoformat()
+        rec['responseRate'] = round((returns / sent * 100) if sent else 0.0, 1)
+        meetings = int(rec.get('meetings') or 0)
+        realized = int(rec.get('realizedMeetings') or 0)
+        rec['meetingRate'] = round((meetings / sent * 100) if sent else 0.0, 1)
+        rec['realizedMeetingRate'] = round((realized / sent * 100) if sent else 0.0, 1)
+        hours = rec.pop('_hours', [])
+        rec['avgResponseHours'] = round(sum(hours) / len(hours), 1) if hours else None
+        variants = []
+        for v in rec.pop('_variants', {}).values():
+            vs = int(v.get('sent') or 0); vr = int(v.get('returns') or 0)
+            vm = int(v.get('meetings') or 0); vreal = int(v.get('realizedMeetings') or 0)
+            v['responseRate'] = round((vr / vs * 100) if vs else 0.0, 1)
+            v['meetingRate'] = round((vm / vs * 100) if vs else 0.0, 1)
+            v['realizedMeetingRate'] = round((vreal / vs * 100) if vs else 0.0, 1)
+            variants.append(v)
+        rec['variants'] = sorted(variants, key=lambda x: (-float(x.get('meetingRate') or 0), -int(x.get('meetings') or 0), -float(x.get('responseRate') or 0), -int(x.get('returns') or 0), -int(x.get('sent') or 0)))[:5]
+        if not rec.get('question'):
+            for ex in rec.get('examples') or []:
+                if ex.get('question'):
+                    rec['question'] = ex.get('question')
+                    break
+    for day in perf_by_day.values():
+        for drec in day.values():
+            sent = int(drec.get('sent') or 0)
+            returns = int(drec.get('returns') or 0)
+            drec['responseRate'] = round((returns / sent * 100) if sent else 0.0, 1)
+    perf_series = sorted(perf_by_type.values(), key=lambda x: (int(x.get('order') or 99), str(x.get('label') or '')))
+    perf_ranked = [x for x in sorted(perf_series, key=lambda x: (-float(x.get('responseRate') or 0), -int(x.get('returns') or 0), -int(x.get('sent') or 0), int(x.get('order') or 99))) if int(x.get('sent') or 0) > 0]
+    perf_approaches = [x for x in sorted(perf_by_approach.values(), key=lambda x: (-float(x.get('responseRate') or 0), -int(x.get('returns') or 0), -int(x.get('sent') or 0), str(x.get('label') or ''))) if int(x.get('sent') or 0) > 0]
+    agenda_ranked = [x for x in sorted(perf_by_approach.values(), key=lambda x: (-float(x.get('meetingRate') or 0), -int(x.get('meetings') or 0), -int(x.get('realizedMeetings') or 0), -float(x.get('responseRate') or 0), -int(x.get('sent') or 0), str(x.get('label') or ''))) if int(x.get('sent') or 0) > 0]
+    agenda_by_type = [x for x in sorted(perf_series, key=lambda x: (-float(x.get('meetingRate') or 0), -int(x.get('meetings') or 0), -int(x.get('realizedMeetings') or 0), int(x.get('order') or 99))) if int(x.get('sent') or 0) > 0]
+    perf_days = [{'date': d, 'types': perf_by_day.get(d, {})} for d in visible_day_keys]
+    type_stats = {'series': type_series, 'days': type_rows, 'total': total}
+    total_returns = sum(int(x.get('returns') or 0) for x in perf_series)
+    total_meetings = sum(int(x.get('meetings') or 0) for x in perf_series)
+    total_realized = sum(int(x.get('realizedMeetings') or 0) for x in perf_series)
+    for rec in perf_approaches:
+        sent = int(rec.get('sent') or 0)
+        returns = int(rec.get('returns') or 0)
+        meetings = int(rec.get('meetings') or 0)
+        realized = int(rec.get('realizedMeetings') or 0)
+        rec['funnel'] = [
+            {'key': 'sent', 'label': 'Enviadas', 'count': sent, 'rate': 100.0 if sent else 0.0},
+            {'key': 'response', 'label': 'Responderam', 'count': returns, 'rate': round((returns / sent * 100) if sent else 0.0, 1)},
+            {'key': 'meeting', 'label': 'Agendaram', 'count': meetings, 'rate': round((meetings / sent * 100) if sent else 0.0, 1)},
+            {'key': 'realized', 'label': 'Realizadas', 'count': realized, 'rate': round((realized / sent * 100) if sent else 0.0, 1)},
+        ]
+        losses = [
+            ('response', sent - returns, 'sem resposta'),
+            ('meeting', max(returns - meetings, 0), 'respondeu e não agendou'),
+            ('realized', max(meetings - realized, 0), 'agendou e não realizou/sem status'),
+        ]
+        gap_key, gap_count, gap_label = sorted(losses, key=lambda x: x[1], reverse=True)[0]
+        rec['mainGap'] = {'key': gap_key, 'count': int(gap_count), 'label': gap_label}
+    responded_no_meeting = [x for x in perf_approaches if int(x.get('returns') or 0) > int(x.get('meetings') or 0)]
+    meeting_not_realized = [x for x in perf_approaches if int(x.get('meetings') or 0) > int(x.get('realizedMeetings') or 0)]
+    no_response_after_followup = [x for x in perf_approaches if str(x.get('parentKey') or '').startswith('followup') and int(x.get('sent') or 0) > int(x.get('returns') or 0)]
+    # P0-2: perdas por SDR/owner ------------------------------------------------
+    _sdr_port_labels = {}
+    for _p, _pmeta in PORTS.items():
+        if str(_pmeta.get('role') or '') == 'sdr':
+            _owner_uid = _pmeta.get('owner') or ''
+            _plbl = (USERS.get(_owner_uid) or {}).get('name') or _pmeta.get('label') or ''
+            if _plbl:
+                _sdr_port_labels[int(_p)] = _plbl
+    _known_sdr_labels = set(HUBSPOT_OWNER_LABELS.values())
+    _by_owner_dispatch = {}
+    for _ev in dispatch_events:
+        _port2 = int(_ev.get('port') or 0)
+        _olbl = _sdr_port_labels.get(_port2)
+        if not _olbl:
+            _oid = str(_ev.get('owner_id') or _ev.get('leadOwnerId') or '').strip()
+            _olbl = HUBSPOT_OWNER_LABELS.get(_oid) or ''
+        if not _olbl:
+            _sdr_raw = str(_ev.get('sdr') or '').strip()
+            if _sdr_raw in _known_sdr_labels:
+                _olbl = _sdr_raw
+        if not _olbl:
+            continue
+        _orec = _by_owner_dispatch.setdefault(_olbl, {
+            'owner': _olbl, 'sent': 0, 'returns': 0, 'meetings': 0, 'realizedMeetings': 0,
+            'respondedNoMeeting': 0, 'meetingNoOutcome': 0, 'noResponseFollowup': 0,
+        })
+        _orec['sent'] += 1
+        if _ev.get('responded'):
+            _orec['returns'] += 1
+            if not _ev.get('scheduledMeeting'):
+                _orec['respondedNoMeeting'] += 1
+        if _ev.get('scheduledMeeting'):
+            _orec['meetings'] += 1
+            if not _ev.get('meetingRealized'):
+                _orec['meetingNoOutcome'] += 1
+        if not _ev.get('responded') and str(_ev.get('kind') or '').startswith('followup'):
+            _orec['noResponseFollowup'] += 1
+    loss_ranking_by_owner = sorted(
+        _by_owner_dispatch.values(),
+        key=lambda x: (-(x.get('respondedNoMeeting') or 0), -(x.get('meetingNoOutcome') or 0))
+    )
+    # P0-3: abordagens para revisar ----------------------------------------
+    _REVIEW_MIN_SAMPLE = 20
+    _REVIEW_RESPONSE_PCT = 5.0
+    _REVIEW_MEETING_PCT = 2.0
+    approach_review = []
+    for _ap in perf_approaches:
+        _ap_sent = int(_ap.get('sent') or 0)
+        if _ap_sent < _REVIEW_MIN_SAMPLE:
+            continue
+        _rr = float(_ap.get('responseRate') or 0)
+        _mr = float(_ap.get('meetingRate') or 0)
+        _reasons = []
+        if _rr < _REVIEW_RESPONSE_PCT:
+            _reasons.append({'key': 'low_response', 'label': 'Revisar abertura', 'detail': f'{_rr:.1f}% de resposta'})
+        elif _mr < _REVIEW_MEETING_PCT:
+            _reasons.append({'key': 'low_meeting', 'label': 'CTA fraco para agenda', 'detail': f'{_mr:.1f}% para agenda'})
+        if not _reasons:
+            continue
+        _preview = ''
+        for _ex in (_ap.get('examples') or []):
+            if _ex.get('message'):
+                _preview = str(_ex.get('message'))[:300]
+                break
+        approach_review.append({
+            'key': _ap.get('key'),
+            'label': _ap.get('label'),
+            'parentKey': _ap.get('parentKey'),
+            'parentLabel': _ap.get('parentLabel'),
+            'versionLabel': _ap.get('versionLabel') or '',
+            'firstSeenDate': _ap.get('firstSeenDate') or '',
+            'lastSeenDate': _ap.get('lastSeenDate') or '',
+            'sent': _ap_sent,
+            'returns': int(_ap.get('returns') or 0),
+            'meetings': int(_ap.get('meetings') or 0),
+            'realizedMeetings': int(_ap.get('realizedMeetings') or 0),
+            'responseRate': _rr,
+            'meetingRate': _mr,
+            'reasons': _reasons,
+            'messagePreview': _preview,
+        })
+    approach_review.sort(key=lambda x: (float(x.get('responseRate') or 0), float(x.get('meetingRate') or 0)))
+    # P1-1: agenda outcome center ------------------------------------------
+    _meeting_rows_all = _dispatch_meeting_rows(days, allowed)
+    _now_ts = time.time()
+    _ao_future, _ao_realized, _ao_past_no, _ao_cancelled = [], [], [], []
+    _ao_by_owner = {}
+    for _mt in _meeting_rows_all:
+        _mt_lbl = ''
+        _mt_owner_name = str(_mt.get('meetingOwner') or '').strip()
+        if _mt_owner_name and _mt_owner_name in _known_sdr_labels:
+            _mt_lbl = _mt_owner_name
+        if not _mt_lbl:
+            _mt_port2 = int(_mt.get('port') or 0)
+            _mt_lbl = _sdr_port_labels.get(_mt_port2) or ''
+        if not _mt_lbl:
+            _mt_sdr = str(_mt.get('sdr') or '').strip()
+            if _mt_sdr in _known_sdr_labels:
+                _mt_lbl = _mt_sdr
+        _mts = float(_mt.get('meetingTs') or 0)
+        _item = {
+            'empresa': _mt.get('empresa') or _mt.get('to') or '—',
+            'sdr': _mt_lbl,
+            'meetingStart': _mt.get('meetingStart') or '',
+            'meetingId': _mt.get('meetingId') or '',
+            'outcome': _mt.get('hubspotOutcome') or '',
+            'port': _mt.get('port'),
+            'to': _mt.get('to') or '',
+            'dealId': _mt.get('dealId') or '',
+        }
+        _ow_out = None
+        if _mt_lbl:
+            _ow_out = _ao_by_owner.setdefault(_mt_lbl, {
+                'owner': _mt_lbl, 'future': 0, 'realized': 0, 'pastNoOutcome': 0, 'cancelled': 0
+            })
+        if _mt.get('future'):
+            _ao_future.append(_item)
+            if _ow_out: _ow_out['future'] += 1
+        elif _mt.get('realized'):
+            _ao_realized.append(_item)
+            if _ow_out: _ow_out['realized'] += 1
+        elif _mt.get('cancelled'):
+            _ao_cancelled.append(_item)
+            if _ow_out: _ow_out['cancelled'] += 1
+        elif _mts and _mts < _now_ts:
+            _ao_past_no.append(_item)
+            if _ow_out: _ow_out['pastNoOutcome'] += 1
+    agenda_outcome = {
+        'future': _ao_future[:30],
+        'realized': _ao_realized[:30],
+        'pastNoOutcome': _ao_past_no[:30],
+        'cancelled': _ao_cancelled[:30],
+        'byOwner': sorted(_ao_by_owner.values(), key=lambda x: -(x.get('pastNoOutcome') or 0)),
+        'summary': {
+            'total': len(_meeting_rows_all),
+            'future': len(_ao_future),
+            'realized': len(_ao_realized),
+            'pastNoOutcome': len(_ao_past_no),
+            'cancelled': len(_ao_cancelled),
+        },
+    }
+    loss_ranking = {
+        'items': [
+            {'key': 'responded_no_meeting', 'label': 'Responderam e não agendaram', 'count': sum(max(int(x.get('returns') or 0) - int(x.get('meetings') or 0), 0) for x in responded_no_meeting), 'approaches': responded_no_meeting[:6], 'nextAction': 'Converter resposta em próximo passo de agenda'},
+            {'key': 'meeting_not_realized', 'label': 'Agendaram e ainda não viraram realizada', 'count': sum(max(int(x.get('meetings') or 0) - int(x.get('realizedMeetings') or 0), 0) for x in meeting_not_realized), 'approaches': meeting_not_realized[:6], 'nextAction': 'Confirmar outcome, no-show ou próxima ação'},
+            {'key': 'no_response_after_followup', 'label': 'Sem resposta depois de follow-up', 'count': sum(max(int(x.get('sent') or 0) - int(x.get('returns') or 0), 0) for x in no_response_after_followup), 'approaches': no_response_after_followup[:6], 'nextAction': 'Revisar cadência, versão e contexto do texto'},
+        ],
+        'byOwner': loss_ranking_by_owner,
+    }
+    conversion_funnel = {'totalSent': total, 'totalReturns': total_returns, 'totalMeetings': total_meetings, 'totalRealizedMeetings': total_realized, 'approaches': perf_approaches, 'lossRanking': loss_ranking}
+    followup_performance = {'series': perf_series, 'ranked': perf_ranked, 'approaches': perf_approaches, 'days': perf_days, 'totalSent': total, 'totalReturns': total_returns, 'windowHours': 24*7, 'attribution': 'último disparo antes da resposta'}
+    agenda_performance = {'ranked': agenda_ranked, 'series': agenda_by_type, 'totalSent': total, 'totalMeetings': total_meetings, 'totalRealizedMeetings': total_realized, 'attribution': 'último disparo antes da agenda/reunião', 'realizedRule': 'conta realizada somente quando o HubSpot informa reunião concluída'}
+    out={'ok': True, 'source': 'controle/wpp_envios.json + history_*.json', 'dispatchDepsMtime': _dispatch_stats_dependency_mtime(), 'periodDays': days, 'visibleDays': visible_days, 'total': total, 'chips': chips, 'days': rows, 'typeStats': type_stats, 'followupPerformance': followup_performance, 'agendaPerformance': agenda_performance, 'conversionFunnel': conversion_funnel, 'lossRanking': loss_ranking, 'approachReview': approach_review, 'agendaOutcome': agenda_outcome, 'skipped': skipped, 'scope': 'consolidado' if user_can_view_all(uid) else 'seus chips'}
+    _dispatch_stats_snapshot_set(uid, days, out)
+    return out
+
+def _msg_identity_for_dedupe(m):
+    """Identidade forte de mensagem para unir ledger tardio + bolha real.
+
+    O ledger pode ser reimportado horas depois com id `3EB..._text`, enquanto a
+    bridge já tem a bolha real `3EB...`. Para a inbox, a bolha real precisa vencer
+    no timestamp; o ledger só enriquece metadados de automação.
+    """
+    if not isinstance(m, dict):
+        return ''
+    for k in ('bridgeMessageId', 'messageId', 'waMessageId', 'id'):
+        v = str(m.get(k) or '').strip()
+        if not v:
+            continue
+        if v.startswith('wpp_envios:'):
+            continue
+        v = re.sub(r'_(text|pdf|media|file|caption)$', '', v, flags=re.I)
+        if len(v) >= 8:
+            return v
+    return ''
 
 
 def _dedupe_loaded_items(items):
-    """Remove duplicatas entre fastlane wpp_envios e history/bridge.
+    """Remove duplicatas entre fastlane/wpp_envios e history/bridge.
 
-    Preferimos a bolha real da bridge quando já existe, mas se só houver fastlane
-    ela mantém o card imediato. Chave conservadora: porta+chat+email/slug+minuto.
+    Preferimos a bolha real da bridge quando já existe, mas se só houver ledger
+    ela mantém o card imediato. Importante: ledger reimportado tarde não pode
+    atualizar o horário do card para “agora”; ele só enriquece a bolha real.
     """
     seen = {}
     for m in sorted([x for x in items if isinstance(x, dict)], key=lambda x: float(x.get('timestamp') or 0)):
-        minute = int(float(m.get('timestamp') or 0) // 60)
-        key = (int(m.get('port') or 0), str(m.get('chat') or ''), str(m.get('email') or m.get('slug') or '').lower(), minute)
-        if not key[1] or not key[2]:
-            key = (int(m.get('port') or 0), str(m.get('chat') or ''), _norm_text(m.get('text'))[:120], minute)
+        mid = _msg_identity_for_dedupe(m)
+        if mid:
+            key = ('mid', int(m.get('port') or 0), str(m.get('chat') or ''), mid)
+        else:
+            minute = int(float(m.get('timestamp') or 0) // 60)
+            key = (int(m.get('port') or 0), str(m.get('chat') or ''), str(m.get('email') or m.get('slug') or '').lower(), minute)
+            if not key[1] or not key[2]:
+                key = (int(m.get('port') or 0), str(m.get('chat') or ''), _norm_text(m.get('text'))[:120], minute)
         prev = seen.get(key)
         if not prev:
             seen[key] = m
             continue
         prev_src = str(prev.get('source') or '')
         cur_src = str(m.get('source') or '')
-        # Se a bridge/history já chegou, ela vence sobre o fastlane puro.
-        if 'wpp_envios_fastlane' in prev_src or 'fastlane' in prev_src:
+        prev_typ = str(prev.get('type') or '')
+        cur_typ = str(m.get('type') or '')
+        prev_is_ledger = (prev_typ.startswith('cron-') or prev_typ == 'seed-wpp-envios' or str(prev.get('sender') or '') == 'cron-import')
+        cur_is_ledger = (cur_typ.startswith('cron-') or cur_typ == 'seed-wpp-envios' or str(m.get('sender') or '') == 'cron-import')
+        if prev_is_ledger and not cur_is_ledger:
+            # Mantém a classificação/metadados do ledger (Auto/Follow-up), mas com
+            # timestamp/id reais da bridge. Assim o card não vira “agora” falso.
+            mm = dict(prev)
+            if m.get('deleted'):
+                mm['deleted'] = True
+                if m.get('deletedAt'):
+                    mm['deletedAt'] = m.get('deletedAt')
+            if m.get('timestamp'):
+                mm['timestamp'] = m.get('timestamp')
+                mm['timestampSource'] = 'bridge'
+            if m.get('id') and not mm.get('bridgeMessageId'):
+                mm['bridgeMessageId'] = m.get('id')
+            mm['source'] = 'controle/wpp_envios.json+bridge:operational'
+            if not mm.get('automation'):
+                mm['automation'] = automation_badge(mm)
+            seen[key] = mm
+        elif cur_is_ledger and not prev_is_ledger:
+            pp = dict(m)
+            if prev.get('deleted'):
+                pp['deleted'] = True
+                if prev.get('deletedAt'):
+                    pp['deletedAt'] = prev.get('deletedAt')
+            if prev.get('timestamp'):
+                pp['timestamp'] = prev.get('timestamp')
+                pp['timestampSource'] = 'bridge'
+            if prev.get('id') and not pp.get('bridgeMessageId'):
+                pp['bridgeMessageId'] = prev.get('id')
+            pp['source'] = 'controle/wpp_envios.json+bridge:operational'
+            if not pp.get('automation'):
+                pp['automation'] = automation_badge(pp)
+            seen[key] = pp
+        elif prev_is_ledger and cur_is_ledger and str(prev.get('timestampSource') or '') == 'bridge':
+            # Já temos o evento de ledger colado na bolha real; não deixar reimport tardio substituir.
+            seen[key] = prev
+        elif prev_is_ledger and cur_is_ledger and str(m.get('timestampSource') or '') == 'bridge':
+            seen[key] = m
+        elif 'wpp_envios_fastlane' in prev_src or 'fastlane' in prev_src:
             seen[key] = m
         elif 'fastlane' not in cur_src:
             seen[key] = m
@@ -1287,7 +2458,12 @@ def load_inbox_candidates(uid):
         ports=set(PORTS.keys())
     else:
         ports=allowed | set(SHARED_DEAL_VISIBILITY_PORTS)
-    ports -= load_paused_ports()
+    paused = load_paused_ports()
+    # Pausa de chip deve bloquear start/uso operacional, não sumir com auditoria
+    # de envios já feitos. Para comunicadores compartilhados (ex.: João Pedro 4609),
+    # manter o histórico operacional visível e filtrado por ledger; conversas
+    # pessoais continuam protegidas por merge_institutional_ledger_with_real_messages().
+    ports -= {p for p in paused if p not in SHARED_DEAL_VISIBILITY_PORTS}
     return load_ports(ports)
 
 def _norm_owner_token(s):
@@ -1319,9 +2495,21 @@ def _conversation_sdr_hint_from_msg(m):
         uid = hubspot_owner_uid_map().get(oid, '')
         if uid:
             return uid
-    for k in ('sdr','sdrName','ownerName','hubspot_owner_name'):
+    for k in ('sdr','sdrName','ownerName','hubspot_owner_name','sender_name','senderName','leadOwnerLabel'):
         uid=sdr_hint_to_uid(m.get(k))
         if uid:
+            return uid
+    # Em envios institucionais/comunicadores sem owner explícito, o bridge_port
+    # ainda identifica o operador responsável pelo envio auditável. Ex.: Lucas
+    # Resende 4606 em `nao_mql_legitimo_tratativa` vinha sem `sdr` e bloqueava
+    # /api/messages, deixando a tela detalhe presa em “Carregando mensagens”.
+    for k in ('dispatchPort','bridge_port','port'):
+        try:
+            p=int((m or {}).get(k) or 0)
+        except Exception:
+            p=0
+        uid=(PORTS.get(p, {}) or {}).get('owner') or ''
+        if uid in USERS:
             return uid
     return ''
 
@@ -1330,6 +2518,62 @@ def clean_title_value(v):
     if not v or v.lower() in {'none','null','sem empresa','sem nome'}:
         return ''
     return v
+
+
+def _looks_like_doc_number(v):
+    digits = re.sub(r'\D+', '', str(v or ''))
+    return bool(digits and len(digits) >= 11 and digits == re.sub(r'\D+', '', str(v or '')))
+
+
+def _title_words_from_slug(slug):
+    raw = str(slug or '').strip().lower()
+    if not raw or raw in {'none','null'} or '@' in raw:
+        return []
+    raw = re.sub(r'[_\s]+', '-', raw)
+    parts = [p for p in re.split(r'[^a-z0-9]+', raw) if p]
+    stop = {'ltda','me','epp','sa','s','a','com','br','www','gmail','hotmail','outlook'}
+    return [p for p in parts if p not in stop]
+
+
+def _humanize_slug_part(p):
+    aliases = {'confeccoes':'Confeccoes','comercio':'Comercio','industria':'Industria','distribuidora':'Distribuidora'}
+    return aliases.get(str(p or '').lower(), str(p or '').capitalize())
+
+
+def identity_fallback_from_msg(m):
+    """Nome visual quando HubSpot/ledger traz só CNPJ/telefone.
+
+    Não inventa dado externo: usa slug/email já presentes no registro operacional.
+    Ex.: slug `liso-confeccoes-douglas` -> empresa `Liso Confeccoes`, contato `Douglas`.
+    """
+    words = _title_words_from_slug((m or {}).get('slug'))
+    if not words:
+        email = str((m or {}).get('email') or '').strip()
+        local = email.split('@', 1)[0] if '@' in email else ''
+        words = _title_words_from_slug(local)
+    if not words:
+        return {'empresa':'', 'nome':''}
+    contact = ''
+    if len(words) >= 3 and len(words[-1]) >= 3:
+        contact = _humanize_slug_part(words[-1])
+        words = words[:-1]
+    empresa = ' '.join(_humanize_slug_part(p) for p in words[:4]).strip()
+    return {'empresa':empresa, 'nome':contact}
+
+
+def display_company_from_msg(m):
+    empresa = clean_title_value((m or {}).get('empresa') or (m or {}).get('lead') or (m or {}).get('company'))
+    if empresa and not _looks_like_doc_number(empresa):
+        return empresa
+    fb = identity_fallback_from_msg(m)
+    return fb.get('empresa') or empresa
+
+
+def display_contact_from_msg(m):
+    nome = clean_title_value((m or {}).get('nome') or (m or {}).get('lead_name') or (m or {}).get('firstname'))
+    if nome and not _looks_like_doc_number(nome):
+        return nome
+    return identity_fallback_from_msg(m).get('nome') or ''
 
 
 # ---- CH-006: LID vs JID real -------------------------------------------------
@@ -1407,6 +2651,42 @@ def message_matches_chat(m, chat):
     return canonical_chat_for_message(m) == canonical_chat_id(chat)
 
 
+def outbound_delivery_jid(port, chat):
+    """JID seguro para envio pelo Channel.
+
+    Baileys/WhatsApp MD tem bug conhecido: envios para `@lid` podem chegar ao
+    destinatário, mas não sincronizar a bolha no Android/celular remetente. Para
+    operação comercial, o Channel nunca deve entregar `@lid` cru ao `/send` da
+    bridge; quando houver telefone real, envia por PN (`@s.whatsapp.net`).
+    """
+    chat = str(chat or '').strip()
+    if not chat:
+        return '', 'chat vazio'
+    if chat.endswith('@g.us') or chat.endswith('@broadcast') or chat == 'status@broadcast':
+        return chat, ''
+    canon = canonical_chat_id(chat)
+    if _is_real_jid(canon) and real_phone_digits(canon):
+        return canon, ''
+    # Conversa antiga pode estar identificada por @lid, mas uma mensagem recente
+    # pode trazer `rawKey.remoteJidAlt`/`jidAlt` com o PN real. Usar esse PN.
+    try:
+        for m in reversed(read_history(int(port))):
+            if not isinstance(m, dict):
+                continue
+            if str(m.get('chat') or '') != chat and canonical_chat_for_message(m) != canon:
+                continue
+            alt = real_jid_from(m)
+            if alt:
+                alt_canon = canonical_chat_id(alt)
+                if _is_real_jid(alt_canon) and real_phone_digits(alt_canon):
+                    return alt_canon, ''
+    except Exception:
+        pass
+    if is_lid(chat):
+        return '', 'Conversa está só como LID; sem telefone real/PN para enviar com segurança. Aguarde uma mensagem nova do lead ou abra pelo contato com número.'
+    return '', 'chat não é um telefone WhatsApp válido'
+
+
 # Números internos Zydon/SDR/institucionais. Conversas entre esses chips são
 # aquecimento, validação ou coordenação interna — não são leads e não devem
 # poluir inbox/Responder agora.
@@ -1444,7 +2724,11 @@ def _is_diag_dispatch(m):
     if status in {'enviado_lead', 'enviado_mql'} and (m.get('pdf_path') or m.get('hubspot_file_id') or m.get('group_summary')):
         return True
     msg_type = str(m.get('msg_type') or '').lower()
-    return 'diagnostico' in msg_type or 'mql' in msg_type
+    # `nao_mql_*` é tratativa operacional enviada com sucesso, não diagnóstico/MQL.
+    # Antes isso marcava cards como “Automação falhou”/“diagnóstico” por engano.
+    if 'nao_mql' in msg_type or 'não_mql' in msg_type or 'nao mql' in msg_type or 'não mql' in msg_type:
+        return False
+    return 'diagnostico' in msg_type or 'diagnóstico' in msg_type or re.search(r'(^|[^a-z])mql([^a-z]|$)', msg_type) is not None
 
 
 def source_label(m):
@@ -1454,6 +2738,7 @@ def source_label(m):
     if 'follow' in msg_type or 'follow' in typ.lower(): return 'Follow-up enviado'
     if 'cadencia' in msg_type or 'sumico' in msg_type: return 'Cadência enviada'
     if typ == 'cron-sdr-primeiro-contato' or 'primeiro_contato' in msg_type or (typ == 'cron-whatsapp-texto' and is_institutional_port(m.get('port'))): return '1º contato SDR'
+    if typ == 'seed-wpp-envios': return 'Automação'
     if typ.startswith('cron-'): return 'Automação'
     if not m.get('fromMe'): return 'Resposta recebida'
     return 'WhatsApp'
@@ -1463,17 +2748,20 @@ def _enrich_dispatch_identity(m):
     if not isinstance(m, dict):
         return m
     try:
-        gp = int(m.get('group_bridge_port') or m.get('dispatchPort') or 0)
+        gp = int(m.get('group_bridge_port') or 0)
     except Exception:
         gp = 0
     try:
-        bp = int(m.get('bridge_port') or m.get('port') or 0)
+        bp = int(m.get('bridge_port') or m.get('port') or m.get('dispatchPort') or 0)
     except Exception:
         bp = 0
-    dispatch_port = gp or bp
-    if dispatch_port and not m.get('dispatchPort'):
+    # bridge_port é quem falou com o lead; group_bridge_port é só aviso interno.
+    dispatch_port = bp or int(m.get('dispatchPort') or 0)
+    if gp and not m.get('groupDispatchPort'):
+        m['groupDispatchPort'] = gp
+        m['groupDispatchLabel'] = PORTS.get(gp, {}).get('label', str(gp))
+    if dispatch_port:
         m['dispatchPort'] = dispatch_port
-    if dispatch_port and not m.get('dispatchLabel'):
         m['dispatchLabel'] = PORTS.get(dispatch_port, {}).get('label', str(dispatch_port))
     owner_id = str(m.get('owner_id') or m.get('hubspot_owner_id') or m.get('leadOwnerId') or '').strip()
     if owner_id and not m.get('leadOwnerId'):
@@ -1484,8 +2772,48 @@ def _enrich_dispatch_identity(m):
 
 
 def _auto_sent_ok(m):
-    st = str((m or {}).get('status') or '').lower()
-    return (not st) or st in {'ok','sent','enviado','enviado_lead','enviado_mql','1','2'}
+    st = str((m or {}).get('status') or '').lower().strip()
+    # Erro declarado no status sempre vence: uma resposta parcial com
+    # success=True não pode mascarar uma falha real registrada no status.
+    if any(x in st for x in ('erro','falha','failed','cancel','invalid','inválido','invalido')):
+        return False
+    if isinstance(m, dict):
+        # Registros compostos de diagnóstico/manual MQL podem ter várias respostas
+        # (`text_response`, `file_response`, `followup_response`, aviso no grupo)
+        # em vez de um campo único `response`. Uma resposta com success=False é
+        # falha real; só consideramos enviado quando houve sucesso e nenhuma falha.
+        saw_success = False
+        for k, resp in m.items():
+            if k == 'response' or k.endswith('_response'):
+                if isinstance(resp, dict):
+                    if resp.get('success') is False:
+                        return False
+                    if resp.get('success') is True:
+                        saw_success = True
+        if saw_success:
+            return True
+    return (not st) or st in {'ok','sent','enviado','enviado_lead','enviado_mql','1','2','manual_nao_mql_convertido_mql','correcao_whatsapp_enviada'} or st.startswith('enviado_') or st.endswith('_enviada')
+
+
+def _visible_for_card_last(m):
+    """Mensagem que pode governar preview/horário do card da inbox.
+
+    Eventos técnicos de apagar/revogar mensagem entram no history como append
+    fromMe sem texto/mídia. Eles devem aparecer no detalhe como contexto técnico
+    quando necessário, mas não podem esconder a última mensagem real do WhatsApp
+    nem empurrar o card para cima com preview vazio.
+    """
+    if not isinstance(m, dict):
+        return False
+    if m.get('deleted'):
+        return False
+    if m.get('delete_revoke_message_id') or m.get('deleted_message_id'):
+        if not _norm_text(m.get('text')) and not (m.get('mediaUrl') or m.get('mediaPath') or m.get('mediaName') or m.get('mimetype') or m.get('mediaType')):
+            return False
+    typ = str(m.get('type') or '')
+    if typ == 'append' and m.get('fromMe') and not _norm_text(m.get('text')) and not (m.get('mediaUrl') or m.get('mediaPath') or m.get('mediaName') or m.get('mimetype') or m.get('mediaType')):
+        return False
+    return True
 
 
 def _auto_summary_init():
@@ -1612,6 +2940,48 @@ def _audio_file_path(m):
         p = DATA_DIR / 'media' / str(port) / fname
         if p.exists() and p.is_file():
             return p
+    return None
+
+
+def resolve_media_file_for_user(uid, fname, port=0, chat=''):
+    """Resolve mídia local com autorização, aceitando /api/media e /media legado.
+
+    O frontend atual usa /api/media?port=...&file=..., mas abas móveis em cache e
+    registros antigos podem abrir /media/<arquivo>. Sem este fallback, PDFs salvos
+    corretamente aparecem como iframe preto com "Not found".
+    """
+    safe = os.path.basename(unquote(str(fname or '').split('?', 1)[0]))
+    if not safe:
+        return None
+    try:
+        port = int(port or 0)
+    except Exception:
+        port = 0
+    if port:
+        allowed_media = port in effective_ports(uid)
+        if not allowed_media and chat:
+            try:
+                allowed_media = conversation_id_allowed(uid, f'{port}::{chat}')
+            except Exception:
+                allowed_media = False
+        if not allowed_media:
+            return None
+        candidate_ports = [port]
+    else:
+        candidate_ports = list(effective_ports(uid))
+    for pnum in candidate_ports:
+        try:
+            pnum = int(pnum)
+        except Exception:
+            continue
+        root = DATA_DIR / 'media' / str(pnum)
+        f = root / safe
+        try:
+            if f.exists() and f.is_file() and f.resolve().is_relative_to(root.resolve()):
+                return f
+        except Exception:
+            if f.exists() and f.is_file():
+                return f
     return None
 
 
@@ -1824,12 +3194,14 @@ def conversations(uid):
         # Privacidade: chips pessoais/institucionais (Mariana/Rafael/Lucas Resende)
         # nunca aparecem como conversa normal. Só eventos operacionais de envio
         # para negócio de SDR entram como auditoria read-only.
-        if is_institutional_port(port_i) and m.get('fromMe') and not is_institutional_dispatch_msg(m):
+        if is_institutional_port(port_i) and m.get('fromMe') and not (is_institutional_dispatch_msg(m) or m.get('readOnlyInstitutionalThread')):
             continue
         chat_key = canonical_chat_for_message(m)
         key=f"{port_i}::{chat_key}"
-        c=conv.setdefault(key, {'id':key,'chat':chat_key,'title':'','subtitle':'','port':port_i,'portLabel':m.get('portLabel'),'messages':0,'last':None,'lastTime':0,'lastIncomingTime':0,'lastOutgoingTime':0,'unread':0,'responses':0,'lastIncoming':None,'lastSource':'','realJid':'','automation':_auto_summary_init(),'audioPending':0,'audioTranscriptText':'','sharedFromPort':False,'sharedVisibilityReason':'','sharedOwnerUid':'','_directVisible':port_i in allowed_ports,'_sdrHintUid':'','_recent':[]})
+        c=conv.setdefault(key, {'id':key,'chat':chat_key,'title':'','subtitle':'','port':port_i,'portLabel':m.get('portLabel'),'messages':0,'last':None,'lastTime':0,'lastIncomingTime':0,'lastOutgoingTime':0,'unread':0,'responses':0,'lastIncoming':None,'lastSource':'','realJid':'','automation':_auto_summary_init(),'audioPending':0,'audioTranscriptText':'','sharedFromPort':False,'sharedVisibilityReason':'','sharedOwnerUid':'','_directVisible':port_i in allowed_ports,'_sdrHintUid':'','_operationalOrigin':False,'_recent':[]})
         c['messages'] += 1
+        if is_operational_channel_msg(m):
+            c['_operationalOrigin'] = True
         # CH-050: acumula só os últimos snippets (sem reler load_all por conversa)
         # para montar o resumo heurístico depois. Mantém o custo baixo (~12 itens).
         # CH-050/052: snippets para resumo; se áudio já foi transcrito, ele vira
@@ -1864,11 +3236,11 @@ def conversations(uid):
         if not c.get('_hsEmail') and m.get('email'):
             c['_hsEmail'] = str(m.get('email')).strip()
         if not c.get('_hsEmpresa'):
-            _emp = clean_title_value(m.get('empresa'))
+            _emp = display_company_from_msg(m)
             if _emp:
                 c['_hsEmpresa'] = _emp
         ts = float(m.get('timestamp') or 0)
-        if ts >= float(c.get('lastTime') or 0):
+        if _visible_for_card_last(m) and ts >= float(c.get('lastTime') or 0):
             c['lastTime'] = ts
             c['last'] = m
             c['lastSource'] = source_label(m)
@@ -1885,10 +3257,10 @@ def conversations(uid):
         if m.get('fromMe'):
             _record_automation(c, m, ts)
         # melhor título da conversa inteira: empresa > nome > slug > telefone
-        best = clean_title_value(m.get('empresa') or m.get('lead'))
-        if best and (not c.get('title') or c.get('title') == short_phone(chat) or c.get('title') == chat):
+        best = display_company_from_msg(m)
+        if best and (not c.get('title') or _looks_like_doc_number(c.get('title')) or c.get('title') == short_phone(chat) or c.get('title') == chat):
             c['title'] = best
-        name = clean_title_value(m.get('nome'))
+        name = display_contact_from_msg(m)
         sdr = clean_title_value(m.get('sdr'))
         if name and name.lower() not in str(c.get('title','')).lower():
             c['subtitle'] = name + (f" · {sdr}" if sdr else '')
@@ -1897,6 +3269,15 @@ def conversations(uid):
     out=[]
     for c in conv.values():
         chat = c.get('chat') or ''
+        # Para SDR, `_operationalOrigin` já foi calculado enquanto varríamos os
+        # eventos da própria conversa. Revalidar chamando `_raw_history_for_chat`
+        # para cada card transforma /api/conversations em O(conversas × histórico)
+        # e causou alerta real do watchdog. Comunicadores seguem com rechecagem
+        # forte porque a privacidade máxima depende do vínculo operacional.
+        if not c.get('_operationalOrigin'):
+            continue
+        if is_institutional_port(c.get('port')) and not operational_conversation_has_origin(c.get('port'), chat):
+            continue
         real = c.get('realJid') or ''
         # Telefone exibível: real do alt-JID, senão do chat se for número de verdade.
         # @lid e IDs LID-derivados (sem telefone válido) devolvem '' aqui.
@@ -1913,9 +3294,10 @@ def conversations(uid):
             c['subtitle'] = display_phone or 'Identificador WhatsApp protegido'
         if is_institutional_port(c.get('port')):
             # Só manter auditoria de envio feito por institucional para negócio de SDR.
-            # Sem SDR dono => é privado/operacional interno e sai da inbox.
+            # Sem SDR dono reconhecido, supervisor/admin ainda pode ver o que veio do
+            # ledger operacional; SDR comum não recebe conversa de comunicador incerta.
             inst_owner = c.get('_sdrHintUid') or ''
-            if inst_owner not in SDR_OWNER_UIDS or not float((c.get('automation') or {}).get('lastAutomationAt') or 0):
+            if (inst_owner not in SDR_OWNER_UIDS) and not (view_all and float((c.get('automation') or {}).get('lastAutomationAt') or 0)):
                 continue
             c['readOnlyInstitutional'] = True
             c['institutionalDispatchLabel'] = 'Envio institucional'
@@ -1932,6 +3314,7 @@ def conversations(uid):
         # Nunca devolver o JID/LID cru como conteúdo visível além do campo técnico `chat`.
         c.pop('realJid', None)
         c.pop('_directVisible', None)
+        c.pop('_operationalOrigin', None)
         c['sdrHintUid'] = c.get('_sdrHintUid') or ''
         c.pop('_sdrHintUid', None)
         out.append(c)
@@ -1948,12 +3331,13 @@ def conversations(uid):
         if is_institutional_port(c.get('port')):
             c['readOnlyInstitutional'] = True
             c['institutionalDispatchLabel'] = auto.get('lastAutomationLabel') or 'Envio institucional'
-        # Ordenação comercial estilo WhatsApp: resposta do lead sobe; senão,
-        # usa entrada real do lead (1º contato/diagnóstico) e não follow-up/replay.
+        # Ordenação estilo WhatsApp: a inbox sobe pela última atividade visível da
+        # conversa, seja mensagem enviada por nós ou resposta do cliente. A entrada
+        # comercial continua exposta como metadado, mas não governa a lista.
         entry_times = [float(auto.get(k) or 0) for k in ('primeiroContatoAt','diagnosticoPdfAt','diagnosticoTextAt')]
         commercial_entry = max(entry_times) if entry_times else 0
         c['commercialEntryTime'] = commercial_entry or float(c.get('lastTime') or 0)
-        c['inboxSortTime'] = float(c.get('lastIncomingTime') or 0) or c['commercialEntryTime']
+        c['inboxSortTime'] = float(c.get('lastTime') or 0)
         c.update(local_state_summary(state.get(c.get('id'))))
         # CH-050: resumo heurístico a partir dos snippets já acumulados no loop.
         c['aiSummary'] = build_ai_summary(c.pop('_recent', []), local_status=c.get('localStatus'))
@@ -1985,7 +3369,8 @@ def conversations(uid):
             c['hubspotDealId'] = hs_link['dealId']
         owner_uid = (hs_entry.get('ownerUid') if isinstance(hs_entry, dict) else '') or c.get('sdrHintUid') or PORTS.get(int(c.get('port') or 0), {}).get('owner') or ''
         c['dealOwnerUid'] = owner_uid
-        c['dealOwnerLabel'] = (USERS.get(owner_uid, {}) or {}).get('name') or owner_uid.replace('_',' ').title()
+        ledger_owner_label = str(((c.get('last') or {}).get('leadOwnerLabel') or '')).strip() if c.get('readOnlyInstitutional') else ''
+        c['dealOwnerLabel'] = ledger_owner_label or (USERS.get(owner_uid, {}) or {}).get('name') or owner_uid.replace('_',' ').title()
         c['senderLabel'] = PORTS.get(int(c.get('port') or 0), {}).get('label','')
         c['sdrLabel'] = c['dealOwnerLabel']
         c['hubspotLinked'] = bool(c.get('hubspotContactId') or c.get('hubspotDealId') or (isinstance(hs_entry, dict) and (hs_entry.get('contactId') or hs_entry.get('dealId'))))
@@ -2024,6 +3409,30 @@ def _media_key(m):
     name = str((m or {}).get('mediaName') or '').strip().lower()
     return name
 
+
+def _is_diagnostic_pdf_message(m):
+    """True para PDFs de diagnóstico mesmo quando o nome bonito diverge.
+
+    O WhatsApp pode salvar o arquivo com um `fileName` curto enviado pela bridge
+    (ex.: `Grupo Automec - Potencial...`) enquanto o import do ledger usa o
+    `pdf_path` completo (ex.: `Gestor Negócios Atacado... - Potencial...`). São a
+    mesma mídia operacional; comparar nome literal cria dois cards de PDF.
+    """
+    if not isinstance(m, dict):
+        return False
+    parts = [
+        m.get('mediaName'), m.get('fileName'), m.get('mediaPath'), m.get('mediaUrl'),
+        m.get('pdf_path'), m.get('text'), m.get('caption'),
+    ]
+    blob = ' '.join(str(x or '') for x in parts).lower()
+    mime = str(m.get('mimetype') or '').lower()
+    media_type = str(m.get('mediaType') or '').lower()
+    return ('.pdf' in blob or 'pdf' in mime or media_type == 'document') and 'potencial de digitalizacao' in blob
+
+
+def _same_diagnostic_pdf(a, b):
+    return _is_diagnostic_pdf_message(a) and _is_diagnostic_pdf_message(b)
+
 def collapse_automation(msgs):
     """Funde evento de automação + mensagem enviada idêntica numa bolha única.
 
@@ -2043,12 +3452,26 @@ def collapse_automation(msgs):
         for ev in events:
             if id(ev) in consumed:
                 continue
-            if abs(float(ev.get('timestamp') or 0) - mt) > 120:
-                continue
             ent = _norm_text(ev.get('text'))
             same_text = nt != '' and nt == ent
             same_media = bool(mk) and mk == _media_key(ev)
-            if not (same_text or same_media):
+            same_diag_pdf = _same_diagnostic_pdf(m, ev)
+            mid = str(m.get('id') or '')
+            evid = str(ev.get('id') or '')
+            ev_msg_id = str(ev.get('messageId') or ev.get('bridgeMessageId') or '')
+            same_bridge_id = bool(mid and (ev_msg_id == mid or evid == mid or evid == (mid + '_text')))
+            delta = abs(float(ev.get('timestamp') or 0) - mt)
+            # Se o ledger carrega o mesmo messageId da bridge, é a mesma mensagem
+            # independentemente do horário de importação. Sem id comum, usa janela
+            # operacional segura para texto/PDF exatamente iguais.
+            if not same_bridge_id:
+                if same_text and delta > 15 * 60:
+                    continue
+                if same_media and delta > 15 * 60:
+                    continue
+                if same_diag_pdf and delta > 15 * 60:
+                    continue
+            if not (same_bridge_id or same_text or same_media or same_diag_pdf):
                 continue
             consumed.add(id(ev))
             m['automation'] = automation_badge(ev)
@@ -2063,8 +3486,40 @@ def collapse_automation(msgs):
                 for k in ('mediaUrl', 'mediaName', 'mediaType', 'mimetype', 'mediaPath'):
                     if ev.get(k) and not m.get(k):
                         m[k] = ev.get(k)
-            break
-    return [m for m in msgs if id(m) not in consumed]
+            # Pode haver dois eventos de automação para a mesma bolha real:
+            # 1) cron-import regravado em history_*.json; 2) fastlane direto do
+            # controle/wpp_envios.json. Consumir todos os matches evita duplicidade
+            # visual como no caso Ormifrio/Gabriella (28/06).
+            continue
+    remaining=[m for m in msgs if id(m) not in consumed]
+    # Também colapsa duplicatas entre dois eventos de automação/ledger sem bolha
+    # real disponível (ex.: seed fastlane + cron importado com o mesmo texto e
+    # mesmo chat). Isso é visual; não altera history/ledger.
+    out=[]
+    seen_auto={}
+    for m in remaining:
+        if is_automation_event(m):
+            # PDF real da bridge pode chegar como api-send sem texto, e o cron-import
+            # entra minutos depois como cron-mql-pdf com texto "PDF enviado: ...".
+            # Para PDF de diagnóstico, a mídia é a identidade; texto do ledger não
+            # deve criar uma segunda bolha (incidente Schutzmann 29/06).
+            if _is_diagnostic_pdf_message(m):
+                ck=(canonical_chat_for_message(m), '', _media_key(m) or 'diagnostic-pdf')
+            else:
+                ck=(canonical_chat_for_message(m), _norm_text(m.get('text')), _media_key(m))
+            minute=int(float(m.get('timestamp') or 0)//60)
+            prev_idx=seen_auto.get(ck)
+            if ck[0] and (ck[1] or ck[2]) and prev_idx is not None:
+                prev=out[prev_idx]
+                if abs(float(prev.get('timestamp') or 0)-float(m.get('timestamp') or 0)) <= 15*60 and (ck[1] or ck[2] or _same_diagnostic_pdf(prev, m)):
+                    # Preferir o evento com id/bridge real quando existir.
+                    if _event_message_id(m) and not _event_message_id(prev):
+                        out[prev_idx]=m
+                    continue
+            if ck[0] and (ck[1] or ck[2]):
+                seen_auto[ck]=len(out)
+        out.append(m)
+    return out
 
 def _conversation_permission_context(port, chat):
     """Resumo mínimo para checar permissão de uma conversa sem chamar conversations()."""
@@ -2130,21 +3585,20 @@ def conversation_id_allowed(uid, conv_id):
         if rows and owner:
             allowed = True if user_can_view_all(uid) else (owner == uid)
     elif user_can_view_all(uid) or port in set(effective_ports(uid)):
-        allowed=True
+        allowed=operational_conversation_has_origin(port, chat)
     else:
         conv,email,empresa=_conversation_permission_context(port, chat)
-        allowed=bool(conversation_allowed(uid, conv, email=email, empresa=empresa).get('allowed'))
+        allowed=bool(conversation_allowed(uid, conv, email=email, empresa=empresa).get('allowed')) and operational_conversation_has_origin(port, chat)
     CONVERSATION_PERMISSION_CACHE[cache_key]={'ts':now,'allowed':allowed}
     return allowed
 
 def _raw_history_for_chat(port, chat):
-    p=DATA_DIR / f'history_{int(port)}.json'
-    try:
-        data=json.loads(p.read_text(encoding='utf-8')) if p.exists() else []
-    except Exception:
-        data=[]
     out=[]
-    for m in (data if isinstance(data,list) else []):
+    try:
+        rows=_history_raw_rows(int(port))
+    except Exception:
+        rows=[]
+    for m in (rows if isinstance(rows,list) else []):
         if not isinstance(m, dict) or not message_matches_chat(m, chat):
             continue
         mm=dict(m); mm['port']=int(mm.get('port') or port); mm['portLabel']=PORTS.get(int(port),{}).get('label',str(port))
@@ -2156,32 +3610,54 @@ def _raw_history_for_chat(port, chat):
 
 def _timeline_source_for_chat(port, chat):
     """Caminho rápido para /api/messages: filtra o chat antes de varrer/mesclar ledger.
-    Preserva privacidade de comunicador: só mostra outbound operacional do ledger e
-    resposta recebida daquele chat operacional.
+
+    Privacidade correta para comunicadores:
+    - sem ledger operacional para este chat: conversa pessoal do comunicador NÃO aparece;
+    - com ledger operacional para este chat: a conversa inteira daquele lead aparece
+      read-only para o SDR dono/supervisor, incluindo respostas posteriores do
+      comunicador e do lead. Isso mantém o contexto comercial sem expor outros chats.
     """
     raw=_raw_history_for_chat(port, chat)
     if not is_institutional_port(port):
-        raw.extend([m for m in wpp_envios_fastlane_events([int(port)]) if message_matches_chat(m, chat)])
+        raw.extend(operational_rows_for_chat(port, chat))
         out=_dedupe_loaded_items(raw); out.sort(key=lambda x: float(x.get('timestamp') or 0)); return out
     ledger=[m for m in wpp_envios_fastlane_events([int(port)], max_age_hours=24*14) if isinstance(m,dict) and is_institutional_dispatch_msg(m) and message_matches_chat(m, chat)]
     has_ledger=bool(ledger)
-    out=[]; consumed=set()
-    for m in raw:
-        if m.get('fromMe'):
-            if not is_institutional_dispatch_msg(m):
-                # conversa pessoal do comunicador: nunca expor
-                continue
-            out.append(m); continue
-        if has_ledger:
-            mm=dict(m); mm['readOnlyInstitutionalReply']=True; _enrich_dispatch_identity(mm); out.append(mm)
+    out=[]
+    if has_ledger:
+        raw_bridge_ids={_event_message_id(x) for x in raw if isinstance(x,dict) and x.get('fromMe') and not is_institutional_dispatch_msg(x)}
+        for m in raw:
+            # Se o history contém também o evento ledger cheio de um envio em partes,
+            # não renderize esse full-text; as bolhas reais das partes já estão no raw.
+            if m.get('fromMe') and is_institutional_dispatch_msg(m):
+                split_ids=_split_send_message_ids(m)
+                if not split_ids:
+                    for ev in ledger:
+                        if canonical_chat_for_message(ev)==canonical_chat_for_message(m) and _norm_text(ev.get('text'))==_norm_text(m.get('text')):
+                            split_ids |= _split_send_message_ids(ev)
+                if split_ids & raw_bridge_ids:
+                    continue
+            mm=dict(m)
+            mm['readOnlyInstitutionalThread']=True
+            if not mm.get('fromMe'):
+                mm['readOnlyInstitutionalReply']=True
+            _enrich_dispatch_identity(mm)
+            out.append(mm)
+    else:
+        for m in raw:
+            # Sem vínculo operacional, só permitir bolha que por si só é evento
+            # operacional identificado. Evita vazar conversa pessoal do comunicador.
+            if m.get('fromMe') and is_institutional_dispatch_msg(m):
+                out.append(m)
     # Garante auditoria operacional mesmo quando a bolha real ainda não chegou.
     for ev in ledger:
         found=False
         for m in out:
-            if _same_dispatch_payload(ev,m) or (_event_message_id(ev) and _event_message_id(ev)==_event_message_id(m)):
+            m_mid=_event_message_id(m)
+            if _same_dispatch_payload(ev,m) or (_event_message_id(ev) and _event_message_id(ev)==m_mid) or (m_mid and m_mid in _split_send_message_ids(ev)):
                 found=True; break
         if not found:
-            ee=dict(ev); ee['timestampSource']=ee.get('timestampSource') or 'ledger'; out.append(ee)
+            ee=dict(ev); ee['timestampSource']=ee.get('timestampSource') or 'ledger'; ee['readOnlyInstitutionalThread']=True; out.append(ee)
     out=_dedupe_loaded_items(out); out.sort(key=lambda x: float(x.get('timestamp') or 0)); return out
 
 def messages_for(uid, conv_id, autotranscribe=False):
@@ -2195,7 +3671,7 @@ def messages_for(uid, conv_id, autotranscribe=False):
     for m in source_msgs:
         if not isinstance(m, dict) or not message_matches_chat(m, chat):
             continue
-        if is_institutional_port(port) and m.get('fromMe') and not is_institutional_dispatch_msg(m):
+        if is_institutional_port(port) and m.get('fromMe') and not (is_institutional_dispatch_msg(m) or m.get('readOnlyInstitutionalThread')):
             continue
         mm=dict(m, port=int(m.get('port') or port), portLabel=PORTS.get(int(m.get('port') or port),{}).get('label',str(m.get('port') or port)))
         _enrich_dispatch_identity(mm)
@@ -2306,6 +3782,10 @@ HUBSPOT_DEAL_PROPS = ['dealname', 'dealstage', 'pipeline', 'hubspot_owner_id', '
 HUBSPOT_PIPE_ACTIVITY_TASK_PROPS = ['hs_task_subject','hs_task_body','hs_task_status','hs_timestamp','hs_task_type','hubspot_owner_id']
 HUBSPOT_PIPE_ACTIVITY_NOTE_PROPS = ['hs_note_body','hs_timestamp','hubspot_owner_id']
 HUBSPOT_PIPE_ACTIVITY_CALL_PROPS = ['hs_call_title','hs_call_body','hs_call_status','hs_timestamp','hubspot_owner_id']
+PIPELINE_FOCUS_SNAPSHOT_FILE = PROJECT / 'controle' / 'runtime' / 'channel' / 'pipeline_focus_snapshot.json'
+PIPELINE_FOCUS_SNAPSHOT_TTL = 600  # 10 min: tela abre rápida; botão atualizar força rede quando cache expira
+DISPATCH_STATS_SNAPSHOT_FILE = PROJECT / 'controle' / 'runtime' / 'channel' / 'dispatch_stats_snapshot.json'
+DISPATCH_STATS_SNAPSHOT_TTL = 600
 HUBSPOT_OWNER_LABELS = {
     '86265630': 'Breno',
     '88063842': 'Sarah',
@@ -2362,6 +3842,81 @@ def _hs_cache_get(key):
 
 def _hs_cache_set(key, val):
     _hs_cache[key] = (time.time() + HUBSPOT_TTL, val)
+
+def _pipeline_focus_snapshot_path(uid):
+    safe=re.sub(r'[^a-zA-Z0-9_-]+','_',str(uid or 'anon'))[:40] or 'anon'
+    return PIPELINE_FOCUS_SNAPSHOT_FILE.with_name(f'pipeline_focus_snapshot_{safe}.json')
+
+def _pipeline_focus_snapshot_get(uid, max_age=PIPELINE_FOCUS_SNAPSHOT_TTL):
+    try:
+        path=_pipeline_focus_snapshot_path(uid)
+        if not path.exists():
+            return None
+        age=time.time() - path.stat().st_mtime
+        if max_age and age > max_age:
+            return None
+        data=json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(data, dict) and data.get('total') is not None:
+            data=dict(data)
+            data['snapshotAgeSeconds']=int(max(0, age))
+            data['snapshot']=True
+            return data
+    except Exception:
+        return None
+    return None
+
+def _pipeline_focus_snapshot_set(uid, data):
+    try:
+        path=_pipeline_focus_snapshot_path(uid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
+
+def _dispatch_stats_dependency_mtime():
+    mtimes=[]
+    for p in [WPP_ENVIOS_FILE]:
+        try: mtimes.append(float(p.stat().st_mtime))
+        except Exception: mtimes.append(0.0)
+    try:
+        for p in DATA_DIR.glob('history_*.json'):
+            try: mtimes.append(float(p.stat().st_mtime))
+            except Exception: pass
+    except Exception:
+        pass
+    return max(mtimes) if mtimes else 0.0
+
+def _dispatch_stats_snapshot_path(uid, days):
+    safe=re.sub(r'[^a-zA-Z0-9_-]+','_',str(uid or 'anon'))[:40] or 'anon'
+    try: dd=max(1,min(31,int(days or 14)))
+    except Exception: dd=14
+    fp=hashlib.sha1((str(WPP_ENVIOS_FILE)+'|'+str(DATA_DIR)).encode('utf-8')).hexdigest()[:10]
+    return DISPATCH_STATS_SNAPSHOT_FILE.with_name(f'dispatch_stats_snapshot_{safe}_{dd}d_{fp}.json')
+
+def _dispatch_stats_snapshot_get(uid, days, max_age=DISPATCH_STATS_SNAPSHOT_TTL):
+    try:
+        path=_dispatch_stats_snapshot_path(uid, days)
+        if not path.exists(): return None
+        age=time.time()-path.stat().st_mtime
+        if max_age and age>max_age: return None
+        data=json.loads(path.read_text(encoding='utf-8'))
+        cur_dep=float(_dispatch_stats_dependency_mtime() or 0)
+        snap_dep=float(data.get('dispatchDepsMtime') or 0) if isinstance(data, dict) else 0
+        if cur_dep and snap_dep and abs(cur_dep-snap_dep)>0.001:
+            return None
+        if isinstance(data, dict) and data.get('ok'):
+            data=dict(data); data['snapshot']=True; data['snapshotAgeSeconds']=int(max(0,age)); return data
+    except Exception:
+        return None
+    return None
+
+def _dispatch_stats_snapshot_set(uid, days, data):
+    try:
+        path=_dispatch_stats_snapshot_path(uid, days)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
 
 def _dedupe_send(uid, port, chat, kind, fingerprint):
     """True se este envio deve ser bloqueado como duplicado recente."""
@@ -2971,13 +4526,17 @@ def chips_for(uid):
     paused=load_paused_ports()
     for p in effective_ports(uid):
         port=int(p)
-        if port in paused:
-            continue
+        is_paused = port in paused
         meta=PORTS.get(port, {})
-        st=bridge_status(port)
+        st=bridge_status(port) if not is_paused else {'connected': False, 'needsQR': False, 'paused': True}
         connected=bool(st.get('connected')); needs_qr=bool(st.get('needsQR'))
-        err=str(st.get('error') or '')
-        m=chip_metrics(port); rec, risk = chip_recommendation(connected, needs_qr, m); health = chip_health(connected, needs_qr, m)
+        err='pausado operacionalmente' if is_paused else str(st.get('error') or '')
+        m=chip_metrics(port)
+        if is_paused:
+            rec, risk = 'pausado', 'baixo'
+        else:
+            rec, risk = chip_recommendation(connected, needs_qr, m)
+        health = chip_health(connected, needs_qr, m)
         if connected and not needs_qr: online+=1
         elif needs_qr: attention+=1
         else: offline+=1
@@ -2988,7 +4547,7 @@ def chips_for(uid):
             'owner':owner,
             'ownerName':(owner.replace('_',' ').title() if owner else (meta.get('label') or '')),
             'role':meta.get('role') or '',
-            'connected':connected, 'needsQR':needs_qr, 'error':err,
+            'connected':connected, 'needsQR':needs_qr, 'paused':is_paused, 'error':err,
             'volumeTotal':m['volumeTotal'], 'volumeToday':m['volumeToday'],
             'responses':m['responses'], 'responsesToday':m['responsesToday'],
             'suggestedLimit':SUGGESTED_DAILY_LIMIT, 'risk':risk, 'recommendation':rec,
@@ -2996,7 +4555,8 @@ def chips_for(uid):
             'qrUrl':('/qr?port=%d' % port) if (needs_qr or not connected) else '',
         })
     summary={'total':len(out),'online':online,'attention':attention,'offline':offline,
-             'needsAction':sum(1 for c in out if c['recommendation']!='ok')}
+             'paused':sum(1 for c in out if c.get('paused')),
+             'needsAction':sum(1 for c in out if c['recommendation'] not in ('ok','pausado'))}
     return out, summary
 
 # ---- CH-003: reunião a partir do HubSpot já cacheado (sem rede) --------------
@@ -3411,9 +4971,10 @@ def _intro_conversion_metrics(token, uid, active_owner_rows):
 
 def _owner_ids_for_user(uid):
     if user_can_view_all(uid):
-        # Supervisor/admin: a referência visual do Rafael é o relatório HubSpot
-        # consolidado das etapas de demanda. Não filtra owner aqui; é leitura agregada.
-        return []
+        # Foco SDR é operacional: Rafael pediu escopo padrão limitado aos 3 SDRs
+        # ativos e às 5 primeiras etapas, evitando buscar todo HubSpot para depois
+        # descartar owners fora da operação.
+        return list(PLAYBOOK_OWNER_IDS.keys())
     reverse={v:k for k,v in HUBSPOT_OWNER_UIDS.items()}
     oid=reverse.get(uid)
     return [oid] if oid else []
@@ -3542,26 +5103,34 @@ def pipeline_focus(uid='rafael'):
     """Visão read-only do pipe: 5 etapas HubSpot fatiadas por atividades HubSpot.
 
     Não usa mensagens WhatsApp/conversas para contar. A atividade é o que está
-    associado ao negócio no HubSpot (tasks + notes + calls), pois é a fonte de verdade
-    que Rafael pediu para esta tela.
+    associado ao negócio no HubSpot. Para performance, o carregamento padrão é
+    task-first: tarefas associadas aos deals, com ligação/WhatsApp detectados no texto
+    da tarefa.
     """
-    key='pipeline_focus_v7_'+str(uid)
+    key='pipeline_focus_v8_task_first_'+str(uid)
     cached=_hs_cache_get(key)
     if cached: return cached
+    snap=_pipeline_focus_snapshot_get(uid)
+    if snap:
+        _hs_cache_set(key, snap)
+        return snap
     token=_hubspot_token()
     if not token:
         return {'configured':False,'error':'HubSpot não configurado','total':0,'rows':[],'activityBuckets':{},'stageRows':[],'ownerRows':[]}
     deals=_search_pipeline_focus_deals(token, uid)
     deal_ids=[str(d.get('id') or '') for d in deals if d.get('id')]
     task_map=_pipeline_activity_assoc_ids(token,'deals','tasks',deal_ids)
-    note_map=_pipeline_activity_assoc_ids(token,'deals','notes',deal_ids)
-    call_map=_pipeline_activity_assoc_ids(token,'deals','calls',deal_ids)
+    # Foco SDR precisa responder rápido e gerir tarefas. Notes/calls associados
+    # multiplicavam chamadas HubSpot e deixavam a tela seca/lenta. O padrão agora
+    # é task-first; sinais de ligação/WhatsApp são detectados no assunto/corpo da tarefa.
+    note_map={}
+    call_map={}
     task_ids=sorted({tid for arr in task_map.values() for tid in arr})
-    note_ids=sorted({nid for arr in note_map.values() for nid in arr})
-    call_ids=sorted({cid for arr in call_map.values() for cid in arr})
+    note_ids=[]
+    call_ids=[]
     tasks=_batch_read_simple(token,'tasks',task_ids,HUBSPOT_PIPE_ACTIVITY_TASK_PROPS)
-    notes=_batch_read_simple(token,'notes',note_ids,HUBSPOT_PIPE_ACTIVITY_NOTE_PROPS)
-    calls=_batch_read_simple(token,'calls',call_ids,HUBSPOT_PIPE_ACTIVITY_CALL_PROPS)
+    notes={}
+    calls={}
     by_bucket={'0':[],'1':[],'2':[],'3':[],'4+':[]}
     by_stage={sid:{'stageId':sid,'label':HUBSPOT_STAGE_LABELS.get(sid,sid),'total':0,'buckets':{'0':0,'1':0,'2':0,'3':0,'4+':0}} for sid in DEMAND_PIPELINE_STAGES}
     by_owner={}
@@ -3611,8 +5180,620 @@ def pipeline_focus(uid='rafael'):
     sample=lambda arr:[{k:r.get(k) for k in ('dealId','dealName','stageLabel','owner','activityCount','bucket','hasCall','hasWhatsApp','typeCounts','activities','url')}|({'lastActivity':r.get('lastActivity')} if r.get('lastActivity') else {}) for r in arr[:8]]
     owner_rows=sorted([v for v in by_owner.values() if not re.fullmatch(r'\d+', str(v.get('owner') or v.get('ownerId') or ''))], key=lambda x:x.get('total',0), reverse=True)
     intro_conversion=_intro_conversion_metrics(token, uid, owner_rows)
-    out={'configured':True,'generatedAt':datetime.now(BRT_TZ).isoformat(),'scope':'consolidado HubSpot' if user_can_view_all(uid) else 'somente sua carteira','total':len(rows),'typeSummary':type_summary,'activityBuckets':{k:{'count':len(v),'sample':sample(sorted(v,key=lambda r: (r.get('activityCount') or 0, r.get('dealName') or '')))} for k,v in by_bucket.items()},'stageRows':list(by_stage.values()),'ownerRows':owner_rows,'introConversion':intro_conversion,'deals':sorted_rows,'rows':sample(rows)}
+    out={'configured':True,'generatedAt':datetime.now(BRT_TZ).isoformat(),'scope':'3 SDRs ativos · 5 primeiras etapas HubSpot','total':len(rows),'typeSummary':type_summary,'activityBuckets':{k:{'count':len(v),'sample':sample(sorted(v,key=lambda r: (r.get('activityCount') or 0, r.get('dealName') or '')))} for k,v in by_bucket.items()},'stageRows':list(by_stage.values()),'ownerRows':owner_rows,'introConversion':intro_conversion,'deals':sorted_rows,'rows':sample(rows)}
+    _pipeline_focus_snapshot_set(uid, out)
     _hs_cache_set(key,out)
+    return out
+
+
+# --- CH: Gestão SDR / Orquestrador (somente leitura) -------------------------
+# Visão de gestão (Rafael/Dexter) derivada de pipeline_focus, que já é HubSpot
+# read-only com cache + snapshot/stale como degradação. Esta camada NÃO escreve
+# no HubSpot, NÃO envia WhatsApp, NÃO fecha/exclui tarefa, NÃO toca em
+# controle/wpp_envios.json nem em crons. Apenas lê o snapshot do pipe e agrega.
+# Toda string que pode aparecer na tela do SDR usa linguagem humana: nada de
+# termos internos de controle/origem técnica.
+ORCH_SAFETY_NOTICE = 'Visão somente leitura. Nenhuma tarefa fechada, nenhum WhatsApp enviado, nada alterado no HubSpot.'
+ORCH_HUMAN_QUEUE_LIMIT = 30
+ORCH_HYGIENE_EXAMPLE_LIMIT = 8
+ORCH_OLD_TASK_DAYS = 30            # tarefa vencida há mais que isso = antiga
+ORCH_RECENT_INTERACTION_DAYS = 2   # interação recente => não mexer
+ORCH_APPROACH_LIMIT = 6
+
+
+def _orch_pipeline_focus_for_summary(uid='rafael'):
+    """Foco para Gestão SDR: cache/snapshot primeiro, recompute HubSpot só sem fallback.
+
+    A tela Gestão SDR deve abrir rápido. Depois de restart, a primeira chamada de
+    pipeline_focus() pode levar dezenas de segundos se o snapshot ainda não foi
+    aquecido. Para a visão de gestão, preferimos snapshot stale a travar a tela.
+    """
+    key='pipeline_focus_v8_task_first_'+str(uid)
+    cached=_hs_cache_get(key)
+    if cached:
+        return cached
+    snap=_pipeline_focus_snapshot_get(uid, max_age=24*3600)
+    if snap:
+        snap=dict(snap); snap['stale']=bool(snap.get('snapshotAgeSeconds',0) > PIPELINE_FOCUS_SNAPSHOT_TTL)
+        _hs_cache_set(key, snap)
+        return snap
+    return pipeline_focus(uid) or {}
+
+
+def _orch_approach_performance(uid='rafael'):
+    """Resumo read-only de abordagens comerciais para Gestão SDR.
+
+    Fonte local: dispatch_stats(), que já atribui respostas/agendas ao último envio
+    anterior e usa snapshot persistente. Não envia WhatsApp e não escreve no ledger.
+    """
+    try:
+        ds=dispatch_stats(uid, days=14, force=False) or {}
+    except Exception:
+        return {'ok': False, 'reason': 'Performance de abordagem indisponível agora', 'topApproaches': [], 'lossRanking': []}
+    approaches=((ds.get('conversionFunnel') or {}).get('approaches') or (ds.get('followupPerformance') or {}).get('approaches') or [])
+    def compact(a):
+        sent=int(a.get('sent') or 0); returns=int(a.get('returns') or 0); meetings=int(a.get('meetings') or 0); realized=int(a.get('realizedMeetings') or 0)
+        label=str(a.get('label') or a.get('parentLabel') or 'Abordagem comercial')
+        if label.lower() == 'outros':
+            label='Abordagem direta'
+        examples=[]
+        for e in (a.get('examples') or a.get('meetingExamples') or [])[:3]:
+            examples.append({
+                'empresa': e.get('empresa') or 'Lead',
+                'message': str(e.get('message') or '')[:220],
+                'link': e.get('link') or '',
+                'chip': e.get('chip') or '',
+                'sdr': e.get('sdr') or '',
+            })
+        return {
+            'key': a.get('key') or label,
+            'label': label,
+            'angle': a.get('angle') or '',
+            'question': a.get('question') or '',
+            'versionLabel': a.get('versionLabel') or '',
+            'sent': sent,
+            'returns': returns,
+            'meetings': meetings,
+            'realizedMeetings': realized,
+            'responseRate': round(float(a.get('responseRate') or (returns*100.0/sent if sent else 0)),1),
+            'meetingRate': round(float(a.get('meetingRate') or (meetings*100.0/sent if sent else 0)),1),
+            'realizedMeetingRate': round(float(a.get('realizedMeetingRate') or (realized*100.0/sent if sent else 0)),1),
+            'mainGap': a.get('mainGap') or {},
+            'examples': examples,
+        }
+    top=sorted([compact(a) for a in approaches if int(a.get('sent') or 0)>0], key=lambda x: (x['meetings'], x['returns'], x['sent']), reverse=True)[:ORCH_APPROACH_LIMIT]
+    loss=[]
+    for a in sorted([compact(a) for a in approaches if int(a.get('sent') or 0)>=3], key=lambda x: (x['sent']-x['returns'], x['sent']), reverse=True)[:ORCH_APPROACH_LIMIT]:
+        loss.append({'label': a['label'], 'angle': a['angle'], 'sent': a['sent'], 'returns': a['returns'], 'withoutResponse': max(0, a['sent']-a['returns']), 'responseRate': a['responseRate'], 'mainGap': a.get('mainGap') or {}})
+    return {
+        'ok': bool(ds.get('ok', True)),
+        'periodDays': ds.get('periodDays') or 14,
+        'totalSent': int(((ds.get('conversionFunnel') or {}).get('totalSent')) or ds.get('total') or 0),
+        'totalReturns': int(((ds.get('conversionFunnel') or {}).get('totalReturns')) or 0),
+        'totalMeetings': int(((ds.get('conversionFunnel') or {}).get('totalMeetings')) or 0),
+        'totalRealizedMeetings': int(((ds.get('conversionFunnel') or {}).get('totalRealizedMeetings')) or 0),
+        'attribution': (ds.get('followupPerformance') or {}).get('attribution') or 'último disparo antes da resposta',
+        'topApproaches': top,
+        'lossRanking': loss,
+        'snapshot': bool(ds.get('snapshot')),
+    }
+
+
+def _orch_norm(txt):
+    """Minúsculas sem acento, espaços colapsados (espelha taskNormText do front)."""
+    s = unicodedata.normalize('NFD', str(txt or ''))
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    return ' '.join(s.lower().split())
+
+
+def _orch_is_automation(label):
+    """Tarefa que é registro de envio automático, não ação humana pendente.
+
+    Espelha taskIsAutomationRecord do front: 'enviado/disparado' ou WhatsApp de
+    diagnóstico/cadência/confirmação/lembrete. Disparo de WhatsApp/PDF entra aqui
+    e NUNCA deve contar como tarefa humana em aberto.
+    """
+    s = _orch_norm(label)
+    if re.search(r'\b(enviado|enviada|disparado|disparada)\b', s):
+        return True
+    if 'whatsapp' in s and re.search(r'diagnostico|cadencia|confirmacao|lembrete', s):
+        return True
+    return False
+
+
+def _orch_task_type(label, is_call=False, is_whatsapp=False):
+    """Classifica a tarefa em um tipo humano (espelha taskTypeLabel do front)."""
+    s = _orch_norm(label)
+    if _orch_is_automation(label):
+        return 'Envio automático'
+    if is_call or re.search(r'\bligacao\b|\bligar\b|\btelefone\b|\bcall\b', s):
+        return 'Ligação'
+    if re.search(r'preparar diagnostico|montar diagnostico|gerar diagnostico', s):
+        return 'Preparar diagnóstico'
+    if is_whatsapp or re.search(r'\bwhatsapp\b|\bzap\b|\bmensagem\b', s):
+        return 'WhatsApp manual'
+    if re.search(r'follow up|followup|retomar|retorno|sem resposta|cadencia', s):
+        return 'Follow-up'
+    if re.search(r'reuniao|agenda|no show|confirmar|meet|remarcar', s):
+        return 'Agenda / reunião'
+    if re.search(r'proposta|comercial|contrato|negociacao|tabela', s):
+        return 'Comercial'
+    return 'Tarefa operacional'
+
+
+def _orch_today_key():
+    return datetime.now(BRT_TZ).strftime('%Y-%m-%d')
+
+
+def _orch_date_key(ts):
+    try:
+        ts = float(ts or 0)
+        if ts <= 0:
+            return ''
+        return datetime.fromtimestamp(ts, BRT_TZ).strftime('%Y-%m-%d')
+    except Exception:
+        return ''
+
+
+def _orch_days_between(date_key, today_key):
+    try:
+        d = datetime.strptime(date_key, '%Y-%m-%d')
+        t = datetime.strptime(today_key, '%Y-%m-%d')
+        return (t - d).days
+    except Exception:
+        return 0
+
+
+def _orch_uid_for_owner(owner_id, owner_name):
+    uid = HUBSPOT_OWNER_UIDS.get(str(owner_id or '').strip())
+    if uid:
+        return uid
+    slug = _orch_norm(owner_name).replace(' ', '_')
+    return slug or 'sem_sdr'
+
+
+def _orch_sla_label(t, today_key):
+    """Texto humano de prazo, sem termos técnicos."""
+    if t.get('completed'):
+        return 'Concluída'
+    dk = t.get('dateKey') or ''
+    if not dk:
+        return 'Sem data definida'
+    if dk < today_key:
+        d = _orch_days_between(dk, today_key)
+        return f'Atrasada há {d} dia' + ('s' if d != 1 else '')
+    if dk == today_key:
+        return 'Vence hoje'
+    d = _orch_days_between(today_key, dk)
+    return f'Vence em {d} dia' + ('s' if d != 1 else '')
+
+
+def _orch_tasks_from_pf(pf):
+    """Extrai e classifica as tarefas dos deals do snapshot do pipe.
+
+    Cada item é uma tarefa HubSpot já associada a um deal (a única "atividade"
+    carregada no modo task-first). Disparo automático fica marcado em
+    `automation` para nunca poluir a fila humana.
+    """
+    today = _orch_today_key()
+    rows = []
+    for deal in (pf.get('deals') or []):
+        for a in (deal.get('activities') or []):
+            kind = str(a.get('kind') or a.get('type') or '').lower()
+            if kind != 'task' and str(a.get('type') or '').upper() != 'TODO':
+                continue
+            status = (str(a.get('status') or '').upper()) or 'SEM_STATUS'
+            ts = a.get('ts') or 0
+            date_key = _orch_date_key(ts)
+            completed = status == 'COMPLETED'
+            label = a.get('label') or a.get('type') or 'Tarefa HubSpot'
+            is_call = bool(a.get('isCall'))
+            is_whatsapp = bool(a.get('isWhatsApp'))
+            automation = _orch_is_automation(label)
+            if completed:
+                bucket = 'concluida'
+            elif not date_key:
+                bucket = 'sem_data'
+            elif date_key < today:
+                bucket = 'atrasada'
+            elif date_key == today:
+                bucket = 'hoje'
+            else:
+                bucket = 'proxima'
+            rows.append({
+                'dealId': deal.get('dealId'),
+                'dealName': deal.get('dealName') or 'Negócio sem nome',
+                'stageId': deal.get('stageId') or '',
+                'stageLabel': deal.get('stageLabel') or 'Sem etapa',
+                'owner': deal.get('owner') or 'Sem SDR',
+                'ownerId': str(deal.get('ownerId') or ''),
+                'url': deal.get('url') or '#',
+                'label': str(label)[:200],
+                'ts': ts,
+                'dateKey': date_key,
+                'status': status,
+                'completed': completed,
+                'isCall': is_call,
+                'isWhatsApp': is_whatsapp,
+                'automation': automation,
+                'typeLabel': _orch_task_type(label, is_call, is_whatsapp),
+                'bucket': bucket,
+            })
+    return rows, today
+
+
+def _orch_intro_rate_by_owner(pf):
+    out = {}
+    for r in ((pf.get('introConversion') or {}).get('rows') or []):
+        out[str(r.get('owner') or '')] = float(r.get('rate') or 0)
+    return out
+
+
+def _task_hygiene_groups(tasks, today_key):
+    """Agrupa tarefas para saneamento, SEM fechar/excluir nada (puro/leitura).
+
+    - safeToCloseAfterApproval: envios automáticos antigos/vencidos e tarefas
+      genéricas muito antigas — candidatas a fechar SÓ depois de aprovação.
+    - reviewBeforeAction: tarefas comerciais antigas com contexto — revisar antes.
+    - doNotTouch: preparar diagnóstico futuro, reunião futura e interação recente.
+    """
+    safe, review, keep = [], [], []
+    def ex(t, reason):
+        return {
+            'dealName': t['dealName'], 'owner': t['owner'], 'stage': t['stageLabel'],
+            'when': _orch_sla_label(t, today_key), 'context': t['label'][:140],
+            'type': t['typeLabel'], 'reason': reason, 'hubspotUrl': t['url'],
+        }
+    for t in tasks:
+        days_overdue = _orch_days_between(t['dateKey'], today_key) if (t['dateKey'] and t['dateKey'] < today_key) else 0
+        is_old = days_overdue >= ORCH_OLD_TASK_DAYS
+        is_generic = t['typeLabel'] == 'Tarefa operacional'
+        recent = bool(t['dateKey']) and abs(_orch_days_between(t['dateKey'], today_key)) <= ORCH_RECENT_INTERACTION_DAYS
+        if t['automation']:
+            # Envio automático vencido/antigo (ou já concluído) só polui a fila.
+            if t['completed'] or (t['bucket'] == 'atrasada'):
+                safe.append(ex(t, 'Envio automático já concluído — pode sair da fila.'))
+            else:
+                keep.append(ex(t, 'Envio automático ainda programado — manter.'))
+            continue
+        if t['completed']:
+            continue
+        if t['typeLabel'] == 'Preparar diagnóstico' and t['bucket'] in ('hoje', 'proxima', 'sem_data'):
+            keep.append(ex(t, 'Preparação de diagnóstico em aberto — não mexer.'))
+            continue
+        if t['typeLabel'] == 'Agenda / reunião' and t['bucket'] in ('hoje', 'proxima'):
+            keep.append(ex(t, 'Reunião futura — não mexer.'))
+            continue
+        if recent and t['bucket'] in ('hoje', 'proxima'):
+            keep.append(ex(t, 'Interação recente — não mexer.'))
+            continue
+        if is_generic and is_old:
+            safe.append(ex(t, f'Tarefa genérica vencida há {days_overdue} dias — revisar e fechar com aprovação.'))
+            continue
+        if t['typeLabel'] in ('Comercial', 'Follow-up', 'WhatsApp manual', 'Ligação') and t['bucket'] == 'atrasada':
+            review.append(ex(t, f'Tarefa comercial atrasada há {days_overdue} dias — tem contexto, revisar antes de agir.'))
+            continue
+        # Demais tarefas em aberto recentes ficam como não-tocar por padrão seguro.
+        if t['bucket'] in ('hoje', 'proxima', 'sem_data'):
+            keep.append(ex(t, 'Tarefa em aberto no prazo — manter.'))
+        else:
+            review.append(ex(t, f'Tarefa atrasada há {days_overdue} dias — revisar antes de agir.'))
+    def group(items):
+        return {'count': len(items), 'examples': items[:ORCH_HYGIENE_EXAMPLE_LIMIT]}
+    return {
+        'safeToCloseAfterApproval': group(safe),
+        'reviewBeforeAction': group(review),
+        'doNotTouch': group(keep),
+    }
+
+
+def task_hygiene_preview(uid='rafael'):
+    """Prévia read-only de higiene de tarefas. NÃO fecha/exclui nenhuma tarefa."""
+    pf = _orch_pipeline_focus_for_summary(uid) or {}
+    base = {
+        'ok': True, 'mutates': False, 'safetyNotice': ORCH_SAFETY_NOTICE,
+        'generatedAt': pf.get('generatedAt'),
+        'scope': pf.get('scope') or ('consolidado' if user_can_view_all(uid) else 'somente sua carteira'),
+        'stale': bool(pf.get('stale')),
+    }
+    if pf.get('configured') is False:
+        base.update({'ok': False, 'configured': False, 'reason': pf.get('error') or 'HubSpot indisponível agora',
+                     'safeToCloseAfterApproval': {'count': 0, 'examples': []},
+                     'reviewBeforeAction': {'count': 0, 'examples': []},
+                     'doNotTouch': {'count': 0, 'examples': []}})
+        return base
+    tasks, today = _orch_tasks_from_pf(pf)
+    base['configured'] = True
+    base.update(_task_hygiene_groups(tasks, today))
+    return base
+
+
+OPS_WATCHDOG_STATE_FILE = Path('/root/.hermes/zydon-prospeccao') / 'controle' / 'runtime' / 'channel' / 'watchdog_status.json'
+
+
+def _ops_file_state(label, path, max_age_seconds=None):
+    try:
+        p=Path(path)
+        exists=p.exists()
+        age=None; size=0; ok=False
+        if exists:
+            st=p.stat(); age=int(max(0, time.time()-st.st_mtime)); size=int(st.st_size); ok=True
+            if max_age_seconds is not None and age > max_age_seconds:
+                ok=False
+        return {'label': label, 'ok': bool(ok), 'exists': bool(exists), 'ageSeconds': age, 'size': size}
+    except Exception as e:
+        return {'label': label, 'ok': False, 'exists': False, 'ageSeconds': None, 'size': 0, 'error': type(e).__name__}
+
+
+def _ops_watchdog_state(max_age_seconds=15*60):
+    try:
+        p=Path(OPS_WATCHDOG_STATE_FILE)
+        if not p.exists():
+            return {'ok': False, 'status': 'unknown', 'ageSeconds': None, 'label': 'Monitoramento ainda sem sinal'}
+        age=int(max(0, time.time()-p.stat().st_mtime))
+        data=json.loads(p.read_text(encoding='utf-8') or '{}')
+        ok=bool(data.get('ok')) and age <= max_age_seconds
+        metrics=[str(x) for x in (data.get('metrics') or [])[:6]]
+        return {
+            'ok': ok,
+            'status': data.get('status') or ('ok' if ok else 'attention'),
+            'ageSeconds': age,
+            'label': 'Monitoramento em dia' if ok else 'Monitoramento precisa atenção',
+            'note': data.get('note') or '',
+            'metrics': metrics,
+        }
+    except Exception as e:
+        return {'ok': False, 'status': 'error', 'ageSeconds': None, 'label': 'Monitoramento indisponível', 'error': type(e).__name__}
+
+
+def ops_health_summary(uid='rafael'):
+    """Saúde operacional leve/read-only para Gestão SDR.
+
+    Não chama HubSpot, não chama bridges WhatsApp, não escreve arquivos e não varre
+    histories. É um cockpit de garantia: release ativa, snapshots, caches e arquivos
+    críticos que sustentam a máquina de vendas.
+    """
+    now=datetime.now(BRT_TZ).isoformat()
+    pipe_path=_pipeline_focus_snapshot_path(uid)
+    dispatch_path=_dispatch_stats_snapshot_path(uid, 14)
+    files=[
+        _ops_file_state('Conversas', CONVERSATIONS_PREWARM_FILE, 15*60),
+        _ops_file_state('Foco SDR', pipe_path, 2*3600),
+        _ops_file_state('Performance comercial', dispatch_path, 30*60),
+        _ops_file_state('Envios operacionais', WPP_ENVIOS_FILE, 10*60),
+    ]
+    watchdog=_ops_watchdog_state()
+    ok_files=sum(1 for f in files if f.get('ok'))
+    warnings=[f"{f.get('label')} precisa atualizar" for f in files if not f.get('ok')]
+    if not watchdog.get('ok'):
+        warnings.append(watchdog.get('label') or 'Monitoramento precisa atenção')
+    signals={
+        'conversationCacheEntries': len(CONVERSATIONS_API_CACHE),
+        'messageCacheEntries': len(MESSAGES_API_CACHE),
+        'dispatchCacheEntries': len(DISPATCH_ROWS_CACHE),
+        'historyCacheEntries': len(_HISTORY_MERGED_CACHE) if '_HISTORY_MERGED_CACHE' in globals() else 0,
+        'refreshingConversations': len(CONVERSATIONS_REFRESHING),
+        'computingMessages': len(MESSAGES_COMPUTING),
+    }
+    risk='ok'
+    if warnings or signals.get('refreshingConversations') or signals.get('computingMessages'):
+        risk='attention'
+    if ok_files < 2:
+        risk='critical'
+    return {
+        'ok': risk != 'critical',
+        'mutates': False,
+        'generatedAt': now,
+        'risk': risk,
+        'headline': 'Máquina saudável' if risk=='ok' else ('Atenção operacional' if risk=='attention' else 'Risco operacional'),
+        'release': {'dir': str(PROJECT), 'name': PROJECT.name, 'pid': os.getpid()},
+        'files': files,
+        'watchdog': watchdog,
+        'signals': signals,
+        'warnings': warnings[:6],
+        'safety': 'Somente leitura: nada é enviado, fechado ou alterado por esta visão.',
+    }
+
+
+def sdr_orchestrator_summary(uid='rafael'):
+    """Resumo de Gestão SDR (somente leitura) derivado do snapshot do pipe.
+
+    Dados reais (HubSpot, via pipeline_focus): negócios por SDR, etapa, tarefas
+    e taxa de Introdução do mês. Derivados/snapshot: classificação de tarefa
+    humana x envio automático, gargalos por etapa e prévia de higiene. Não há
+    consulta extra a HubSpot: usa o cache/snapshot do pipe e degrada para stale.
+    """
+    pf = _orch_pipeline_focus_for_summary(uid) or {}
+    out = {
+        'ok': True, 'generatedAt': pf.get('generatedAt'),
+        'scope': pf.get('scope') or ('consolidado' if user_can_view_all(uid) else 'somente sua carteira'),
+        'stale': bool(pf.get('stale')),
+        'safetyNotice': ORCH_SAFETY_NOTICE,
+        'sdrCards': [], 'interventions': [], 'humanQueue': [],
+        'pipelineBottlenecks': [], 'automationHealth': {}, 'approachPerformance': {},
+        'taskHygienePreview': {},
+        'dataNotes': 'Negócios, etapas, tarefas e taxa de Introdução vêm do HubSpot. Classificação de tarefa humana x envio automático, gargalos e higiene são derivados do mesmo snapshot, sem consulta extra.',
+    }
+    if pf.get('configured') is False:
+        out['ok'] = False
+        out['configured'] = False
+        out['reason'] = pf.get('error') or 'HubSpot indisponível agora'
+        return out
+    out['configured'] = True
+    tasks, today = _orch_tasks_from_pf(pf)
+    intro_by_owner = _orch_intro_rate_by_owner(pf)
+
+    # ---- Cards por SDR ------------------------------------------------------
+    deals = pf.get('deals') or []
+    active_by_owner = {}
+    for d in deals:
+        key = (str(d.get('ownerId') or ''), d.get('owner') or 'Sem SDR')
+        active_by_owner[key] = active_by_owner.get(key, 0) + 1
+    cards_by_owner = {}
+    for (oid, oname), active in active_by_owner.items():
+        cards_by_owner[oname] = {
+            'uid': _orch_uid_for_owner(oid, oname), 'name': oname, 'ownerId': oid,
+            'activeDeals': active, 'openHumanTasks': 0, 'overdueHumanTasks': 0,
+            'completedToday': 0, 'futureMeetings': 0, 'pastMeetingsWithoutOutcome': 0,
+            'responsesAwaitingAction': 0, 'introRate': intro_by_owner.get(oname, 0),
+            'manualVsAutomation': {'human': 0, 'automation': 0},
+            'status': 'ok', '_overdueExamples': [],
+        }
+    for t in tasks:
+        c = cards_by_owner.get(t['owner'])
+        if c is None:
+            c = cards_by_owner.setdefault(t['owner'], {
+                'uid': _orch_uid_for_owner(t['ownerId'], t['owner']), 'name': t['owner'],
+                'ownerId': t['ownerId'], 'activeDeals': 0, 'openHumanTasks': 0,
+                'overdueHumanTasks': 0, 'completedToday': 0, 'futureMeetings': 0,
+                'pastMeetingsWithoutOutcome': 0, 'responsesAwaitingAction': 0,
+                'introRate': intro_by_owner.get(t['owner'], 0),
+                'manualVsAutomation': {'human': 0, 'automation': 0}, 'status': 'ok',
+                '_overdueExamples': [],
+            })
+        if t['automation']:
+            c['manualVsAutomation']['automation'] += 1
+            continue
+        c['manualVsAutomation']['human'] += 1
+        is_meeting = t['typeLabel'] == 'Agenda / reunião'
+        if t['completed']:
+            if t['dateKey'] == today:
+                c['completedToday'] += 1
+            continue
+        c['openHumanTasks'] += 1
+        if t['bucket'] == 'atrasada':
+            c['overdueHumanTasks'] += 1
+            if len(c['_overdueExamples']) < 4:
+                c['_overdueExamples'].append(f"{t['dealName']} · {_orch_sla_label(t, today)}")
+        if is_meeting and t['bucket'] in ('hoje', 'proxima'):
+            c['futureMeetings'] += 1
+        if is_meeting and t['bucket'] == 'atrasada':
+            c['pastMeetingsWithoutOutcome'] += 1
+        if t['typeLabel'] in ('Follow-up', 'WhatsApp manual') and t['bucket'] in ('atrasada', 'hoje'):
+            c['responsesAwaitingAction'] += 1
+    for c in cards_by_owner.values():
+        if c['overdueHumanTasks'] >= 5 or c['pastMeetingsWithoutOutcome'] >= 2:
+            c['status'] = 'intervention'
+        elif c['overdueHumanTasks'] >= 1 or c['pastMeetingsWithoutOutcome'] >= 1 or c['openHumanTasks'] >= 12:
+            c['status'] = 'attention'
+        else:
+            c['status'] = 'ok'
+    sdr_cards = sorted(cards_by_owner.values(),
+                       key=lambda x: (x['overdueHumanTasks'] + x['pastMeetingsWithoutOutcome'], x['openHumanTasks']),
+                       reverse=True)
+
+    # ---- Intervenções recomendadas -----------------------------------------
+    interventions = []
+    for c in sdr_cards:
+        if c['overdueHumanTasks'] >= 1:
+            sev = 'red' if c['overdueHumanTasks'] >= 5 else 'yellow'
+            interventions.append({
+                'severity': sev, 'type': 'carga_sdr',
+                'title': f"{c['name']}: {c['overdueHumanTasks']} tarefas atrasadas",
+                'reason': 'Tarefas humanas vencidas acumuladas podem travar o avanço do funil deste SDR.',
+                'evidence': c['_overdueExamples'] or [f"{c['overdueHumanTasks']} tarefas vencidas"],
+                'suggestedAction': 'Repriorizar com o SDR as tarefas vencidas antes de abrir novas frentes.',
+                'owner': c['name'],
+            })
+        if c['pastMeetingsWithoutOutcome'] >= 1:
+            sev = 'red' if c['pastMeetingsWithoutOutcome'] >= 2 else 'yellow'
+            interventions.append({
+                'severity': sev, 'type': 'reuniao_sem_desfecho',
+                'title': f"{c['name']}: {c['pastMeetingsWithoutOutcome']} reuniões passadas sem desfecho",
+                'reason': 'Reuniões/diagnósticos já na data sem próximo passo definido tendem a esfriar.',
+                'evidence': [f"{c['pastMeetingsWithoutOutcome']} reuniões aguardando desfecho"],
+                'suggestedAction': 'Confirmar resultado e o próximo passo de cada reunião já realizada.',
+                'owner': c['name'],
+            })
+
+    # ---- Gargalos do pipeline (etapas com muitos negócios sem atividade) ----
+    zero_by_stage = {}
+    for d in deals:
+        if int(d.get('activityCount') or 0) == 0:
+            sid = d.get('stageId') or ''
+            zero_by_stage.setdefault(sid, []).append(d.get('dealName') or 'Negócio sem nome')
+    bottlenecks = []
+    for st in (pf.get('stageRows') or []):
+        sid = st.get('stageId') or ''
+        buckets = st.get('buckets') or {}
+        zero = int(buckets.get('0') or 0)
+        bottlenecks.append({
+            'stageId': sid, 'stageLabel': st.get('label') or sid,
+            'total': int(st.get('total') or 0), 'semAtividade': zero,
+            'umToque': int(buckets.get('1') or 0),
+            'examples': (zero_by_stage.get(sid) or [])[:5],
+            'reason': f"{zero} negócios sem nenhuma atividade nesta etapa." if zero else 'Etapa com atividades em dia.',
+        })
+    bottlenecks.sort(key=lambda x: x['semAtividade'], reverse=True)
+    for b in bottlenecks:
+        if b['semAtividade'] >= 8:
+            interventions.append({
+                'severity': 'yellow', 'type': 'gargalo_pipeline',
+                'title': f"{b['stageLabel']}: {b['semAtividade']} negócios sem atividade",
+                'reason': 'Muitos negócios parados sem nenhuma atividade nesta etapa do funil.',
+                'evidence': b['examples'] or [f"{b['semAtividade']} negócios sem atividade"],
+                'suggestedAction': 'Distribuir um primeiro toque para os negócios sem atividade desta etapa.',
+                'owner': 'Equipe',
+            })
+            break
+
+    # ---- Saúde das automações (envios automáticos x ação humana) ------------
+    auto_count = sum(1 for t in tasks if t['automation'])
+    human_count = sum(1 for t in tasks if not t['automation'])
+    auto_stale = sum(1 for t in tasks if t['automation'] and (t['completed'] or t['bucket'] == 'atrasada'))
+    automation_health = {
+        'automaticos': auto_count, 'acoesHumanas': human_count,
+        'historicoConcluido': auto_stale,
+        'note': 'Envios automáticos ficam fora da fila de tarefa humana para não inflar o pendente do SDR.',
+    }
+    if auto_count >= 10 and auto_count >= human_count:
+        interventions.append({
+            'severity': 'gray', 'type': 'ruido_automacao',
+            'title': f"{auto_count} envios automáticos no histórico do pipe",
+            'reason': 'Volume alto de envios automáticos pode confundir a leitura do que é ação humana pendente.',
+            'evidence': [f"{auto_count} envios automáticos", f"{human_count} ações humanas"],
+            'suggestedAction': 'Manter os envios automáticos fora da fila humana — já estão separados nesta visão.',
+            'owner': 'Equipe',
+        })
+
+    if not interventions:
+        interventions.append({
+            'severity': 'green', 'type': 'ok',
+            'title': 'Operação sob controle',
+            'reason': 'Nenhum gargalo crítico identificado neste momento.',
+            'evidence': [f"{human_count} ações humanas no pipe", f"{len(deals)} negócios acompanhados"],
+            'suggestedAction': 'Seguir o plano do dia.',
+            'owner': 'Equipe',
+        })
+
+    # ---- Fila humana (tarefas humanas em aberto, atrasada primeiro) ---------
+    bucket_rank = {'atrasada': 0, 'hoje': 1, 'sem_data': 2, 'proxima': 3}
+    open_human = [t for t in tasks if not t['automation'] and not t['completed']]
+    open_human.sort(key=lambda t: (bucket_rank.get(t['bucket'], 9), t.get('ts') or 0))
+    human_queue = [{
+        'company': t['dealName'], 'phone': '', 'owner': t['owner'],
+        'stage': t['stageLabel'], 'sla': _orch_sla_label(t, today),
+        'context': t['label'][:140], 'nextAction': t['typeLabel'],
+        'hubspotUrl': t['url'], 'conversationId': '',
+    } for t in open_human[:ORCH_HUMAN_QUEUE_LIMIT]]
+
+    # Remove campos internos dos cards antes de devolver.
+    for c in sdr_cards:
+        c.pop('_overdueExamples', None)
+
+    out['sdrCards'] = sdr_cards
+    out['interventions'] = interventions
+    out['humanQueue'] = human_queue
+    out['pipelineBottlenecks'] = bottlenecks
+    out['automationHealth'] = automation_health
+    out['approachPerformance'] = _orch_approach_performance(uid)
+    hyg = _task_hygiene_groups(tasks, today)
+    out['taskHygienePreview'] = {
+        'safeToCloseAfterApproval': hyg['safeToCloseAfterApproval']['count'],
+        'reviewBeforeAction': hyg['reviewBeforeAction']['count'],
+        'doNotTouch': hyg['doNotTouch']['count'],
+        'safetyNotice': ORCH_SAFETY_NOTICE,
+    }
     return out
 
 
@@ -4063,6 +6244,10 @@ a{color:var(--accent);text-decoration:none}
 .conversation{background:var(--chat-bg)}
 .context{background:#FFFFFF;border-left:1px solid var(--line-soft)}
 .zone-head{height:60px;flex:0 0 60px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line-soft)}
+.refresh-strip{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 14px;border-bottom:1px solid var(--line-soft);background:var(--panel-2)}
+[data-theme="dark"] .refresh-strip{background:linear-gradient(90deg,rgba(205,235,0,.035),rgba(255,255,255,.018));border-bottom-color:rgba(205,235,0,.055)}
+.refresh-conv{border:0;background:transparent;color:var(--txt-2);padding:5px 0;font-size:11.5px;font-weight:850;letter-spacing:.015em;line-height:1;cursor:pointer;transition:.12s;white-space:nowrap;text-align:left}
+.refresh-conv:hover{color:var(--accent);transform:translateY(-1px)}.refresh-conv:active{transform:scale(.98)}.refresh-strip small{font-size:10.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .scroll{overflow-y:auto;overflow-x:hidden;flex:1;min-height:0}
 /* sidebar */
 .brand{display:flex;align-items:center;gap:11px;padding:18px 18px 14px}
@@ -4088,7 +6273,7 @@ a{color:var(--accent);text-decoration:none}
 .chip-row .st{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
 .st.on{background:var(--success);box-shadow:0 0 0 3px var(--success-soft)}
 .st.warn{background:var(--warning);box-shadow:0 0 0 3px var(--warning-soft)}
-.st.off{background:var(--muted);box-shadow:0 0 0 3px rgba(255,255,255,0.05)}
+.st.off,.st.muted{background:var(--muted);box-shadow:0 0 0 3px rgba(255,255,255,0.05)}
 .chip-row .who{flex:1;color:var(--txt-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chip-row .vol{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
 .me{width:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:10px 6px 12px;border-top:1px solid var(--line-soft);position:relative;cursor:default}.me:hover{background:rgba(20,28,20,.045)}
@@ -4106,13 +6291,13 @@ a{color:var(--accent);text-decoration:none}
 .live-status{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);font-weight:500;white-space:nowrap;min-width:0;flex:0 1 auto;overflow:hidden}
 .live-dot{width:6px;height:6px;border-radius:50%;background:#2BB673;box-shadow:0 0 0 3px rgba(43,182,115,.16);flex:0 0 auto;animation:livePulse 2.2s ease-in-out infinite}
 .live-status.paused .live-dot{background:var(--muted);box-shadow:none;animation:none}
-.live-txt{font-weight:600;color:var(--txt-2)}.live-status.paused .live-txt{color:var(--muted)}
+.live-txt{font-weight:600;color:var(--txt-2)}.live-status.paused .live-txt{color:var(--muted)}.live-status.loading .live-txt::after{content:" · atualizando";font-weight:500;color:var(--muted)}
 .live-ago{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
 .live-refresh{flex:0 0 auto;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:8px;padding:4px 8px;font-size:11px;font-weight:650;line-height:1;cursor:pointer;transition:.12s}
 .live-refresh:hover{background:var(--surface-2);color:var(--txt);border-color:var(--line-strong)}
 .live-refresh:active{transform:scale(.96)}
 @keyframes livePulse{0%,100%{opacity:1}50%{opacity:.4}}
-@media(max-width:760px){.live-ago{display:none}.live-refresh{padding:4px 7px}}
+@media(max-width:760px){.live-ago{display:none}.refresh-strip small{display:none}.refresh-conv{font-size:11px}}
 .filter-toggle{margin-left:auto;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:9px;padding:5px 9px;font-size:11.5px;font-weight:650}.filter-toggle.on{background:var(--accent-dim);color:var(--accent);border-color:var(--line-strong)}.filterbar{display:none;gap:7px;padding:8px 12px;border-bottom:1px solid var(--line-soft);overflow-x:auto;scrollbar-width:none}.filterbar.open{display:flex}.filterbar::-webkit-scrollbar{display:none}.wfilter{flex:0 0 auto;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:999px;padding:6px 10px;font-size:12px;font-weight:600;white-space:nowrap}.wfilter.on{background:var(--accent-dim);border-color:var(--line-strong);color:var(--accent)}.wfilter select{border:0;background:transparent;color:inherit;font:inherit;outline:0;max-width:150px}.wfilter.clear{color:var(--danger);background:var(--danger-soft)}
 
 .seg{display:flex;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:2px;gap:2px}
@@ -4125,7 +6310,7 @@ a{color:var(--accent);text-decoration:none}
 .fchip.on{background:var(--accent-dim);border-color:rgba(205,235,0,0.32);color:var(--accent)}
 .fchip .av{width:16px;height:16px;border-radius:50%;font-size:8.5px;display:grid;place-items:center;font-weight:700;color:#0a0a0a}
 .cards{padding:5px 8px}
-.card{display:block;width:100%;text-align:left;border:1px solid transparent;background:none;border-radius:12px;padding:10px 11px 9px 32px;margin-bottom:1px;position:relative;transition:.12s}
+.card{display:block;width:100%;text-align:left;border:1px solid transparent;background:none;border-radius:12px;padding:8px 10px 7px 30px;margin-bottom:1px;position:relative;transition:.12s}
 .card:hover{background:var(--surface)}.card.active{background:var(--surface-2);border-color:var(--line-soft)}
 .card.reply{background:rgba(205,235,0,0.045)}
 .card.reply:hover{background:rgba(205,235,0,0.075)}
@@ -4134,19 +6319,19 @@ a{color:var(--accent);text-decoration:none}
 .card.new-top{animation:newTop 8s ease-out forwards}
 @keyframes newTop{0%{background:var(--accent-soft);box-shadow:inset 0 0 0 1px rgba(43,182,115,.35)}12%{background:var(--accent-soft)}100%{background:none;box-shadow:inset 0 0 0 1px transparent}}
 .card.new-top:hover{background:var(--surface)}
-.card.readonly{background:linear-gradient(180deg,rgba(205,235,0,.045),var(--surface));border-color:rgba(31,61,43,.13);opacity:1}.readonly-banner{margin:0 0 9px;padding:10px 12px;border:1px solid rgba(31,61,43,.16);background:var(--accent-dim);color:var(--txt-2);border-radius:12px;font-size:12px;line-height:1.4}.readonly-banner b{color:var(--accent)}.inst-map{display:flex;flex-wrap:wrap;gap:5px;margin:5px 0 7px}.inst-pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line-soft);background:var(--panel);border-radius:999px;padding:3px 8px;font-size:11px;color:var(--txt-2);font-weight:650}.inst-pill.owner{background:rgba(205,235,0,.13);border-color:rgba(205,235,0,.25);color:var(--accent)}.inst-pill.sender{background:var(--surface);color:var(--muted)}.readonly-help{margin:4px 10px 9px;padding:8px 10px;border-radius:10px;background:var(--surface);border:1px solid var(--line-soft);font-size:11.5px;color:var(--txt-2);line-height:1.35}.readonly-help b{color:var(--accent)}
+.card.readonly{background:linear-gradient(180deg,rgba(205,235,0,.035),var(--surface));border-color:rgba(31,61,43,.10);opacity:1}.readonly-banner{margin:0 0 9px;padding:10px 12px;border:1px solid rgba(31,61,43,.16);background:var(--accent-dim);color:var(--txt-2);border-radius:12px;font-size:12px;line-height:1.4}.readonly-banner b{color:var(--accent)}.inst-map{display:flex;flex-wrap:nowrap;gap:4px;margin:3px 0 5px;overflow:hidden}.inst-pill{display:inline-flex;align-items:center;gap:4px;min-width:0;max-width:52%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid var(--line-soft);background:var(--panel);border-radius:999px;padding:2px 7px;font-size:10.5px;color:var(--txt-2);font-weight:650}.inst-pill.owner{background:rgba(205,235,0,.10);border-color:rgba(205,235,0,.20);color:var(--accent)}.inst-pill.sender{background:var(--surface);color:var(--muted)}.readonly-help{margin:4px 10px 9px;padding:8px 10px;border-radius:10px;background:var(--surface);border:1px solid var(--line-soft);font-size:11.5px;color:var(--txt-2);line-height:1.35}.readonly-help b{color:var(--accent)}
 
 .card .row1{display:flex;align-items:center;gap:8px;margin-bottom:2px}
 .card .company{font-weight:650;font-size:13.5px;letter-spacing:-0.012em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 .card .time{font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums;flex:0 0 auto}
 .card .time.urgent{color:var(--accent);font-weight:600}
-.card .contact{font-size:12px;color:var(--txt-2);margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.card .preview{font-size:12.5px;color:var(--muted);line-height:1.4;display:flex;gap:6px;margin-bottom:7px}
+.card .contact{font-size:11.8px;color:var(--txt-2);margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .preview{font-size:12.2px;color:var(--muted);line-height:1.3;display:flex;gap:5px;margin-bottom:5px}
 .card .preview .from{font-weight:600;flex:0 0 auto}
 .card .preview .from.lead{color:var(--accent)}.card .preview .from.sdr{color:var(--txt-2)}.card .preview .from.auto{color:var(--info)}
 .card .preview .txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--txt-2)}
 .card .row3{display:flex;align-items:center;gap:5px;flex-wrap:wrap;row-gap:4px}.card .row3 .spacer{flex:1}
-.badge{font-size:10px;font-weight:600;border-radius:6px;padding:2px 6px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.badge{font-size:9.8px;font-weight:600;border-radius:6px;padding:1.5px 5.5px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
 .b-diag{background:var(--info-soft);color:#9fb8ff}.b-pc{background:var(--warning-soft);color:var(--warning)}
 .b-reply{background:var(--success-soft);color:var(--success)}.b-done{background:var(--surface-hi);color:var(--txt-2)}.b-hs{background:rgba(255,107,107,.12);color:var(--danger);border:1px solid rgba(255,107,107,.18)}
 .b-shared{background:rgba(205,235,0,.10);color:var(--accent);border:1px solid rgba(205,235,0,.18)}
@@ -4163,6 +6348,14 @@ a{color:var(--accent);text-decoration:none}
 .card-archive{position:absolute;right:9px;bottom:8px;border:1px solid var(--line-soft);background:var(--surface);color:var(--muted);border-radius:999px;padding:2px 7px;font-size:10.5px;font-weight:700;opacity:0;transition:.12s}.card:hover .card-archive,.card.archived .card-archive{opacity:1}.card-archive:hover{background:var(--surface-2);color:var(--txt)}
 .empty{padding:60px 28px;text-align:center;color:var(--muted)}
 .empty b{display:block;color:var(--txt-2);font-weight:600;font-size:14px;margin-bottom:5px}.empty span{font-size:12.5px}
+.list-page-info{position:sticky;top:0;z-index:3;margin:2px 0 6px;padding:8px 10px;border:1px solid var(--line-soft);border-radius:10px;background:rgba(255,255,255,.72);backdrop-filter:blur(10px);color:var(--muted);font-size:11.5px;display:flex;align-items:center;gap:4px;box-shadow:0 4px 16px rgba(20,28,20,.04)}[data-theme="dark"] .list-page-info{background:rgba(16,25,19,.78);border-color:rgba(205,235,0,.06);box-shadow:none}.list-page-info b{color:var(--txt);font-size:12.5px}.list-page-info span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.list-pager{display:flex;align-items:center;justify-content:center;gap:10px;padding:14px 8px 22px;color:var(--muted);font-size:12px}.list-pager button{border:1px solid var(--line);background:var(--txt);color:var(--accent);border-radius:999px;padding:9px 14px;font-weight:750;font-size:12px;box-shadow:0 8px 22px rgba(11,15,12,.12)}.list-pager button.ghost{background:var(--surface);color:var(--txt-2);box-shadow:none}.list-pager.done{padding-top:16px}.list-pager.done span{border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:7px 11px}
+.cards.loading-lite{opacity:.92}
+.tag-more{font-size:10px;font-weight:800;border-radius:999px;padding:2px 7px;background:var(--surface-hi);color:var(--muted);border:1px solid var(--line-soft)}
+.list-scroll-saved{scroll-behavior:auto!important}.modal-limit-note{border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:7px 10px;color:var(--muted);font-size:11.5px;font-weight:750;margin:0 0 8px;display:inline-flex}.search kbd.busy{color:var(--accent);border-color:rgba(205,235,0,.28);background:rgba(205,235,0,.10)}
+.pull-refresh{height:0;overflow:visible;display:flex;justify-content:center;align-items:flex-start;pointer-events:none;position:relative;z-index:6;opacity:0;transform:translateY(-18px);transition:opacity .16s ease,transform .18s cubic-bezier(.2,.9,.2,1)}
+.pull-refresh .pr-card{margin-top:7px;display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line-soft);background:rgba(255,255,255,.94);backdrop-filter:blur(14px);color:var(--txt-2);border-radius:999px;padding:7px 11px;font-size:11.5px;font-weight:850;box-shadow:0 12px 30px rgba(20,28,20,.12)}
+.pull-refresh .pr-spinner{width:16px;height:16px;border-radius:50%;border:2px solid rgba(31,61,43,.16);border-top-color:var(--accent);display:inline-block;transform:rotate(var(--pull-rot,0deg));transition:transform .08s linear}.pull-refresh .pr-txt{white-space:nowrap}.pull-refresh.visible{opacity:1}.pull-refresh.armed .pr-card{color:var(--accent);border-color:rgba(205,235,0,.34);background:rgba(205,235,0,.12)}.pull-refresh.loading{opacity:1;transform:translateY(0)!important}.pull-refresh.loading .pr-spinner{animation:pullSpin .75s linear infinite}@keyframes pullSpin{to{transform:rotate(360deg)}}
+[data-theme="dark"] .pull-refresh .pr-card{background:rgba(14,17,20,.94)}
 /* conversation */
 .conv-head{display:flex;align-items:center;gap:12px}
 .back-btn{display:none}.conv-head .ttl{flex:1;min-width:0}
@@ -4192,11 +6385,11 @@ a{color:var(--accent);text-decoration:none}
 .event-card .sender-line{display:inline-flex;align-items:center;gap:7px;color:var(--txt);font-size:13px;font-weight:800;line-height:1.15}
 .event-card .sender-line .sender-av{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-size:10px;font-weight:850;color:#07100B;box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}
 .event-card .edesc{font-size:11.5px;color:var(--txt-2);margin-top:2px;white-space:pre-wrap;line-height:1.4}
-.pdf{margin-top:9px;border:1px solid var(--line);background:var(--panel);border-radius:11px;padding:10px 11px;display:flex;align-items:center;gap:11px;max-width:330px;transition:.12s;text-decoration:none}
+.pdf{margin-top:9px;border:1px solid var(--line);background:var(--panel);border-radius:11px;padding:10px 11px;display:flex;align-items:center;gap:11px;width:min(330px,100%);max-width:100%;box-sizing:border-box;transition:.12s;text-decoration:none;color:var(--txt);text-align:left;font:inherit;appearance:none;-webkit-appearance:none;cursor:pointer;overflow:hidden}
 .pdf:hover{border-color:var(--line-strong);background:var(--surface)}
-.pdf .pic{width:38px;height:46px;border-radius:7px;flex:0 0 auto;display:grid;place-items:center;background:linear-gradient(160deg,#3a1414,#1c0c0c);border:1px solid rgba(255,107,107,.25)}
+.pdf .pic{width:38px;height:46px;border-radius:7px;flex:0 0 38px;display:grid;place-items:center;background:linear-gradient(160deg,#3a1414,#1c0c0c);border:1px solid rgba(255,107,107,.25)}
 .pdf .pic span{font-size:8px;font-weight:800;color:#ff8b8b}
-.pdf .pmeta{flex:1;min-width:0}.pdf .pmeta b{display:block;font-size:12.5px;font-weight:600;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pdf .pmeta span{font-size:11px;color:var(--muted)}
+.pdf .pmeta{flex:1 1 auto;min-width:0;overflow:hidden}.pdf .pmeta b{display:block;font-size:12.5px;font-weight:650;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.pdf .pmeta span{display:block;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .brow{display:flex;flex-direction:column;max-width:68%;gap:2px;margin-bottom:1px}
 .brow.out{align-self:flex-end;align-items:flex-end}.brow.in{align-self:flex-start;align-items:flex-start}
 .brow.grp-start{margin-top:9px}
@@ -4214,12 +6407,16 @@ a{color:var(--accent);text-decoration:none}
 .bwho .autobadge{font-size:9.5px;font-weight:600;color:var(--info);background:var(--info-soft);border-radius:5px;padding:1px 6px}
 .bwho .dispatch-who{font-size:10.5px;color:var(--accent);background:var(--accent-soft);border:1px solid var(--btn-lime-line);border-radius:5px;padding:1px 6px}
 .btime{float:right;margin:6px 0 -2px 10px;font-size:10px;color:var(--muted);line-height:1;position:relative;top:3px;font-variant-numeric:tabular-nums;user-select:none}
-.bubble.has-media .btime{float:none;display:block;text-align:right;margin:7px 0 0;top:0;clear:both}
-.bubble.has-media .pdf{margin-top:4px;margin-bottom:2px;max-width:280px}
+.bubble.has-media{padding:7px;min-width:min(330px,100%);max-width:min(360px,100%)}
+.bubble.has-media .btext{display:block;min-width:0}
+.bubble.has-media .btime{float:none;display:block;text-align:right;margin:7px 2px 0;top:0;clear:both}
+.bubble.has-media .pdf{margin:0 0 2px;width:100%;max-width:100%;background:rgba(255,255,255,.13);border-color:rgba(255,255,255,.18);box-shadow:none}
+.brow.out .bubble.has-media .pdf{background:rgba(7,16,11,.16);border-color:rgba(7,16,11,.16)}
+.brow.in .bubble.has-media .pdf{background:var(--surface);border-color:var(--line-soft)}
 .bubble.has-media .pdf .pmeta span{color:var(--txt-2)}
 .pdf.disabled{pointer-events:none;opacity:.78}.pdf.disabled .pic{background:var(--surface-2)}
 .audio-card{margin-top:9px;border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:10px 11px;display:grid;grid-template-columns:34px minmax(0,1fr);gap:10px;max-width:340px}.audio-card .aic{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:var(--btn-ink);color:var(--btn-lime);border:1px solid var(--btn-lime-line);font-size:14px}.audio-card .ameta{min-width:0}.audio-card .ameta b{display:block;font-size:12px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:5px}.audio-card audio{width:100%;height:32px}.audio-card .adownload{display:inline-block;margin-top:5px;font-size:11px;color:var(--muted);text-decoration:none}.audio-card .adownload:hover{color:var(--txt)}.bubble.has-media .audio-card{margin-top:4px;margin-bottom:2px;max-width:300px}
-.file-modal .modal-card{width:min(1120px,calc(100vw - 28px));height:min(92vh,880px);max-width:none;max-height:92vh;display:grid;grid-template-rows:auto minmax(0,1fr)}.file-modal .modal-head{min-width:0}.file-modal .modal-head b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-modal .modal-body{padding:0;overflow:hidden;min-height:0;height:100%;display:block}.file-preview{height:100%;min-height:0;background:#111;border-top:1px solid var(--line-soft)}.file-preview iframe{display:block;width:100%;height:100%;min-height:calc(min(92vh,880px) - 62px);border:0;background:#111}.file-preview-fallback{height:100%;display:grid;place-items:center;padding:24px;text-align:center;color:var(--txt-2)}.file-preview-fallback b{display:block;color:var(--txt);margin-bottom:6px}.file-actions{display:flex;gap:8px;align-items:center}.file-actions a,.file-actions button{border:1px solid var(--line-soft);background:var(--surface);color:var(--txt);border-radius:999px;padding:7px 11px;font-size:12px;font-weight:850;text-decoration:none}.file-actions a.primary{background:var(--btn-ink);color:var(--btn-lime);border-color:var(--btn-lime-line)}
+.file-modal .modal-card{width:min(1120px,calc(100vw - 28px));height:min(92vh,880px);max-width:none;max-height:92vh;display:grid;grid-template-rows:auto minmax(0,1fr)}.file-modal .modal-head{min-width:0}.file-modal .modal-head b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-modal .modal-body{padding:0;overflow:auto;min-height:0;height:100%;display:block;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-x pan-y}.file-preview{height:100%;min-height:0;background:#111;border-top:1px solid var(--line-soft);overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.file-preview iframe{display:block;width:100%;height:100%;min-height:calc(min(92vh,880px) - 62px);border:0;background:#111}.file-preview-fallback{height:100%;display:grid;place-items:center;padding:24px;text-align:center;color:var(--txt-2)}.file-preview-fallback b{display:block;color:var(--txt);margin-bottom:6px}.file-actions{display:flex;gap:8px;align-items:center}.file-actions a,.file-actions button{border:1px solid var(--line-soft);background:var(--surface);color:var(--txt);border-radius:999px;padding:7px 11px;font-size:12px;font-weight:850;text-decoration:none}.file-actions a.primary{background:var(--btn-ink);color:var(--btn-lime);border-color:var(--btn-lime-line)}@media(max-width:820px){.file-modal{align-items:stretch;justify-content:stretch;padding:8px}.file-modal .modal-card{width:calc(100vw - 16px);height:calc(100dvh - 16px);max-height:calc(100dvh - 16px);border-radius:14px}.file-modal .modal-head{padding:10px 12px;gap:7px;flex-wrap:wrap}.file-modal .modal-head b{max-width:46vw}.file-modal .modal-head .modal-sub{font-size:11.5px;line-height:1.15;max-width:35vw}.file-actions{margin-left:auto}.file-actions a,.file-actions button{padding:7px 10px;font-size:11.5px}.file-modal .modal-body{overflow:auto;touch-action:pan-y}.file-preview{height:auto;min-height:calc(100dvh - 82px);overflow:auto;touch-action:pan-y}.file-preview iframe{height:calc(100dvh - 82px);min-height:calc(100dvh - 82px);overflow:auto}}
 /* CH-UX-ANALYTICS: telas de análise em desktop usam a largura toda, sem painel vazio de conversa/contexto. */
 .app.analytics-mode{grid-template-columns:var(--sidebar-w) minmax(0,1fr)}
 .app.analytics-mode .conversation,.app.analytics-mode .context{display:none}
@@ -4245,12 +6442,28 @@ a{color:var(--accent);text-decoration:none}
 .pipe-act-group{display:flex;flex-direction:column;gap:7px}.pipe-act-group-title{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:850;margin:2px 0 0}.pipe-act-upcoming{border-color:rgba(122,90,0,.22);background:rgba(122,90,0,.045)}
 #pipeModal .modal-card{width:min(920px,calc(100vw - 40px));max-width:none}.pipe-modal-list{display:flex;flex-direction:column;gap:8px}.pipe-modal-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.pipe-modal-toolbar span{font-size:12px;color:var(--muted)}.pipe-modal-toolbar input{border:1px solid var(--line-soft);background:var(--surface);color:var(--txt);border-radius:10px;padding:8px 10px;font-size:13px;min-width:240px}.pipe-lead-row{border:1px solid var(--line-soft);background:var(--surface);border-radius:12px;padding:10px 11px}.pipe-lead-top{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center}.pipe-lead-main{min-width:0;cursor:pointer}.pipe-lead-row .fn{font-size:13px;font-weight:800;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pipe-lead-row .fm{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.35}.pipe-lead-row .badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.pipe-lead-actions{display:flex;align-items:center;gap:7px}.pipe-lead-actions button,.pipe-lead-actions a{border:1px solid var(--line-soft);background:var(--panel);color:var(--txt);text-decoration:none;border-radius:999px;padding:7px 10px;font-size:12px;font-weight:800;white-space:nowrap}.pipe-lead-actions button{cursor:pointer}.pipe-acts{display:none;margin-top:10px;border-top:1px solid var(--line-soft);padding-top:9px}.pipe-lead-row.open .pipe-acts{display:flex;flex-direction:column;gap:7px}.pipe-act{display:grid;grid-template-columns:96px minmax(0,1fr) auto;gap:9px;align-items:start;border:1px solid var(--line-soft);background:var(--panel);border-radius:10px;padding:8px}.pipe-act-time{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}.pipe-act-label{font-size:12px;color:var(--txt);line-height:1.35;min-width:0}.pipe-act-kind{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border:1px solid var(--line-soft);border-radius:999px;padding:2px 6px;white-space:nowrap}.pipe-empty-acts{font-size:12px;color:var(--muted);border:1px dashed var(--line);border-radius:10px;padding:9px}
 .app.analytics-mode .mgmt-panel,.app.analytics-mode .focus-panel{padding:14px 18px 22px!important;gap:12px!important}.app.analytics-mode .mgmt-section{background:var(--surface);border-radius:16px}.app.analytics-mode .pipe-tr{background:var(--panel);border-radius:10px}.app.analytics-mode .pipe-tr.head{background:var(--surface-2)}
+[data-theme="dark"] .app.analytics-mode{background:#07100B;color:#F4F7F0}
+[data-theme="dark"] .app.analytics-mode .sidebar{background:linear-gradient(180deg,#101913,#07100B);border-right-color:rgba(205,235,0,.07)}
+[data-theme="dark"] .app.analytics-mode .list,[data-theme="dark"] .app.analytics-mode .cards{background:#07100B}
+[data-theme="dark"] .app.analytics-mode .zone-head,[data-theme="dark"] .app.analytics-mode .list-sub{background:#0B140F;border-bottom-color:rgba(205,235,0,.07)}
+[data-theme="dark"] .app.analytics-mode .search{background:#101913;border-color:rgba(205,235,0,.10);color:#F4F7F0}
+[data-theme="dark"] .app.analytics-mode .search input{color:#F4F7F0}
+[data-theme="dark"] .app.analytics-mode .mgmt-card,[data-theme="dark"] .app.analytics-mode .mgmt-section,[data-theme="dark"] .app.analytics-mode .focus-card,[data-theme="dark"] .app.analytics-mode .focus-hero,[data-theme="dark"] .app.analytics-mode .cad-board,[data-theme="dark"] .app.analytics-mode .pipe-simple-head,[data-theme="dark"] .app.analytics-mode .pipe-sum,[data-theme="dark"] .app.analytics-mode .dispatch-board,[data-theme="dark"] .app.analytics-mode .perf-hero,[data-theme="dark"] .app.analytics-mode .perf-board,[data-theme="dark"] .app.analytics-mode .perf-kpi,[data-theme="dark"] .app.analytics-mode .perf-chart{background:linear-gradient(180deg,#101913,#0B140F);border-color:rgba(205,235,0,.09);box-shadow:none;color:#F4F7F0}
+[data-theme="dark"] .app.analytics-mode .cad-stage,[data-theme="dark"] .app.analytics-mode .cad-sec,[data-theme="dark"] .app.analytics-mode .pipe-tr,[data-theme="dark"] .app.analytics-mode .pipe-state{background:#101913;border-color:rgba(205,235,0,.075);color:#F4F7F0}
+[data-theme="dark"] .app.analytics-mode .pipe-tr.head,[data-theme="dark"] .app.analytics-mode .cad-stage-summary span,[data-theme="dark"] .app.analytics-mode .cad-chip,[data-theme="dark"] .app.analytics-mode .dispatch-total{background:#142019;border-color:rgba(205,235,0,.08);color:#B9C3BA}
+[data-theme="dark"] .app.analytics-mode .cad-chip.cad-apt b,[data-theme="dark"] .app.analytics-mode .cad-src.cad-src-ledger{color:#CDEB00}
 @media(max-width:980px){.pipe-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.pipe-simple-head{flex-direction:column}.pipe-simple-head .stamp{white-space:normal}}
 @media(max-width:560px){.pipe-summary{grid-template-columns:1fr}}
 
 .perf-hero{border:1px solid var(--line-soft);background:linear-gradient(180deg,var(--surface),var(--panel));border-radius:18px;padding:16px;display:grid;grid-template-columns:1.05fr .95fr;gap:16px}.perf-title>b{display:block;font-size:18px;letter-spacing:-.02em}.perf-title span{display:block;color:var(--muted);font-size:12.5px;line-height:1.45;margin-top:4px;max-width:780px}.perf-title span b{display:inline;font-size:inherit;color:var(--txt);letter-spacing:0}.perf-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}.perf-kpi{border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:12px;min-height:76px;display:flex;flex-direction:column;justify-content:space-between}.perf-kpi b{display:block;font-size:24px;line-height:1;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.perf-kpi span{display:block;font-size:11px;color:var(--muted);margin-top:7px;line-height:1.25}.perf-chart{border:1px solid var(--line-soft);background:var(--surface);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:11px}.perf-chart h4,.perf-board h4{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}.funnel-row{display:grid;grid-template-columns:116px 1fr 58px;gap:10px;align-items:center;font-size:12px;color:var(--txt)}.funnel-track{height:15px;border-radius:999px;background:rgba(31,61,43,.08);overflow:hidden;border:1px solid rgba(31,61,43,.16)}.funnel-fill{display:block;min-width:4px;height:100%;border-radius:999px;background:linear-gradient(90deg,#1F3D2B,#9FB800)}.perf-board{border:1px solid var(--line-soft);background:var(--surface);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:8px}.perf-owner{display:grid;grid-template-columns:minmax(130px,1fr) 80px minmax(120px,1.2fr) 70px;gap:10px;align-items:center;border-top:1px solid var(--line-soft);padding-top:9px;font-size:12px}.perf-owner:first-of-type{border-top:0}.perf-owner b{font-size:13px}.perf-owner small{color:var(--muted);font-size:11px}.perf-bar{height:9px;border-radius:999px;background:var(--surface-2);overflow:hidden;border:1px solid var(--line-soft)}.perf-bar i{display:block;height:100%;border-radius:999px;background:var(--btn-lime)}.perf-note{font-size:11.5px;color:var(--muted);line-height:1.4;margin-top:2px}.perf-secondary{display:grid;grid-template-columns:1fr;gap:12px}@media(max-width:1100px){.perf-hero{grid-template-columns:1fr}.perf-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.perf-owner{grid-template-columns:1fr 70px;gap:6px}.perf-owner .perf-bar{grid-column:1/-1}}
 
 .dispatch-board{border:1px solid var(--line-soft);background:linear-gradient(180deg,var(--surface),var(--panel));border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:12px}.dispatch-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.dispatch-head b{display:block;font-size:15px}.dispatch-head span{display:block;color:var(--muted);font-size:12px;line-height:1.4;margin-top:3px}.dispatch-total{border:1px solid var(--line-soft);border-radius:999px;padding:6px 10px;font-size:12px;font-weight:800;color:var(--txt);white-space:nowrap;background:var(--surface-2)}.dispatch-chart{height:230px;display:flex;align-items:flex-end;gap:10px;padding:8px 4px 0;border-bottom:1px solid var(--line-soft);overflow-x:auto}.dispatch-col{min-width:42px;flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;border:0;background:transparent;color:var(--txt);padding:0;cursor:pointer}.dispatch-col:hover .dispatch-stack{transform:translateY(-3px);box-shadow:0 14px 28px rgba(31,61,43,.16)}.dispatch-col.on .dispatch-stack{outline:2px solid var(--btn-lime);outline-offset:2px}.dispatch-col .n{font-size:11px;font-weight:850;color:var(--txt);height:14px}.dispatch-col .d{font-size:10.5px;color:var(--muted);font-weight:700}.dispatch-stack{width:100%;max-width:54px;height:var(--h);min-height:4px;border-radius:10px 10px 3px 3px;background:var(--surface-2);border:1px solid var(--line-soft);overflow:hidden;display:flex;flex-direction:column-reverse;box-shadow:inset 0 1px 0 rgba(255,255,255,.18);transition:.14s}.dispatch-seg{width:100%;transition:opacity .12s,filter .12s}.dispatch-seg:hover{filter:brightness(1.05);opacity:.95}.dispatch-seg.dim{opacity:.18;filter:saturate(.55)}.dispatch-legend{display:flex;gap:7px;flex-wrap:wrap}.dispatch-chip{display:flex;align-items:center;gap:6px;border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:5px 8px;font-size:11.5px;color:var(--txt-2);cursor:pointer}.dispatch-chip:hover,.dispatch-chip.on{border-color:var(--btn-lime-line);color:var(--txt);box-shadow:inset 0 0 0 1px rgba(205,235,0,.22)}.dispatch-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}.dispatch-detail{border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:10px}.dispatch-detail b{font-size:12px}.dispatch-detail .lines{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;margin-top:8px}.dispatch-detail .line{font-size:11.5px;color:var(--txt-2);display:flex;align-items:center;gap:6px;border:1px solid transparent;background:transparent;border-radius:8px;padding:4px 6px;text-align:left;cursor:pointer}.dispatch-detail .line:hover{border-color:var(--line-soft);background:var(--surface-2);color:var(--txt)}.dispatch-rank{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.dispatch-rank .r{border:1px solid var(--line-soft);background:var(--surface);border-radius:12px;padding:8px 10px;cursor:pointer}.dispatch-rank .r:hover,.dispatch-rank .r.on{border-color:var(--btn-lime-line)}.dispatch-rank b{display:block;font-size:18px}.dispatch-rank span{display:block;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dispatch-modal-card{width:min(980px,calc(100vw - 36px));max-width:none}.dispatch-modal-list{display:flex;flex-direction:column;gap:8px}.dispatch-msg-row{border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:11px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px}.dispatch-msg-row h4{margin:0 0 3px;font-size:13px}.dispatch-msg-row small{display:block;color:var(--muted);font-size:11.5px}.dispatch-msg-row p{margin:8px 0 0;color:var(--txt-2);font-size:12px;line-height:1.45;white-space:pre-wrap;max-height:96px;overflow:auto}.dispatch-msg-row a{align-self:start;border:1px solid var(--btn-lime-line);background:var(--btn-ink);color:var(--btn-lime);border-radius:999px;padding:7px 10px;text-decoration:none;font-size:11.5px;font-weight:850;white-space:nowrap}
+
+.dispatch-tooltip{position:fixed;z-index:9999;min-width:190px;max-width:280px;background:#0B0F0C;color:#F6F7F2;border:1px solid rgba(205,235,0,.34);border-radius:12px;padding:9px 10px;box-shadow:0 18px 42px rgba(0,0,0,.28);font-size:11.5px;line-height:1.35;pointer-events:none}.dispatch-tooltip[hidden]{display:none}.dispatch-tooltip b{display:block;color:#CDEB00;font-size:12px;margin-bottom:5px}.dispatch-tooltip .tt-row{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid rgba(255,255,255,.09);padding-top:4px;margin-top:4px}.dispatch-tooltip .tt-row span{display:flex;align-items:center;gap:6px;min-width:0}.dispatch-tooltip .tt-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}
+.follow-ads{border:1px solid rgba(255,255,255,.10);background:#101214;color:#F7F8F5;border-radius:22px;padding:18px;display:flex;flex-direction:column;gap:16px;box-shadow:0 18px 50px rgba(0,0,0,.16)}.follow-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.follow-head em,.follow-pick-title,.follow-bars h4,.follow-preview h4{display:block;margin:0 0 8px;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:#8B949E;font-style:normal;font-weight:800}.follow-head b{display:block;font-size:22px;letter-spacing:-.03em}.follow-head span{display:block;color:#A9B1BA;font-size:12.5px;line-height:1.45;margin-top:4px;max-width:760px}.follow-head strong{font-size:32px;line-height:1;color:#CDEB00;text-align:right}.follow-head strong small{display:block;color:#8B949E;font-size:11px;margin-top:5px}.follow-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.follow-kpis div,.follow-card{border:1px solid rgba(255,255,255,.09);background:#171A1D;border-radius:16px;padding:13px;text-align:left}.follow-kpis b{display:block;font-size:24px;line-height:1;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.follow-kpis span,.follow-card span{display:block;color:#F7F8F5;font-size:12px;font-weight:750;margin-top:8px}.follow-kpis small,.follow-card small{display:block;color:#8B949E;font-size:11px;margin-top:4px;line-height:1.35}.version-pill{display:inline-flex;margin:6px 0 0;padding:3px 8px;border-radius:999px;border:1px solid rgba(205,235,0,.25);background:rgba(205,235,0,.09);color:#D9F99D;font-size:10px;font-style:normal;font-weight:900;letter-spacing:.02em}.follow-card em{display:block;color:#DDE3EA;font-size:11px;line-height:1.32;font-style:normal;margin-top:9px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.follow-cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.follow-card{cursor:pointer;transition:.14s;min-height:118px}.follow-card:hover{transform:translateY(-1px);border-color:rgba(24,119,242,.45)}.follow-card.on{border-color:#1877F2;box-shadow:inset 0 0 0 1px #1877F2}.follow-card b{display:block;font-size:30px;line-height:1;margin-top:12px}.follow-detail{display:grid;grid-template-columns:1fr 1fr;gap:14px}.follow-bars,.follow-preview{border:1px solid rgba(255,255,255,.09);background:#171A1D;border-radius:18px;padding:14px}.cadence-bar{display:grid;grid-template-columns:minmax(150px,1.1fr) 1fr 64px;gap:10px;align-items:center;padding:9px 8px;border-top:1px solid rgba(255,255,255,.07);font-size:12px;border-radius:12px;cursor:pointer}.cadence-bar:hover,.cadence-bar.on{background:rgba(255,255,255,.045)}.cadence-bar:first-of-type{border-top:0}.cadence-bar span{color:#DDE3EA;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cadence-bar span b{display:block;text-align:left;font-size:12px;overflow:hidden;text-overflow:ellipsis}.cadence-bar span small{display:block;color:#8B949E;font-size:10.5px;overflow:hidden;text-overflow:ellipsis}.cadence-bar div{height:10px;border-radius:999px;background:#272B30;overflow:hidden}.cadence-bar i{display:block;height:100%;border-radius:999px}.cadence-bar>b{font-variant-numeric:tabular-nums;text-align:right}.cadence-bar>b small{display:block;color:#8B949E;font-size:10px;margin-top:2px}.chat-preview{background:#0B0F0C;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:13px;display:flex;flex-direction:column;gap:9px;margin-bottom:10px}.bubble{max-width:88%;border-radius:15px;padding:10px 12px;font-size:12.5px;line-height:1.38}.bubble small{display:block;text-align:right;font-size:10px;opacity:.58;margin-top:6px}.bubble.out{align-self:flex-end;background:#CFEF7A;color:#0B0F0C;border-bottom-right-radius:5px}.bubble.in{align-self:flex-start;background:#24282D;color:#F7F8F5;border-bottom-left-radius:5px}.follow-trend{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.follow-trend span{border:1px solid rgba(255,255,255,.08);background:#101214;color:#8B949E;border-radius:999px;padding:5px 8px;font-size:10.5px}.follow-trend b{color:#F7F8F5;margin-left:4px}.approach-panel{display:grid;grid-template-columns:.85fr 1.15fr;gap:14px;border:1px solid rgba(255,255,255,.09);background:linear-gradient(135deg,#15181C,#0F1215);border-radius:20px;padding:14px}.approach-panel h4{margin:0 0 6px;font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:#8B949E}.approach-panel p{margin:0;color:#F7F8F5;font-size:17px;font-weight:850}.approach-panel strong{display:inline-flex;margin-top:8px;border:1px solid rgba(37,211,102,.28);background:rgba(37,211,102,.10);color:#8EF2B1;border-radius:999px;padding:5px 9px;font-size:11px}.approach-steps{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.approach-steps span{border:1px solid rgba(255,255,255,.08);background:#101214;color:#DDE3EA;border-radius:999px;padding:6px 9px;font-size:11px}.approach-list{display:flex;flex-direction:column;gap:8px}.approach-row{position:relative;border:1px solid rgba(255,255,255,.08);background:#101214;border-radius:14px;padding:10px 58px 10px 11px}.approach-row b{display:block;font-size:12.5px;color:#F7F8F5}.approach-row span{display:block;font-size:11px;color:#A9B1BA;margin-top:3px}.approach-row em{display:block;font-style:normal;color:#DDE3EA;font-size:11.5px;line-height:1.35;margin-top:6px}.approach-row a{position:absolute;right:10px;top:10px;color:#CDEB00;font-size:11px;text-decoration:none;font-weight:800}.variant-row{border:1px solid rgba(255,255,255,.08);background:#101214;border-radius:14px;padding:10px 11px}.variant-row b{display:block;font-size:12.5px;color:#F7F8F5}.variant-row span{display:block;font-size:11px;color:#8B949E;margin-top:3px}.variant-row em{display:block;font-style:normal;color:#DDE3EA;font-size:11.5px;line-height:1.35;margin-top:7px}@media(max-width:980px){.follow-kpis,.follow-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.follow-detail,.approach-panel{grid-template-columns:1fr}.follow-head{flex-direction:column}.follow-head strong{text-align:left}}@media(max-width:560px){.follow-kpis,.follow-cards{grid-template-columns:1fr}.cadence-bar{grid-template-columns:118px 1fr 48px}.follow-ads{padding:13px;border-radius:18px}}
+
+.funnel-step{display:grid;grid-template-columns:100px minmax(120px,1fr) 86px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.07)}.funnel-step span{color:#DDE3EA;font-size:12px;font-weight:800}.funnel-step div{height:10px;background:rgba(255,255,255,.08);border-radius:999px;overflow:hidden}.funnel-step i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#CDEB00,#25D366)}.funnel-step b{text-align:right;font-size:16px}.funnel-step small{display:block;color:#8B949E;font-size:10px}
+.task-focus{border-radius:24px;background:linear-gradient(180deg,#101913,#0B140F)!important}.focus-subtabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:0 0 14px;padding:8px;border:1px solid rgba(205,235,0,.08);border-radius:18px;background:linear-gradient(180deg,rgba(16,25,19,.86),rgba(8,13,10,.92));box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}.focus-subtab{appearance:none;-webkit-appearance:none;text-align:left;border:1px solid rgba(255,255,255,.06);border-radius:14px;background:rgba(255,255,255,.025);color:var(--txt-2);padding:10px 12px;display:flex;flex-direction:column;gap:3px;cursor:pointer;transition:.14s;min-width:0}.focus-subtab b{font-size:12.5px;color:var(--txt);font-weight:850}.focus-subtab span{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.focus-subtab:hover{background:rgba(205,235,0,.055);border-color:rgba(205,235,0,.16);transform:translateY(-1px)}.focus-subtab.on{background:linear-gradient(180deg,rgba(205,235,0,.16),rgba(205,235,0,.07));border-color:rgba(205,235,0,.28);box-shadow:0 10px 24px rgba(0,0,0,.18)}.focus-subtab.on b{color:var(--accent)}@media(max-width:760px){.focus-subtabs{grid-template-columns:1fr}.focus-subtab span{white-space:normal}}.orch-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.orch-card,.orch-int,.orch-hyg,.orch-approach-row,.orch-loss-row{border:1px solid rgba(205,235,0,.08);background:rgba(255,255,255,.035);border-radius:14px;padding:12px}.orch-card-head,.orch-int-top,.orch-approach-row,.orch-loss-row{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.orch-card-grid,.orch-funnel,.orch-hyg-grid,.orch-auto-strip,.orch-ops-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.orch-card-grid div,.orch-funnel div,.orch-auto-strip div,.orch-ops-grid div{border:1px solid rgba(255,255,255,.06);background:rgba(0,0,0,.12);border-radius:12px;padding:9px}.orch-card b,.orch-hyg b,.orch-funnel b,.orch-auto-strip b{display:block;color:#F4F7F0}.orch-card span,.orch-card-foot,.orch-int-reason,.orch-int-action,.orch-hyg small,.orch-bottleneck span,.orch-approach-row span,.orch-loss-row span,.orch-approach-metrics em{display:block;color:#9AA6A0;font-size:11.5px;line-height:1.35}.orch-status,.orch-sev-dot{border-radius:999px}.orch-status{font-size:11px;font-weight:800;padding:3px 8px;background:rgba(255,255,255,.06);color:#DDE3DA}.st-int{background:rgba(239,68,68,.14);color:#FCA5A5}.st-attn{background:rgba(245,158,11,.13);color:#FCD34D}.st-ok{background:rgba(34,197,94,.12);color:#86EFAC}.orch-ints,.orch-necks{display:flex;flex-direction:column;gap:8px}.orch-int.sev-red{border-color:rgba(239,68,68,.25)}.orch-int.sev-yellow{border-color:rgba(245,158,11,.24)}.orch-evs{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.orch-ev{border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.04);border-radius:999px;padding:3px 8px;color:#DDE3DA;font-size:11px}.orch-bottleneck{position:relative;overflow:hidden;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:10px;background:rgba(255,255,255,.03)}.orch-bottleneck i{position:absolute;left:0;bottom:0;height:3px;background:#CDEB00}.orch-approach-board .focus-split{align-items:start}.orch-approach-row,.orch-loss-row{margin-bottom:8px}.orch-approach-row small{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.orch-approach-row a{color:#CDEB00;text-decoration:none}.orch-approach-metrics{text-align:right;min-width:120px}.orch-approach-metrics b{font-size:20px;color:#CDEB00}.focus-filterbar{display:grid;grid-template-columns:minmax(260px,1fr) repeat(3,minmax(150px,190px));gap:10px;align-items:end;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.035);border-radius:16px;padding:12px}.focus-filterbar b{display:block;font-size:13px;color:#F7F8F5}.focus-filterbar span{display:block;font-size:11.5px;color:#9AA6A0;margin-top:3px}.focus-filterbar label{display:flex;flex-direction:column;gap:5px;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:#8B949E;font-weight:850}.focus-filterbar select{height:34px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0B120E;color:#F7F8F5;padding:0 10px;font-weight:750}.focus-filterbar .mgmt-clear{height:34px;align-self:end;border:1px solid rgba(205,235,0,.28);background:rgba(205,235,0,.10);color:#D9F99D;border-radius:10px;padding:0 12px;font-size:11.5px;font-weight:850}.mgmt-top-filter{grid-template-columns:minmax(260px,1fr) repeat(3,minmax(140px,180px)) auto}.task-meaning{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.task-meaning div{border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);border-radius:13px;padding:10px}.task-meaning b{display:block;font-size:12px;color:#D9F99D}.task-meaning span{display:block;margin-top:3px;font-size:11px;line-height:1.35;color:#9AA6A0}.task-expected{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.task-expected>div{border:1px solid rgba(205,235,0,.10);background:#121B16;border-radius:16px;padding:12px}.task-expected b{display:block;color:#F7F8F5}.task-expected span{display:block;margin:4px 0 9px;color:#9AA6A0;font-size:11.5px}.task-track{height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}.task-track i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#CDEB00,#25D366)}.task-track.warn i{background:linear-gradient(90deg,#F59E0B,#EF4444)}.task-stale{display:inline-flex;margin-left:6px;color:#D9F99D;font-style:normal;font-weight:850}.task-scope-strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.task-scope-strip div{border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.035);border-radius:13px;padding:10px 12px}.task-scope-strip b{display:block;color:#F7F8F5;font-size:20px}.task-scope-strip span{display:block;color:#9AA6A0;font-size:11.5px}.task-group-row.auto-record{border-style:dashed;opacity:.86}.task-group-row.auto-record b{color:#B7C4BB}.task-group-row.auto-record strong{color:#9AA6A0}.task-group-row.auto-record i{background:linear-gradient(90deg,#64748B,#94A3B8)}.task-day-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.task-day{border:1px solid rgba(205,235,0,.08);background:#142019;border-radius:14px;padding:10px;min-width:0}.task-day b{display:block;font-size:22px;color:#F4F7F0;line-height:1}.task-day span{display:block;font-size:11px;color:#CDEB00;font-weight:850;margin-top:4px}.task-day small{display:block;font-size:10.5px;color:#9AA6A0;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.focus-split{display:grid;grid-template-columns:minmax(280px,.9fr) minmax(320px,1.1fr);gap:12px}.task-focus .mini-hint{margin-top:4px;color:#9AA6A0;font-size:11px;line-height:1.35}.task-group-board{border:1px solid rgba(205,235,0,.14);background:linear-gradient(180deg,rgba(205,235,0,.055),rgba(255,255,255,.025));border-radius:20px;padding:14px;display:flex;flex-direction:column;gap:12px}.task-group-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-end}.task-group-head b{display:block;color:#F7F8F5;font-size:15px}.task-group-head span{display:block;color:#9AA6A0;font-size:12px;line-height:1.4}.task-group-grid{display:grid;grid-template-columns:1fr 1.2fr;gap:14px}.task-group-grid section{display:flex;flex-direction:column;gap:8px}.task-group-grid h4{margin:0;color:#C9D5CE;font-size:11px;letter-spacing:.08em;text-transform:uppercase}.task-group-row{position:relative;overflow:hidden;text-align:left;border:1px solid rgba(255,255,255,.08);background:#0B120E;color:#F7F8F5;border-radius:15px;padding:11px 54px 12px 12px;min-height:58px;cursor:pointer}.task-group-row:hover{border-color:rgba(205,235,0,.32);transform:translateY(-1px)}.task-group-row b{position:relative;z-index:1;display:block;font-size:13px}.task-group-row span{position:relative;z-index:1;display:block;color:#9AA6A0;font-size:11.5px;margin-top:4px;line-height:1.35}.task-group-row strong{position:absolute;z-index:2;right:12px;top:14px;font-size:20px;color:#CDEB00}.task-group-row i{position:absolute;left:0;bottom:0;height:3px;background:linear-gradient(90deg,#CDEB00,#25D366);border-radius:0 999px 999px 0}@media(max-width:900px){.task-group-grid{grid-template-columns:1fr}}
 
 .cad-board{border:1px solid rgba(31,61,43,.14);background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(31,61,43,.035));border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:12px}
 .cad-board-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.cad-board-head b{font-size:15px;display:block}.cad-board-head span{display:block;color:var(--muted);font-size:12px;line-height:1.45;margin-top:3px;max-width:720px}.cad-board-head button{border:1px solid var(--btn-lime-line);background:var(--btn-ink);color:var(--btn-lime);border-radius:999px;padding:7px 12px;font-weight:750;font-size:12px;white-space:nowrap}
@@ -4554,14 +6767,18 @@ span.cad-chip.cad-dec{color:#6a3c9c}
 const qs=new URLSearchParams(location.search), user=qs.get('u')||'', token=qs.get('t')||'', deepConv=qs.get('conv')||'';
 const auth=`u=${encodeURIComponent(user)}&t=${encodeURIComponent(token)}`;
 let deepConvOpened=false;
-let convs=[], active=null, msgs=[], me=null, portMeta={};
+let convs=[], active=null, msgs=[], msgsConvId=null, me=null, portMeta={};
 let queue='todos', sortMode='recent', mode='reply';
 let hubspotFilter=false; // WhatsApp mode: mostra todas as conversas reais do WhatsApp
 let managerOverview=null, managerOverviewLoading=false;
 let pipelineFocus=null, pipelineFocusLoading=false;
-let dispatchStats=null, dispatchStatsLoading=false, dispatchSelectedChip='', dispatchSelectedDay='';
+let dispatchStats=null, dispatchStatsLoading=false, dispatchSelectedChip='', dispatchSelectedDay='', dispatchSelectedType='';
 let pipeCallFilter='all', pipeWhatsFilter='all', pipeBucketFilter='all', pipeSampleBucket='1';
+let focusOwnerFilter='all', focusStageFilter='all', focusTaskFilter='open';
 let cadenciaPreview=null, cadenciaLoading=false;
+// Gestão SDR (subaba do Foco): visão de gestão somente leitura. Os dados vêm de
+// /api/sdr-orchestrator-summary e /api/task-hygiene-preview (HubSpot read-only).
+let sdrOrch=null, sdrOrchLoading=false, sdrOrchError='', focusSubtab='dia';
 // CH-026/CH-010: seleção em massa (ids). O estado de triagem (status/nota) é
 // persistido no backend via /api/state e chega em cada conversa (localStatus,
 // localNote, localUpdatedAt). Mutamos a conversa em memória de forma otimista e
@@ -4578,6 +6795,10 @@ let viewMode='conversas';
 let loadAllInFlight=false, lastHeavyLoad=0;
 // CH-RT/UX: feedback "ao vivo" da inbox + destaque do card que chegou no topo.
 let lastInboxUpdatedAt=0, newTopConvId='', newTopTimer=null;
+// Inbox mobile: renderiza em páginas para não pesar/travar DOM com 500+ cards.
+const LIST_PAGE_SIZE=60;
+const ANALYTICS_MODAL_LIMIT=80;
+let listVisibleCount=LIST_PAGE_SIZE, lastListSignature='', searchDebounceTimer=null, listScrollTimer=null, pendingListScrollRestore=null;
 
 const QUEUES=[
   {key:'responder', label:'Responder agora', hot:true},
@@ -4647,14 +6868,70 @@ async function api(path, opts={}){
   }finally{ clearTimeout(timer); }
 }
 
+function debounce(fn, wait=350){
+  let timer=null;
+  return function(...args){ clearTimeout(timer); timer=setTimeout(()=>fn.apply(this,args), wait); };
+}
+function setSearchBusy(on){
+  const k=document.querySelector('.search kbd'); if(k) k.classList.toggle('busy', !!on);
+}
+function compactBadges(items, max=3){
+  items=(items||[]).filter(Boolean);
+  if(items.length<=max) return items.join('');
+  return items.slice(0,max).join('')+`<span class="tag-more" title="${esc(items.length-max)} marcador(es) oculto(s) para deixar a lista leve">+${items.length-max}</span>`;
+}
+function limitedHtmlRows(rows, renderFn, limit=ANALYTICS_MODAL_LIMIT, noun='itens'){
+  rows=rows||[];
+  const visible=rows.slice(0,limit).map(renderFn).join('');
+  const note=rows.length>limit?`<div class="modal-limit-note">Mostrando ${limit} de ${rows.length} ${esc(noun)} para não travar o mobile. Use busca/filtro para refinar.</div>`:'';
+  return note+visible;
+}
+function listScrollKey(){ return 'zydon-channel-list-scroll:'+viewMode+':'+(user||'cookie'); }
+function getListScroller(){ return document.querySelector('.list .scroll'); }
+function saveListScroll(){
+  const sc=getListScroller(); if(!sc) return;
+  try{ sessionStorage.setItem(listScrollKey(), String(sc.scrollTop||0)); }catch(e){}
+}
+function restoreListScroll(){
+  const sc=getListScroller(); if(!sc) return;
+  let y=pendingListScrollRestore;
+  if(y==null){ try{ y=+(sessionStorage.getItem(listScrollKey())||0); }catch(e){ y=0; } }
+  pendingListScrollRestore=null;
+  if(y>0){ sc.classList.add('list-scroll-saved'); sc.scrollTop=y; setTimeout(()=>sc.classList.remove('list-scroll-saved'),60); }
+}
+function saveInboxSnapshot(){
+  try{ sessionStorage.setItem('zydon-channel-inbox-snapshot', JSON.stringify({ts:Date.now(),convs,me,portMeta})); }catch(e){}
+}
+function restoreInboxSnapshot(){
+  try{
+    const raw=sessionStorage.getItem('zydon-channel-inbox-snapshot'); if(!raw||convs.length) return false;
+    const d=JSON.parse(raw); if(!d || Date.now()-(+d.ts||0)>10*60*1000) return false;
+    convs=d.convs||[]; me=d.me||null; portMeta=d.portMeta||{};
+    if(me){
+      document.getElementById('meName').textContent=me.name||'—';
+      document.getElementById('meSub').textContent=(me.admin?'Admin · ':(me.view_all?'Supervisor · ':''))+(me.ports||[]).length+' conexões';
+      const ava=document.getElementById('meAva'); if(ava){ ava.textContent=initials(me.name); ava.style.background=colorFor(me.name); }
+    }
+    drawCards(); restoreListScroll(); return true;
+  }catch(e){ return false; }
+}
+function setListLoading(on){
+  const el=document.getElementById('cards'); if(el) el.classList.toggle('loading-lite', !!on);
+  const live=document.getElementById('liveStatus'); if(live) live.classList.toggle('loading', !!on);
+}
+
 /* ---- Tema Zydon: Light/Dark seguindo paleta da marca. Toggle no perfil. ---- */
 function currentTheme(){ try{return localStorage.getItem('zydon-theme')||'light'}catch{return 'light'} }
-function applyTheme(t){
+function analyticsModeActive(){return viewMode==='foco'||viewMode==='gestao'||['/foco','/gestao'].includes(window.location.pathname||'')}
+function applyTheme(t, opts={}){
   t=(t||currentTheme()); if(t!=='dark') t='light';
-  document.documentElement.setAttribute('data-theme',t);
-  try{localStorage.setItem('zydon-theme',t)}catch(e){}
-  const logo=document.getElementById('brandLogo'); if(logo) logo.src=(t==='dark'?'/logo-dark.png':'/logo.png');
-  const btn=document.getElementById('themeBtn'); if(btn) btn.innerHTML=themeIcon(t==='dark'?'sun':'moon');
+  // Gestão/Foco são superfícies analíticas premium: sempre dark na tela inteira.
+  // Não gravar essa imposição em localStorage, para Conversas continuar respeitando o toggle do usuário.
+  const visualTheme=analyticsModeActive()?'dark':t;
+  document.documentElement.setAttribute('data-theme',visualTheme);
+  if(!opts.visualOnly){ try{localStorage.setItem('zydon-theme',t)}catch(e){} }
+  const logo=document.getElementById('brandLogo'); if(logo) logo.src=(visualTheme==='dark'?'/logo-dark.png':'/logo.png');
+  const btn=document.getElementById('themeBtn'); if(btn) btn.innerHTML=themeIcon(visualTheme==='dark'?'sun':'moon');
 }
 function toggleTheme(ev){ if(ev) ev.stopPropagation(); applyTheme(currentTheme()==='dark'?'light':'dark'); }
 function themeIcon(k){
@@ -4715,6 +6992,19 @@ function relTime(ts){
 }
 function dt(ts){try{return new Date((+ts)*1000).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo'})}catch{return ''}}
 function hhmm(ts){try{return new Date((+ts)*1000).toLocaleTimeString('pt-BR',{timeZone:'America/Sao_Paulo',hour:'2-digit',minute:'2-digit'})}catch{return ''}}
+function brDateKey(ts){try{return new Date((+ts)*1000).toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'})}catch{return ''}}
+function cardTime(ts){
+  // Card de conversa deve mostrar horário/data real, não idade relativa tipo “5min”.
+  // Idade relativa muda sozinha e estava sendo lida como data errada nos disparos em lote.
+  if(!ts) return '';
+  const d=new Date((+ts)*1000);
+  const today=new Date().toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'});
+  const key=brDateKey(ts);
+  const y=new Date(Date.now()-86400000).toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'});
+  if(key===today) return d.toLocaleTimeString('pt-BR',{timeZone:'America/Sao_Paulo',hour:'2-digit',minute:'2-digit'});
+  if(key===y) return 'Ontem';
+  return d.toLocaleDateString('pt-BR',{timeZone:'America/Sao_Paulo',day:'2-digit',month:'2-digit'});
+}
 function dayKey(ts){try{return new Date((+ts)*1000).toLocaleDateString('pt-BR',{timeZone:'America/Sao_Paulo',weekday:'long',day:'2-digit',month:'long'})}catch{return ''}}
 
 function ownerOf(port){const m=portMeta[port]||{}; return (m.owner||'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())||m.label||('Chip '+port)}
@@ -4792,14 +7082,15 @@ function localBadge(c){
 }
 function automationBadge(c){
   const a=(c&&c.automation)||{};
-  let out='';
-  if(a.risk==='falha') out+='<span class="badge b-risk">⚠ Automação falhou</span>';
-  else if(a.diagnostico==='parcial') out+='<span class="badge b-risk">⚠ Diagnóstico parcial</span>';
-  else if(a.diagnostico==='feito') out+='<span class="badge b-diag">Diagnóstico feito</span>';
-  if(a.primeiroContato==='feito') out+='<span class="badge b-pc">1º contato feito</span>';
-  if(a.count>1) out+=`<span class="badge b-auto">🤖 ${a.count} automações</span>`;
-  if(a.followup==='feito') out+='<span class="badge b-done">Follow-up feito</span>';
-  return out;
+  // Um único badge de automação por card. Antes esta função devolvia vários spans
+  // dentro de um só item do compactBadges(), deixando cards institucionais grossos.
+  if(a.risk==='falha') return '<span class="badge b-risk">⚠ Automação falhou</span>';
+  if(a.diagnostico==='parcial') return '<span class="badge b-risk">⚠ Diagnóstico parcial</span>';
+  if(a.diagnostico==='feito') return '<span class="badge b-diag">Diagnóstico feito</span>';
+  if(a.primeiroContato==='feito') return '<span class="badge b-pc">1º contato feito</span>';
+  if(a.followup==='feito') return '<span class="badge b-done">Follow-up feito</span>';
+  if(a.count>1) return `<span class="badge b-auto">🤖 ${a.count} automações</span>`;
+  return '';
 }
 function sharedBadge(c){
   if(!c || !c.sharedFromPort) return '';
@@ -4816,15 +7107,18 @@ function autoStatusText(v){return ({feito:'Feito',pendente:'Pendente',parcial:'P
 function previewFrom(c){
   if(leadLast(c)) return {cls:'lead', label:'Lead'};
   const t=autoType(c);
-  if(/^cron-/.test(t)) return {cls:'auto', label:'Auto'};
+  if(/^cron-/.test(t)||t==='seed-wpp-envios') return {cls:'auto', label:'Auto'};
   return {cls:'sdr', label:'SDR'};
 }
 function slaTag(c){
   if(hasActionableLeadReply(c)) return '<span class="sla now"><span class="pulse"></span>Responder agora</span>';
   const s=Math.floor(Date.now()/1000-(+c.lastTime||0));
   if(!c.lastTime) return '';
+  // A idade da última interação já aparece uma vez no canto direito do card.
+  // Não repetir “5min” + “enviado há 5min”: isso parece data duplicada/errada.
+  // Só mostramos SLA quando existe uma informação diferente e útil: atraso real.
   if(s>3*3600) return `<span class="sla warn"><span class="pulse"></span>há ${relTime(c.lastTime)} sem resposta</span>`;
-  return `<span class="sla ok">enviado há ${relTime(c.lastTime)}</span>`;
+  return '';
 }
 
 /* ---------- render ---------- */
@@ -4842,9 +7136,11 @@ function renderShell(){
       <div class="me" title="Perfil"><div class="avatar" id="meAva"></div><div class="nm"><b id="meName">—</b><span id="meSub"></span></div><div class="profile-actions"><button class="theme-btn" id="themeBtn" onclick="toggleTheme(event)" title="Alternar tema"></button><button class="logout-btn" onclick="event.stopPropagation(); location.href='/logout'" title="Sair"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg></button></div></div>
     </aside>
     <section class="col list">
-      <div class="zone-head"><div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg><input id="search" placeholder="Buscar empresa, contato, telefone…"><kbd>/</kbd></div></div>
-      <div class="list-sub"><span class="title" id="queueTitle">Conversas</span><span class="n" id="queueCount"></span><span class="live-status" id="liveStatus" title="A inbox atualiza sozinha"><span class="live-dot"></span><span class="live-txt">ao vivo</span><span class="live-ago"></span></span><button class="live-refresh" onclick="loadAll({fast:true,force:true})" title="Atualizar agora">Atualizar</button><span class="spacer"></span><button class="filter-toggle" id="filterToggle" onclick="toggleFilters()">Filtros</button></div>
+      <div class="zone-head"><div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input id="search" placeholder="Buscar empresa, contato, telefone…"><kbd>/</kbd></div></div>
+      <div class="list-sub"><span class="title" id="queueTitle">Conversas</span><span class="n" id="queueCount"></span><span class="live-status" id="liveStatus" title="A inbox atualiza sozinha"><span class="live-dot"></span><span class="live-txt">ao vivo</span><span class="live-ago"></span></span><span class="spacer"></span><button class="filter-toggle" id="filterToggle" onclick="toggleFilters()">Filtros</button></div>
+      <div class="refresh-strip"><button class="refresh-conv" onclick="refreshInboxNewOnly()" title="Atualizar a lista de conversas sem recarregar a página inteira">↻ ATUALIZAR CONVERSAS</button><small>Busca novas mensagens sem perder sua posição</small></div>
       <div class="filterbar" id="filterbar"></div>
+      <div class="pull-refresh" id="pullRefresh" aria-hidden="true"><div class="pr-card"><span class="pr-spinner"></span><span class="pr-txt">Puxe para atualizar</span></div></div>
       <div class="scroll"><div class="cards" id="cards"></div></div>
       <div class="bulkbar" id="bulkbar" hidden>
         <span class="bb-n" id="bbN"></span>
@@ -4915,9 +7211,10 @@ function renderShell(){
       <div class="modal-card dispatch-modal-card">
         <div class="modal-head"><b id="dispatchModalTitle">Disparos</b><span class="modal-sub" id="dispatchModalSub"></span><span class="spacer"></span><button class="icon-btn" onclick="closeDispatchModal()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
         <div class="modal-body" id="dispatchModalBody"></div>
-        <div class="modal-foot">Lista read-only do ledger operacional. Abrir conversa leva para o chat/auditoria correspondente.</div>
+        <div class="modal-foot">Lista somente leitura dos envios reais. Abrir conversa leva direto para o chat correspondente.</div>
       </div>
     </div>
+    <div id="dispatchTooltip" class="dispatch-tooltip" hidden></div>
     <div class="modal wizard-modal" id="bulkWizard" hidden>
       <div class="modal-scrim" onclick="closeBulkWizard()"></div>
       <div class="modal-card">
@@ -4928,13 +7225,59 @@ function renderShell(){
       </div>
     </div>
   </div>`;
-  const s=document.getElementById('search'); s.oninput=()=>{drawCards(); scheduleIdentityHydration('search');};
+  const s=document.getElementById('search');
+  const debouncedSearch=debounce(()=>{setSearchBusy(false); resetListPagination(); drawCards(); scheduleIdentityHydration('search'); restoreListScroll();},380);
+  s.oninput=()=>{setSearchBusy(true); debouncedSearch();};
+  const listScroller=getListScroller();
+  if(listScroller) listScroller.addEventListener('scroll',()=>{ clearTimeout(listScrollTimer); listScrollTimer=setTimeout(saveListScroll,120); }, {passive:true});
   document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='TEXTAREA'){e.preventDefault();s.focus()}if(e.key==='Escape'){ if(connOpen) closeConnections(); closePipeModal(); }});
   const ta=document.getElementById('composer');
   ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(160,ta.scrollHeight)+'px'});
   ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendReply()}});
   renderQuick();
   applyTheme(currentTheme());
+  installPullToReload();
+}
+
+let pullReloadBound=false;
+function pullRefreshEl(){return document.getElementById('pullRefresh')}
+function setPullRefreshState(dy=0, armed=false, loading=false){
+  const el=pullRefreshEl(); if(!el) return;
+  const shown=Math.max(0, Math.min(72, dy));
+  const pct=Math.max(0, Math.min(1, shown/85));
+  el.style.transform=`translateY(${Math.round(shown*.55-18)}px)`;
+  el.style.setProperty('--pull-rot', Math.round(pct*300)+'deg');
+  el.classList.toggle('visible', shown>8 || loading);
+  el.classList.toggle('armed', !!armed);
+  el.classList.toggle('loading', !!loading);
+  const txt=el.querySelector('.pr-txt');
+  if(txt) txt.textContent=loading?'Atualizando conversas…':(armed?'Solte para atualizar':'Puxe para atualizar');
+}
+function installPullToReload(){
+  if(pullReloadBound) return;
+  const scroller=document.querySelector('.list .scroll');
+  if(!scroller) return;
+  pullReloadBound=true;
+  let startY=0, pulling=false, armed=false;
+  const reset=()=>{pulling=false; armed=false; document.body.classList.remove('pull-reload-armed'); setPullRefreshState(0,false,false)};
+  scroller.addEventListener('touchstart',e=>{
+    if(viewMode!=='conversas' || scroller.scrollTop>0 || (e.touches||[]).length!==1){ reset(); return; }
+    startY=e.touches[0].clientY; pulling=true; armed=false; setPullRefreshState(0,false,false);
+  }, {passive:true});
+  scroller.addEventListener('touchmove',e=>{
+    if(!pulling || !(e.touches||[]).length) return;
+    const dy=Math.max(0,e.touches[0].clientY-startY);
+    armed=dy>85 && scroller.scrollTop<=0;
+    document.body.classList.toggle('pull-reload-armed', armed);
+    setPullRefreshState(dy, armed, false);
+  }, {passive:true});
+  scroller.addEventListener('touchend',()=>{
+    const shouldReload=armed;
+    pulling=false; armed=false; document.body.classList.remove('pull-reload-armed');
+    if(shouldReload){ setPullRefreshState(90,true,true); setTimeout(()=>window.location.reload(),260); }
+    else setPullRefreshState(0,false,false);
+  }, {passive:true});
+  scroller.addEventListener('touchcancel',reset, {passive:true});
 }
 
 function routeForViewMode(mode){return mode==='foco'?'/foco':(mode==='gestao'?'/gestao':'/conversas')}
@@ -4952,7 +7295,10 @@ function setViewMode(mode, opts={}){
   }
   document.querySelectorAll('[data-view]').forEach(btn=>btn.classList.toggle('on', btn.dataset.view===viewMode));
   const app=document.getElementById('app');
-  if(app) app.classList.toggle('analytics-mode', viewMode==='foco'||viewMode==='gestao');
+  const analyticsMode=(viewMode==='foco'||viewMode==='gestao');
+  if(app) app.classList.toggle('analytics-mode', analyticsMode);
+  // Gestão/Foco são dashboards analíticos; manter visual dark mesmo se a preferência salva for White.
+  applyTheme(currentTheme(), {visualOnly:true});
   const ft=document.getElementById('filterToggle');
   if(ft) ft.style.display=(viewMode==='conversas')?'':'none';
   const fb=document.getElementById('filterbar');
@@ -4986,6 +7332,8 @@ function quickTemplates(){
     {label:'Assinatura', text:`Aqui é ${sdr}, da Zydon. Fico à disposição por aqui.`},
   ];
 }
+const FIRST_SDR_QUESTION='Como você imagina que a Zydon poderia te apoiar?';
+const FIRST_SDR_QUESTION_ALT='Como você imagina que a Zydon poderia te apoiar?';
 function suggestedReplyForActive(){
   const c=convs.find(x=>x.id===active);
   if(!c) return '';
@@ -5019,14 +7367,14 @@ function suggestedReplyForActive(){
     return `Perfeito! Posso te sugerir alguns horários para uma conversa rápida sobre a ${emp}. Funciona melhor pra você ainda esta semana ou na próxima? Me diz um período que eu já reservo.`;
   // Se HubSpot mostra deal em etapa avançada, não tratar como lead frio.
   if(dealStage && /diagn[oó]stico|apresenta|proposta|negocia/i.test(dealStage))
-    return `Boa. Pelo que vi aqui, a ${emp} já está em andamento com a Zydon. Me conta o que você precisa agora que eu te ajudo a dar sequência do jeito certo.`;
+    return `Boa. Pelo que vi aqui, a ${emp} já está em andamento com a Zydon. Vi o diagnóstico inicial e queria começar pelo motivo principal.\n\n${FIRST_SDR_QUESTION}`;
   // Lead respondeu, mas sem pedido de reunião -> reconhecer e perguntar próximo ponto.
   if(replied)
     return `Valeu pelo retorno! Para eu te orientar do jeito certo na ${emp}, me conta qual é a principal dúvida ou o ponto mais importante pra você nesse momento?`;
   // Sem resposta após primeiro contato -> follow-up leve.
   if(noReply)
-    return `Oi! Passando rápido só para retomar nosso contato. Se fizer sentido conversarmos sobre a ${emp}, é só me avisar por aqui que eu sigo com você. Sem pressa.`;
-  return `Oi, tudo bem? Estou por aqui para te ajudar com a ${emp}. Como posso te apoiar?`;
+    return `Oi! Passando rápido só para retomar nosso contato. Vi o diagnóstico inicial e queria começar pelo motivo principal.\n\n${FIRST_SDR_QUESTION}`;
+  return `Oi, tudo bem? Aqui é ${sdr}, da Zydon.\n\nFiz uma análise inicial da ${emp} para entender onde a Zydon poderia ajudar.\n\n${FIRST_SDR_QUESTION}`;
 }
 function suggestReply(){
   const ta=document.getElementById('composer'); if(!ta) return;
@@ -5082,11 +7430,13 @@ function renderChipsSummary(){
 }
 
 function statusMeta(c){
+  if(c.paused) return {dot:'muted', label:'Pausado'};
   if(c.connected && !c.needsQR) return {dot:'on', label:'Online'};
   if(c.needsQR) return {dot:'warn', label:'Precisa de QR'};
   return {dot:'off', label:'Offline'};
 }
 function recMeta(r){return ({
+  pausado:{label:'Pausado',cls:''},
   ok:{label:'Tudo certo',cls:'rec-ok'},
   reconectar:{label:'Reconectar',cls:'rec-bad'},
   aquecer:{label:'Aquecer chip',cls:'rec-warn'},
@@ -5121,7 +7471,7 @@ function portByNum(port){ return (adminPorts||[]).find(p=>String(p.port)===Strin
 function chipForPort(port){ return (chips||[]).find(c=>String(c.port)===String(port)) || {}; }
 function userForOwner(owner){ return (adminUsers||[]).find(u=>u.id===owner) || {}; }
 function roleLabel(role){ return role==='sdr'?'SDR':'Comunicador'; }
-function statusPill(c){ const sm=statusMeta(c||{}); return `<span class="pill ${sm.dot==='on'?'good':(sm.dot==='warn'?'warn':'bad')}"><span class="st ${sm.dot}"></span>${sm.label}</span>`; }
+function statusPill(c){ const sm=statusMeta(c||{}); const cls=sm.dot==='on'?'good':(sm.dot==='warn'?'warn':(sm.dot==='muted'?'':'bad')); return `<span class="pill ${cls}"><span class="st ${sm.dot}"></span>${sm.label}</span>`; }
 function renderTeamCard(portMeta, kind){
   const c=chipForPort(portMeta.port), u=userForOwner(portMeta.owner), isSdr=(kind==='sdr');
   const online = c && Object.keys(c).length ? statusPill(c) : '<span class="pill warn">sem leitura de status</span>';
@@ -5159,7 +7509,8 @@ function renderConnections(){
   const all=(me&&me.admin&&adminPorts.length?adminPorts:(chips||[])).slice().sort((a,b)=>a.port-b.port);
   const online=all.filter(p=>{const c=chipForPort(p.port); return c.connected && !c.needsQR}).length;
   const qr=all.filter(p=>{const c=chipForPort(p.port); return c.needsQR || (!c.connected && c.port)}).length;
-  document.getElementById('connSub').textContent=`${all.length} portas · ${online} online`+(qr?` · ${qr} aguardando QR`:'');
+  const paused=all.filter(p=>{const c=chipForPort(p.port); return c.paused || p.paused}).length;
+  document.getElementById('connSub').textContent=`${all.length} portas · ${online} online`+(paused?` · ${paused} pausado(s)`: '')+(qr?` · ${qr} aguardando QR`:'');
   const sdrs=all.filter(p=>p.role==='sdr');
   const comms=all.filter(p=>p.role!=='sdr');
   const current=connTab==='comunicadores'?comms:sdrs;
@@ -5214,13 +7565,15 @@ function renderFilters(){} // noop — filtros SDR/chip removidos da UI
 function ownerUidOfConv(c){ return c.dealOwnerUid || c.sharedOwnerUid || c.sdrHintUid || ((portMeta[c.port]||{}).owner) || ''; }
 function ownerLabelOfConv(c){ return c.dealOwnerLabel || ((me&&me.ports||[]).find(p=>String(p.port)===String(c.port))||{}).owner || ownerUidOfConv(c).replace(/_/g,' '); }
 function filterActiveCount(){ return [filterOwner,filterStatus,filterChip].filter(Boolean).length; }
+function resetListPagination(){ listVisibleCount=LIST_PAGE_SIZE; }
+function listSignature(){ return [filterOwner,filterStatus,filterChip,(document.getElementById('search')?.value||''),viewMode].join('|'); }
 function toggleFilters(){ filterOpen=!filterOpen; renderFilterBar(); }
-function setWFilter(k,v){ if(k==='owner') filterOwner=v||''; if(k==='status') filterStatus=v||''; if(k==='chip') filterChip=v||''; drawCards(); }
-function clearWFilters(){ filterOwner=''; filterStatus=''; filterChip=''; drawCards(); }
+function setWFilter(k,v){ saveListScroll(); if(k==='owner') filterOwner=v||''; if(k==='status') filterStatus=v||''; if(k==='chip') filterChip=v||''; resetListPagination(); drawCards(); scrollListTop(false); }
+function clearWFilters(){ saveListScroll(); filterOwner=''; filterStatus=''; filterChip=''; resetListPagination(); drawCards(); scrollListTop(false); }
 function renderFilterBar(){
   const bar=document.getElementById('filterbar'), btn=document.getElementById('filterToggle'); if(!bar) return;
   const owners=[...new Map(convs.map(c=>[ownerUidOfConv(c), ownerLabelOfConv(c)]).filter(x=>x[0]).sort((a,b)=>String(a[1]).localeCompare(String(b[1])))).entries()];
-  const chips=[...new Map(convs.map(c=>[String(c.port), chipLabel(c.port)]).filter(x=>x[0]).sort((a,b)=>String(a[1]).localeCompare(String(b[1])))).entries()];
+  const chips=[...new Map([...(me&&me.ports||[]).map(p=>[String(p.port), `${p.label||chipLabel(p.port)}${p.paused?' (pausado)':''}`]), ...convs.map(c=>[String(c.port), chipLabel(c.port)])].filter(x=>x[0]).sort((a,b)=>String(a[1]).localeCompare(String(b[1])))).entries()];
   const n=filterActiveCount();
   if(btn){ btn.classList.toggle('on', filterOpen||n>0); btn.textContent=n?`Filtros (${n})`:'Filtros'; }
   bar.classList.toggle('open', filterOpen||n>0);
@@ -5364,7 +7717,7 @@ function filterPipeModalList(){
   if(q) rows=rows.filter(r=>[r.dealName,r.stageLabel,r.owner,String(r.activityCount||0)].join(' ').toLowerCase().includes(q));
   const list=document.getElementById('pipeModalList'), count=document.getElementById('pipeModalCount');
   if(count) count.textContent=`${rows.length} negócio${rows.length===1?'':'s'}`;
-  if(list) list.innerHTML=rows.map(pipeLeadModalRow).join('')||'<div class="mini-empty">Nenhum negócio neste card.</div>';
+  if(list) list.innerHTML=limitedHtmlRows(rows, pipeLeadModalRow, ANALYTICS_MODAL_LIMIT, 'negócios')||'<div class="mini-empty">Nenhum negócio neste card.</div>';
 }
 function openPipeModal(bucket='all'){
   const modal=document.getElementById('pipeModal'); if(!modal) return;
@@ -5379,6 +7732,137 @@ function openPipeModal(bucket='all'){
 }
 function closePipeModal(){const m=document.getElementById('pipeModal'); if(m) m.hidden=true;}
 function pipeCardKey(e,bucket){if(e.key==='Enter'||e.key===' '){e.preventDefault();openPipeModal(bucket);}}
+function brDateKeyFromTs(ts){try{return new Date((+ts||0)*1000).toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'})}catch(e){return ''}}
+function brShortDateFromKey(k){try{return new Date(k+'T12:00:00').toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}catch(e){return k||'sem data'}}
+function todayBrKey(){try{return new Date().toLocaleDateString('en-CA',{timeZone:'America/Sao_Paulo'})}catch(e){return ''}}
+function addDaysKey(baseKey,days){try{const d=new Date(baseKey+'T12:00:00'); d.setDate(d.getDate()+days); return d.toISOString().slice(0,10)}catch(e){return ''}}
+function pipelineTaskRows(){
+  const rows=[];
+  pfDeals().forEach(deal=>{
+    (deal.activities||[]).forEach(a=>{
+      const kind=String(a.kind||a.type||'').toLowerCase();
+      if(kind!=='task' && String(a.type||'').toUpperCase()!=='TODO') return;
+      const status=String(a.status||'').toUpperCase()||'SEM_STATUS';
+      const dateKey=a.ts?brDateKeyFromTs(a.ts):'';
+      rows.push({id:a.id||`${deal.dealId}:${rows.length}`, dealId:deal.dealId, dealName:deal.dealName||'Negócio sem nome', stageLabel:deal.stageLabel||'Sem etapa', owner:deal.owner||'Sem SDR', url:deal.url||'#', label:a.label||a.type||'Tarefa HubSpot', ts:a.ts||0, dateKey, status, completed:status==='COMPLETED', isCall:!!a.isCall, isWhatsApp:!!a.isWhatsApp});
+    });
+  });
+  return rows;
+}
+function taskBucketLabel(t){
+  if(t.completed) return 'concluída';
+  const today=todayBrKey();
+  if(!t.dateKey) return 'sem data';
+  if(t.dateKey<today) return 'atrasada';
+  if(t.dateKey===today) return 'hoje';
+  return 'próxima';
+}
+function taskNormText(txt){return String(txt||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/https?:\/\/\S+/g,' ').replace(/\b\d{1,2}[\/-]\d{1,2}(?:[\/-]\d{2,4})?\b/g,' ').replace(/\b\d{2}:\d{2}\b/g,' ').replace(/\b\d+\b/g,' ').replace(/[•|–—_()[\]{}:;,.!?]+/g,' ').replace(/\s+/g,' ').trim()}
+function taskIsAutomationRecord(t){
+  const s=taskNormText(t.label);
+  return /\b(enviado|enviada|disparado|disparada)\b/.test(s) || (/\bwhatsapp\b/.test(s) && /diagnostico|cadencia|confirmacao|lembrete/.test(s));
+}
+function taskActionScope(t){return taskIsAutomationRecord(t)?'Automação / envio':'Ação do SDR'}
+function taskTypeLabel(t){
+  const s=taskNormText(t.label);
+  if(taskIsAutomationRecord(t)) return 'WhatsApp / automação';
+  if(t.isCall||/\bligacao\b|\bligar\b|\btelefone\b|\bcall\b/.test(s)) return 'Ligação';
+  if(/preparar diagnostico|montar diagnostico|gerar diagnostico/.test(s)) return 'Preparar diagnóstico';
+  if(t.isWhatsApp||/\bwhatsapp\b|\bzap\b|\bmensagem\b/.test(s)) return 'WhatsApp manual';
+  if(/follow up|followup|retomar|retorno|sem resposta|cadencia/.test(s)) return 'Follow-up';
+  if(/reuniao|agenda|no show|confirmar|meet|remarcar/.test(s)) return 'Agenda / reunião';
+  if(/proposta|comercial|contrato|negociacao|tabela/.test(s)) return 'Comercial';
+  return 'Tarefa operacional';
+}
+function taskPatternLabel(t){
+  const s=taskNormText(t.label);
+  if(/whatsapp/.test(s)&&/diagnostico/.test(s)&&/enviad/.test(s)) return 'Diagnóstico enviado por WhatsApp';
+  if(/whatsapp/.test(s)&&/cadencia/.test(s)) return 'Cadência WhatsApp enviada';
+  if(/lembrete de diagnostico enviado/.test(s)) return 'Lembrete de diagnóstico enviado';
+  if(/confirmacao de diagnostico enviada/.test(s)) return 'Confirmação de diagnóstico enviada';
+  if(/preparar diagnostico/.test(s)) return 'Preparar diagnóstico';
+  if(/whatsapp/.test(s)&&/confirm/.test(s)) return 'WhatsApp de confirmação';
+  if(/whatsapp/.test(s)&&(/follow|retomar|sem resposta|cadencia/.test(s))) return 'WhatsApp de follow-up';
+  if(/ligar|ligacao|telefone|call/.test(s)) return 'Ligação / tentativa de contato';
+  if(/no show|remarcar|reagendar/.test(s)) return 'No-show / remarcação';
+  if(/agenda|reuniao|meet/.test(s)) return 'Agenda / reunião';
+  if(/proposta|comercial|contrato|negociacao|tabela/.test(s)) return 'Proposta / comercial';
+  const words=s.split(' ').filter(w=>w.length>2 && !['para','com','sem','dos','das','uma','por','que','hubspot','tarefa'].includes(w)).slice(0,4);
+  return words.length?words.map(w=>w.charAt(0).toUpperCase()+w.slice(1)).join(' '):'Outras tarefas';
+}
+function taskGroupRows(tasks, mode){
+  const today=todayBrKey(), m=new Map();
+  tasks.forEach(t=>{const label=mode==='type'?taskTypeLabel(t):taskPatternLabel(t); const key=taskNormText(label); if(!m.has(key))m.set(key,{key,label,total:0,open:0,overdue:0,today:0,future:0,completed:0,automation:0,human:0,owners:{},examples:[]}); const g=m.get(key); const auto=taskIsAutomationRecord(t); g.total++; if(auto)g.automation++; else g.human++; g.owners[t.owner]=(g.owners[t.owner]||0)+1; if(g.examples.length<3)g.examples.push(t.label); if(t.completed)g.completed++; else{g.open++; if(t.dateKey&&t.dateKey<today)g.overdue++; else if(t.dateKey===today)g.today++; else g.future++;}});
+  return [...m.values()].sort((a,b)=>b.human-a.human||b.open-a.open||b.total-a.total||a.label.localeCompare(b.label,'pt-BR'));
+}
+function taskGroupBars(tasks){
+  const byType=taskGroupRows(tasks,'type').slice(0,8), byPattern=taskGroupRows(tasks,'pattern').slice(0,10), max=Math.max(1,...byType.map(x=>x.total),...byPattern.map(x=>x.total));
+  const row=(g,mode)=>{const topOwners=Object.entries(g.owners).sort((a,b)=>b[1]-a[1]).slice(0,2).map(([o,n])=>`${o}: ${n}`).join(' · '); const autoOnly=g.automation>0&&g.human===0; const summary=autoOnly?`${g.total} registros de envio · não é fila de tarefa humana`:`${g.open} abertas · ${g.overdue} atrasadas · ${g.today} hoje · ${g.completed} concluídas`; return `<button class="task-group-row ${autoOnly?'auto-record':''}" onclick="openTaskGroup('${mode}','${encodeURIComponent(g.key)}')"><div><b>${esc(g.label)}</b><span>${summary}${topOwners?' · '+esc(topOwners):''}</span></div><strong>${g.total}</strong><i style="width:${Math.max(6,Math.round(g.total/max*100))}%"></i></button>`};
+  const human=tasks.filter(t=>!taskIsAutomationRecord(t)).length, auto=tasks.length-human;
+  return `<div class="task-group-board"><div class="task-group-head"><b>Agrupamento das tarefas</b><span>Separa ação real do SDR de registro de envio/automação para não confundir volume pendente.</span></div><div class="task-scope-strip"><div><b>${human}</b><span>Ações do SDR</span></div><div><b>${auto}</b><span>Envios/automação registrados</span></div></div><div class="task-group-grid"><section><h4>Por tipo de ação</h4>${byType.map(g=>row(g,'type')).join('')||'<div class="mini-empty">Sem tarefas neste filtro.</div>'}</section><section><h4>Por padrão da descrição</h4>${byPattern.map(g=>row(g,'pattern')).join('')||'<div class="mini-empty">Sem padrões neste filtro.</div>'}</section></div></div>`;
+}
+function taskPassFilter(t){
+  const b=taskBucketLabel(t);
+  if(focusTaskFilter==='open') return !t.completed;
+  if(focusTaskFilter==='overdue') return b==='atrasada';
+  if(focusTaskFilter==='today') return b==='hoje';
+  if(focusTaskFilter==='future') return b==='próxima' || b==='sem data';
+  if(focusTaskFilter==='completed') return t.completed;
+  return true;
+}
+function taskRowHtml(t){
+  const when=t.dateKey?brShortDateFromKey(t.dateKey):'sem data';
+  const flags=[t.isWhatsApp?'WhatsApp':'',t.isCall?'ligação':''].filter(Boolean).join(' · ');
+  return `<div class="focus-row"><div><div class="fn">${esc(t.dealName)}</div><div class="fm">${esc(t.owner)} · ${esc(when)} · ${esc(taskBucketLabel(t))} · ${esc(t.stageLabel)}${flags?' · '+esc(flags):''}</div><div class="mini-hint">${esc(t.label).slice(0,160)}</div></div><div class="fa"><a class="bb-btn" href="${esc(t.url)}" target="_blank" rel="noopener noreferrer">HubSpot</a></div></div>`;
+}
+function focusFilterControls(){
+  const owners=[...new Set(pfAllDeals().map(r=>r.owner).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'pt-BR'));
+  const stages=(pf().stageRows||[]).filter(r=>r.total||pfAllDeals().some(d=>d.stageId===r.stageId));
+  const opt=(value,label,sel)=>`<option value="${esc(value)}" ${value===sel?'selected':''}>${esc(label)}</option>`;
+  return `<div class="focus-filterbar"><div><b>Filtro do Foco</b><span>Escopo padrão: 5 primeiras etapas do pipe e os 3 SDRs ativos.</span></div><label>SDR<select onchange="setPipeFilter('owner',this.value)">${opt('all','Todos os SDRs',focusOwnerFilter)}${owners.map(o=>opt(o,o,focusOwnerFilter)).join('')}</select></label><label>Etapa<select onchange="setPipeFilter('stage',this.value)">${opt('all','5 primeiras etapas',focusStageFilter)}${stages.map(s=>opt(s.stageId,s.label,focusStageFilter)).join('')}</select></label><label>Status<select onchange="setPipeFilter('task',this.value)">${[['open','Abertas'],['overdue','Atrasadas'],['today','Hoje'],['future','Próximas'],['completed','Concluídas'],['all','Todas']].map(([v,l])=>opt(v,l,focusTaskFilter)).join('')}</select></label></div>`;
+}
+function sdrTaskFocusBlock(){
+  const allTasks=pipelineTaskRows();
+  const tasks=allTasks.filter(taskPassFilter);
+  if(!allTasks.length) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Foco SDR: tarefas e atividades</b><span>Carregando tarefas do HubSpot… Se houver snapshot salvo, ele aparece enquanto a atualização termina.</span></div></div>${focusFilterControls()}</div>`;
+  const today=todayBrKey();
+  const open=tasks.filter(t=>!t.completed);
+  const overdue=open.filter(t=>t.dateKey&&t.dateKey<today).sort((a,b)=>(a.ts||0)-(b.ts||0));
+  const todayRows=open.filter(t=>t.dateKey===today).sort((a,b)=>(a.ts||0)-(b.ts||0));
+  const future=open.filter(t=>!t.dateKey||t.dateKey>today).sort((a,b)=>(a.ts||9999999999)-(b.ts||9999999999));
+  const completedRecent=tasks.filter(t=>t.completed&&t.dateKey>=addDaysKey(today,-7)).sort((a,b)=>(b.ts||0)-(a.ts||0));
+  const totalOpenAll=allTasks.filter(t=>!t.completed).length;
+  const expectedToday=Math.max(1, Math.round(totalOpenAll/5));
+  const resolvedToday=allTasks.filter(t=>t.completed&&t.dateKey===today).length;
+  const dueTodayAll=allTasks.filter(t=>!t.completed&&t.dateKey===today).length;
+  const donePct=Math.min(100, Math.round(resolvedToday/expectedToday*100));
+  const pressurePct=Math.min(100, Math.round((overdue.length+todayRows.length)/Math.max(1,open.length)*100));
+  const byOwner=new Map();
+  tasks.forEach(t=>{const o=t.owner||'Sem SDR'; if(!byOwner.has(o)) byOwner.set(o,{owner:o,total:0,open:0,overdue:0,today:0,future:0,completed:0}); const x=byOwner.get(o); x.total++; if(t.completed)x.completed++; else{x.open++; if(t.dateKey&&t.dateKey<today)x.overdue++; else if(t.dateKey===today)x.today++; else x.future++;}});
+  const ownerRows=[...byOwner.values()].sort((a,b)=>(b.overdue+b.today)-(a.overdue+a.today)||b.open-a.open||b.total-a.total).slice(0,8);
+  const nextKeys=[0,1,2,3,4,5,6].map(i=>addDaysKey(today,i));
+  const dayCols=nextKeys.map(k=>{const rows=tasks.filter(t=>!t.completed&&t.dateKey===k); const owners={}; rows.forEach(t=>owners[t.owner]=(owners[t.owner]||0)+1); const top=Object.entries(owners).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([o,n])=>`<small>${esc(o)}: ${n}</small>`).join(''); return `<div class="task-day"><b>${rows.length}</b><span>${esc(brShortDateFromKey(k))}</span>${top||'<small>sem tarefa</small>'}</div>`;}).join('');
+  const ownerHtml=ownerRows.map(o=>`<div class="focus-row"><div><div class="fn">${esc(o.owner)}</div><div class="fm">${o.overdue} atrasadas · ${o.today} hoje · ${o.future} próximas · ${o.completed} concluídas</div></div><div class="fa"><button onclick="openOwnerTasks('${esc(o.owner)}')">Ver</button></div></div>`).join('');
+  const critical=[...overdue,...todayRows].slice(0,10).map(taskRowHtml).join('')||'<div class="mini-empty">Sem tarefa atrasada ou vencendo hoje neste filtro.</div>';
+  const stale=(pf().stale||pipelineFocusLoading)?'<em class="task-stale">atualizando HubSpot em segundo plano</em>':'';
+  return `<div class="dispatch-board task-focus"><div class="dispatch-head"><div><b>Foco SDR: tarefas e atividades</b><span>Gerir o dia: o que está vencido, o que vence hoje, quem está carregado e se o ritmo realizado bate o esperado. ${stale}</span></div><div class="dispatch-total">${open.length} abertas</div></div>${focusFilterControls()}<div class="task-meaning"><div><b>Atrasadas</b><span>tarefa aberta com prazo anterior a hoje; primeira fila de cobrança.</span></div><div><b>Hoje</b><span>vence no dia; precisa virar ação ou reagendamento.</span></div><div><b>Próximas</b><span>futuras/sem data; planejamento da semana.</span></div><div><b>Concluídas</b><span>volume realizado no HubSpot.</span></div></div><div class="follow-kpis"><div><b>${overdue.length}</b><span>Atrasadas</span><small>fora do prazo</small></div><div><b>${todayRows.length}</b><span>Hoje</span><small>vencem no dia</small></div><div><b>${future.length}</b><span>Próximas</span><small>futuras/sem data</small></div><div><b>${completedRecent.length}</b><span>Concluídas</span><small>últimos 7 dias</small></div></div><div class="task-expected"><div><b>Realizado vs esperado hoje</b><span>${resolvedToday} concluídas hoje · esperado ${expectedToday} · ${dueTodayAll} ainda vencem hoje</span><div class="task-track"><i style="width:${donePct}%"></i></div></div><div><b>Pressão do dia</b><span>${overdue.length+todayRows.length} tarefas exigem ação agora neste filtro</span><div class="task-track warn"><i style="width:${pressurePct}%"></i></div></div></div>${taskGroupBars(tasks)}<div class="task-day-grid">${dayCols}</div><div class="focus-split"><div class="focus-section"><h4>Por SDR <em>${ownerRows.length}</em></h4>${ownerHtml||'<div class="mini-empty">Sem SDR com tarefa neste filtro.</div>'}</div><div class="focus-section"><h4>Prioridade de hoje <em>${overdue.length+todayRows.length}</em></h4>${critical}</div></div></div>`;
+}
+function openTaskGroup(mode,key){
+  const decoded=decodeURIComponent(key||'');
+  const rows=pipelineTaskRows().filter(taskPassFilter).filter(t=>taskNormText(mode==='type'?taskTypeLabel(t):taskPatternLabel(t))===decoded).sort((a,b)=>Number(a.completed)-Number(b.completed)||(a.ts||9999999999)-(b.ts||9999999999));
+  const label=rows[0]?(mode==='type'?taskTypeLabel(rows[0]):taskPatternLabel(rows[0])):'Grupo de tarefas';
+  document.getElementById('pipeModalTitle').textContent=`${mode==='type'?'Tipo':'Padrão'} · ${label}`;
+  document.getElementById('pipeModalSub').textContent=`${rows.length} tarefa${rows.length===1?'':'s'} agrupadas por ${mode==='type'?'tipo detectado':'descrição parecida'}`;
+  document.getElementById('pipeModalBody').innerHTML=`<div class="pipe-modal-list">${limitedHtmlRows(rows, taskRowHtml, ANALYTICS_MODAL_LIMIT, 'tarefas')||'<div class="mini-empty">Sem tarefas neste grupo.</div>'}</div>`;
+  document.getElementById('pipeModal').hidden=false;
+}
+function openOwnerTasks(owner){
+  const rows=pipelineTaskRows().filter(t=>String(t.owner||'')===String(owner||'')).sort((a,b)=>Number(a.completed)-Number(b.completed)||(a.ts||9999999999)-(b.ts||9999999999));
+  document.getElementById('pipeModalTitle').textContent=`Tarefas · ${owner||'SDR'}`;
+  document.getElementById('pipeModalSub').textContent=`${rows.length} tarefa${rows.length===1?'':'s'} no HubSpot`;
+  document.getElementById('pipeModalBody').innerHTML=`<div class="pipe-modal-list">${limitedHtmlRows(rows, taskRowHtml, ANALYTICS_MODAL_LIMIT, 'tarefas')||'<div class="mini-empty">Sem tarefas para este SDR.</div>'}</div>`;
+  document.getElementById('pipeModal').hidden=false;
+}
 function pipeSimpleHeader(title){
   const p=pf(), total=p.total||pfStats().total||0;
   return `<div class="pipe-simple-head"><div><b>${esc(title)}</b><span>Deals das etapas comerciais acompanhados por quantidade de atividades registradas no HubSpot. A leitura é simples: etapa do pipe na linha, quantidade de atividades nas colunas.</span></div><div class="stamp">${total} negócios · HubSpot</div></div>`;
@@ -5421,15 +7905,45 @@ function performanceDashboard(){
   </div>`;
 }
 
-function dispatchColor(i){return ['#CDEB00','#1F3D2B','#6B7C00','#8AA000','#D7B56D','#7BA05B','#B6C74A','#455A35'][i%8]}
+function dispatchColor(i){return ['#CDEB00','#1F3D2B','#6B7C00','#8AA000','#D7B56D','#7BA05B','#B6C74A','#455A35','#A16207','#6B7280'][i%10]}
+let followupSelectedType='';
+let agendaSelectedType='';
 function setDispatchChip(port){dispatchSelectedChip=(dispatchSelectedChip===String(port)?'':String(port)); drawCards()}
+function setDispatchType(key){dispatchSelectedType=(dispatchSelectedType===String(key)?'':String(key)); drawCards()}
+function setFollowupType(key){followupSelectedType=String(key||''); drawCards()}
+function setAgendaType(key){agendaSelectedType=String(key||''); drawCards()}
 function setDispatchDay(day){dispatchSelectedDay=(dispatchSelectedDay===String(day)?'':String(day)); drawCards()}
 function previewDispatchDay(day){if(dispatchSelectedDay!==String(day)){dispatchSelectedDay=String(day); drawCards()}}
 function dispatchDayObj(day){return ((dispatchStats&&dispatchStats.days)||[]).find(d=>d.date===day)||null}
+function dispatchTypeDayObj(day){return (((dispatchStats&&dispatchStats.typeStats)||{}).days||[]).find(d=>d.date===day)||null}
+function hideDispatchTooltip(){const t=document.getElementById('dispatchTooltip'); if(t) t.hidden=true}
+function showDispatchTooltip(e, mode, day){
+  const t=document.getElementById('dispatchTooltip'); if(!t) return;
+  const fmt=d=>{try{return new Date(d+'T12:00:00').toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}catch(_){return d}};
+  let rows=[], total=0, title='';
+  if(mode==='type'){
+    const d=dispatchTypeDayObj(day)||{types:{},total:0};
+    const series=(((dispatchStats&&dispatchStats.typeStats)||{}).series||[]);
+    total=d.total||0; title=`${fmt(day)} · ${total} envios`;
+    rows=series.map((c,i)=>({label:c.label,n:(d.types||{})[String(c.key)]||0,color:dispatchColor(i)})).filter(x=>x.n);
+  }else{
+    const d=dispatchDayObj(day)||{chips:{},total:0};
+    const series=(dispatchStats&&dispatchStats.chips||[]).slice(0,8);
+    total=d.total||0; title=`${fmt(day)} · ${total} mensagens`;
+    rows=series.map((c,i)=>({label:c.label||('Chip '+c.port),n:(d.chips||{})[String(c.port)]||0,color:dispatchColor(i)})).filter(x=>x.n);
+  }
+  t.innerHTML=`<b>${esc(title)}</b>${rows.map(r=>`<div class="tt-row"><span><i class="tt-dot" style="background:${r.color}"></i>${esc(r.label)}</span><strong>${r.n}</strong></div>`).join('')||'<div class="tt-row"><span>Sem camada neste dia</span><strong>0</strong></div>'}`;
+  t.hidden=false;
+  const pad=14, w=260, h=Math.min(320, 34+rows.length*28);
+  let x=(e&&e.clientX||0)+pad, y=(e&&e.clientY||0)+pad;
+  if(x+w>window.innerWidth) x=(e&&e.clientX||0)-w-pad;
+  if(y+h>window.innerHeight) y=(e&&e.clientY||0)-h-pad;
+  t.style.left=Math.max(8,x)+'px'; t.style.top=Math.max(8,y)+'px';
+}
 function closeDispatchModal(){const m=document.getElementById('dispatchModal'); if(m) m.hidden=true}
 function dispatchEventRow(ev){
-  const meta=[ev.time,ev.chip,ev.sdr?('SDR '+ev.sdr):'',ev.phone,ev.type].filter(Boolean).join(' · ');
-  const msg=ev.message||'Mensagem sem texto no ledger; registro de envio operacional.';
+  const meta=[ev.time,ev.chip,ev.kindLabel||'',ev.sdr?('SDR '+ev.sdr):'',ev.phone,ev.type].filter(Boolean).join(' · ');
+  const msg=ev.message||'Envio sem texto visível.';
   const link=ev.link||'#';
   return `<div class="dispatch-msg-row"><div><h4>${esc(ev.empresa||ev.contact||ev.to||'Envio')}</h4><small>${esc(meta)}</small><p>${esc(msg)}</p></div><a href="${esc(link)}" target="_blank" rel="noopener noreferrer">Abrir conversa</a></div>`;
 }
@@ -5441,12 +7955,23 @@ function openDispatchModal(day, port=''){
   const chip=(dispatchStats&&dispatchStats.chips||[]).find(c=>String(c.port)===String(port));
   document.getElementById('dispatchModalTitle').textContent=`${rows.length} disparo${rows.length===1?'':'s'} · ${day}`;
   document.getElementById('dispatchModalSub').textContent=chip?`${chip.label} · porta ${chip.port}`:'Todos os chips do dia';
-  document.getElementById('dispatchModalBody').innerHTML=`<div class="dispatch-modal-list">${rows.map(dispatchEventRow).join('')||'<div class="mini-empty">Sem registros neste recorte.</div>'}</div>`;
+  document.getElementById('dispatchModalBody').innerHTML=`<div class="dispatch-modal-list">${limitedHtmlRows(rows, dispatchEventRow, ANALYTICS_MODAL_LIMIT, 'disparos')||'<div class="mini-empty">Sem registros neste recorte.</div>'}</div>`;
+  document.getElementById('dispatchModal').hidden=false;
+}
+function openDispatchTypeModal(day, key=''){
+  const d=dispatchTypeDayObj(day); if(!d) return;
+  const keys=key?[String(key)]:Object.keys(d.details||{});
+  const rows=[]; keys.forEach(k=>{((d.details||{})[String(k)]||[]).forEach(ev=>rows.push(ev))});
+  rows.sort((a,b)=>String(a.time||'').localeCompare(String(b.time||'')));
+  const series=(((dispatchStats&&dispatchStats.typeStats)||{}).series||[]).find(c=>String(c.key)===String(key));
+  document.getElementById('dispatchModalTitle').textContent=`${rows.length} envio${rows.length===1?'':'s'} · ${day}`;
+  document.getElementById('dispatchModalSub').textContent=series?series.label:'Todos os tipos do dia';
+  document.getElementById('dispatchModalBody').innerHTML=`<div class="dispatch-modal-list">${limitedHtmlRows(rows, dispatchEventRow, ANALYTICS_MODAL_LIMIT, 'disparos')||'<div class="mini-empty">Sem registros neste recorte.</div>'}</div>`;
   document.getElementById('dispatchModal').hidden=false;
 }
 function dispatchStatsBlock(){
   const ds=dispatchStats;
-  if(dispatchStatsLoading && !ds) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Disparos WhatsApp por dia</b><span>Carregando ledger de envios…</span></div></div></div>`;
+  if(dispatchStatsLoading && !ds) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Disparos WhatsApp por dia</b><span>Carregando envios reais…</span></div></div></div>`;
   if(!ds) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Disparos WhatsApp por dia</b><span>Sem dados carregados ainda.</span></div><button class="bb-btn" onclick="loadDispatchStats(true)">Carregar</button></div></div>`;
   if(ds.error) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Disparos WhatsApp por dia</b><span>${esc(ds.error)}</span></div><button class="bb-btn" onclick="loadDispatchStats(true)">Tentar de novo</button></div></div>`;
   const chips=(ds.chips||[]).slice(0,8);
@@ -5456,16 +7981,201 @@ function dispatchStatsBlock(){
   const cols=(ds.days||[]).map(day=>{
     const h=Math.max(day.total?8:2,Math.round((day.total||0)/max*190));
     const segs=chips.map((c,i)=>{const n=(day.chips||{})[String(c.port)]||0; if(!n) return ''; const dim=dispatchSelectedChip&&dispatchSelectedChip!==String(c.port); return `<i class="dispatch-seg ${dim?'dim':''}" title="${esc(c.label)} · ${n}" style="height:${Math.max(4,Math.round(n/(day.total||1)*100))}%;background:${dispatchColor(i)}"></i>`}).join('');
-    return `<button class="dispatch-col ${dispatchSelectedDay===day.date?'on':''}" onmouseenter="previewDispatchDay('${esc(day.date)}')" onclick="openDispatchModal('${esc(day.date)}',dispatchSelectedChip)" title="${esc(fmtDay(day.date))} · ${day.total||0} mensagens · clique para ver detalhes"><span class="n">${day.total||0}</span><div class="dispatch-stack" style="--h:${h}px">${segs}</div><span class="d">${esc(fmtDay(day.date))}</span></button>`;
+    return `<button class="dispatch-col ${dispatchSelectedDay===day.date?'on':''}" onmouseenter="previewDispatchDay('${esc(day.date)}');showDispatchTooltip(event,'chip','${esc(day.date)}')" onmousemove="showDispatchTooltip(event,'chip','${esc(day.date)}')" onmouseleave="hideDispatchTooltip()" onclick="openDispatchModal('${esc(day.date)}',dispatchSelectedChip)" title="${esc(fmtDay(day.date))} · ${day.total||0} mensagens · clique para ver detalhes"><span class="n">${day.total||0}</span><div class="dispatch-stack" style="--h:${h}px">${segs}</div><span class="d">${esc(fmtDay(day.date))}</span></button>`;
   }).join('');
   const legend=chips.map((c,i)=>`<button class="dispatch-chip ${dispatchSelectedChip===String(c.port)?'on':''}" onclick="setDispatchChip('${c.port}')"><i class="dispatch-dot" style="background:${dispatchColor(i)}"></i>${esc(c.label||('Chip '+c.port))}</button>`).join('');
   const detailLines=chips.map((c,i)=>{const n=(selectedDay.chips||{})[String(c.port)]||0; if(!n) return ''; return `<button class="line" onclick="openDispatchModal('${esc(selectedDay.date)}','${c.port}')"><i class="dispatch-dot" style="background:${dispatchColor(i)}"></i>${esc(c.label)}: <b>${n}</b></button>`}).join('')||'<span class="line">Sem disparos neste dia.</span>';
   const rank=chips.map((c,i)=>`<div class="r ${dispatchSelectedChip===String(c.port)?'on':''}" onclick="setDispatchChip('${c.port}')"><b>${c.total||0}</b><span><i class="dispatch-dot" style="display:inline-block;background:${dispatchColor(i)}"></i> ${esc(c.label||('Chip '+c.port))} · porta ${c.port}</span></div>`).join('');
-  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Disparos WhatsApp por dia · por chip</b><span>Colunas verticais empilhadas. Passe o mouse para prévia; clique na coluna ou no total do chip para abrir os envios com mensagem e link. Fonte: ${esc(ds.source||'ledger')} · últimos ${ds.periodDays||14} dias · ${esc(ds.scope||'')}</span></div><div class="dispatch-total">${ds.total||0} mensagens</div></div><div class="dispatch-chart">${cols||'<div class="mini-empty">Sem disparos no período.</div>'}</div><div class="dispatch-legend">${legend}</div><div class="dispatch-detail"><b>${esc(fmtDay(selectedDay.date||''))} · ${selectedDay.total||0} mensagens</b><div class="lines">${detailLines}</div></div><div class="dispatch-rank">${rank}</div></div>`;
+  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Painel WhatsApp · envios por chip</b><span>Volume operacional por pessoa/chip, com leitura por dia e drill-down nas mensagens reais. Use para entender cadência, concentração e capacidade de resposta. ${ds.visibleDays||((ds.days||[]).length)||0} dias com dados · ${esc(ds.scope||'')}</span></div><div class="dispatch-total">${ds.total||0} mensagens</div></div><div class="dispatch-chart">${cols||'<div class="mini-empty">Sem disparos no período.</div>'}</div><div class="dispatch-legend">${legend}</div><div class="dispatch-detail"><b>${esc(fmtDay(selectedDay.date||''))} · ${selectedDay.total||0} mensagens</b><div class="lines">${detailLines}</div></div><div class="dispatch-rank">${rank}</div></div>`;
 }
-
+function dispatchTypeStatsBlock(){
+  const ds=(dispatchStats&&dispatchStats.typeStats)||null;
+  if(dispatchStatsLoading && !ds) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Disparos por tipo</b><span>Carregando classificação…</span></div></div></div>`;
+  if(!ds) return '';
+  const series=(ds.series||[]).slice(0,10);
+  const days=ds.days||[];
+  const max=Math.max(1,...days.map(d=>d.total||0));
+  const fmtDay=d=>{try{return new Date(d+'T12:00:00').toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}catch(e){return d}};
+  const selectedDay=days.find(d=>d.date===dispatchSelectedDay)||[...days].reverse().find(d=>(d.total||0)>0)||days[0]||{date:'',types:{},total:0};
+  const cols=days.map(day=>{
+    const h=Math.max(day.total?8:2,Math.round((day.total||0)/max*190));
+    const segs=series.map((c,i)=>{const n=(day.types||{})[String(c.key)]||0; if(!n) return ''; const dim=dispatchSelectedType&&dispatchSelectedType!==String(c.key); return `<i class="dispatch-seg ${dim?'dim':''}" title="${esc(c.label)} · ${n}" style="height:${Math.max(4,Math.round(n/(day.total||1)*100))}%;background:${dispatchColor(i)}"></i>`}).join('');
+    return `<button class="dispatch-col ${dispatchSelectedDay===day.date?'on':''}" onmouseenter="previewDispatchDay('${esc(day.date)}');showDispatchTooltip(event,'type','${esc(day.date)}')" onmousemove="showDispatchTooltip(event,'type','${esc(day.date)}')" onmouseleave="hideDispatchTooltip()" onclick="openDispatchTypeModal('${esc(day.date)}',dispatchSelectedType)" title="${esc(fmtDay(day.date))} · ${day.total||0} envios · clique para ver detalhes"><span class="n">${day.total||0}</span><div class="dispatch-stack" style="--h:${h}px">${segs}</div><span class="d">${esc(fmtDay(day.date))}</span></button>`;
+  }).join('');
+  const legend=series.map((c,i)=>`<button class="dispatch-chip ${dispatchSelectedType===String(c.key)?'on':''}" onclick="setDispatchType('${esc(c.key)}')"><i class="dispatch-dot" style="background:${dispatchColor(i)}"></i>${esc(c.label)}</button>`).join('');
+  const detailLines=series.map((c,i)=>{const n=(selectedDay.types||{})[String(c.key)]||0; if(!n) return ''; return `<button class="line" onclick="openDispatchTypeModal('${esc(selectedDay.date)}','${esc(c.key)}')"><i class="dispatch-dot" style="background:${dispatchColor(i)}"></i>${esc(c.label)}: <b>${n}</b></button>`}).join('')||'<span class="line">Sem envios neste dia.</span>';
+  const rank=series.map((c,i)=>`<div class="r ${dispatchSelectedType===String(c.key)?'on':''}" onclick="setDispatchType('${esc(c.key)}')"><b>${c.total||0}</b><span><i class="dispatch-dot" style="display:inline-block;background:${dispatchColor(i)}"></i> ${esc(c.label)}</span></div>`).join('');
+  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Mix de abordagens · por dia</b><span>Distribuição dos tipos comerciais usados na operação: diagnóstico, follow-ups, primeiro contato, pausa por sumiço, tratativas e outros. Clique para abrir as mensagens que compõem cada camada.</span></div><div class="dispatch-total">${ds.total||0} mensagens</div></div><div class="dispatch-chart">${cols||'<div class="mini-empty">Sem disparos no período.</div>'}</div><div class="dispatch-legend">${legend}</div><div class="dispatch-detail"><b>${esc(fmtDay(selectedDay.date||''))} · ${selectedDay.total||0} mensagens</b><div class="lines">${detailLines}</div></div><div class="dispatch-rank">${rank}</div></div>`;
+}
+function followupPerformanceBlock(){
+  const fp=(dispatchStats&&dispatchStats.followupPerformance)||null;
+  if(dispatchStatsLoading && !fp) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Retorno por follow-up</b><span>Calculando respostas reais dos leads…</span></div></div></div>`;
+  if(!fp) return '';
+  const ranked=(fp.ranked||[]).filter(r=>(r.sent||0)>0).slice(0,10);
+  const approaches=((fp.approaches||[]).filter(r=>(r.sent||0)>0));
+  const board=approaches.length?approaches:ranked;
+  const series=(fp.series||[]).filter(r=>(r.sent||0)>0);
+  const days=fp.days||[];
+  const fmtDay=d=>{try{return new Date(d+'T12:00:00').toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}catch(e){return d}};
+  const best=board[0]||ranked[0]||null;
+  const totalSent=fp.totalSent||0, totalReturns=fp.totalReturns||0;
+  const globalRate=totalSent?totalReturns/totalSent*100:0;
+  const selected=board.find(r=>String(r.key)===String(followupSelectedType))||best||board[0]||series[0]||null;
+  if(!followupSelectedType && selected) followupSelectedType=String(selected.key||'');
+  const color=(idx)=>['#CDEB00','#25D366','#1877F2','#8B5CF6','#F59E0B','#EF476F','#14B8A6','#94A3B8'][idx%8];
+  const cards=board.slice(0,8).map((r,i)=>{const sample=((r.examples||[])[0]||{}).message || ((r.variants||[])[0]||{}).text || r.question || r.angle || ''; return `<button class="follow-card ${selected&&String(selected.key)===String(r.key)?'on':''}" onclick="setFollowupType('${esc(r.key)}')"><span>${esc(r.label||r.parentLabel||'Abordagem')}</span>${r.versionLabel?`<i class="version-pill">${esc(r.versionLabel)}</i>`:''}<b style="color:${color(i)}">${pct(r.responseRate||0)}</b><small>${r.returns||0}/${r.sent||0} retornos${r.avgResponseHours!=null?' · '+esc(r.avgResponseHours)+'h média':''}</small>${sample?`<em>${esc(sample).slice(0,120)}</em>`:''}</button>`}).join('')||'<div class="mini-empty">Ainda sem abordagens classificadas.</div>';
+  const maxRate=Math.max(1,...board.map(r=>Number(r.responseRate||0)));
+  const bars=board.slice(0,8).map((r,i)=>{const sample=((r.variants||[])[0]||{}).text||r.question||r.angle||''; return `<div class="cadence-bar ${selected&&String(selected.key)===String(r.key)?'on':''}" onclick="setFollowupType('${esc(r.key)}')"><span><b>#${i+1} ${esc(r.label||'Abordagem')}</b>${sample?`<small>${esc(sample).slice(0,88)}</small>`:''}</span><div><i style="width:${Math.max(3,Math.round((Number(r.responseRate||0)/maxRate)*100))}%;background:${color(i)}"></i></div><b>${pct(r.responseRate||0)}<small>${r.returns||0}/${r.sent||0}</small></b></div>`}).join('')||'<div class="mini-empty">Sem taxa para comparar ainda.</div>';
+  const trendKey=selected&&(selected.parentKey||selected.key);
+  const trend=(trendKey?days:[]).map(d=>{const m=((d.types||{})[String(trendKey)]||{}); return `<span title="${esc(fmtDay(d.date))} · ${m.returns||0}/${m.sent||0}">${esc(fmtDay(d.date))}<b>${pct(m.responseRate||0)}</b></span>`}).join('')||'<span><b>—</b></span>';
+  const examples=(selected&&selected.examples)||[];
+  const ex=examples[0]||{};
+  const ap=ex.approach||selected||{};
+  const previewMsg=ex.message||((selected&&selected.variants&&selected.variants[0]&&selected.variants[0].text)||'Sem amostra de mensagem com retorno ainda para esta abordagem.');
+  const replyText=ex.responseHours!=null?`Lead respondeu depois de ${esc(ex.responseHours)}h`:'Aguardando respostas suficientes';
+  const steps=((ap.structure||selected&&selected.structure)||[]).map(x=>`<span>${esc(x)}</span>`).join('');
+  const variants=((selected&&selected.variants)||[]).map((v,i)=>`<div class="variant-row"><b>Variação ${String.fromCharCode(65+i)}</b><span>${v.sent||0} envios · ${v.returns||0} respostas · ${pct(v.responseRate||0)}</span><em>${esc(v.text||'')}</em></div>`).join('');
+  const exampleRows=examples.map((e,i)=>`<div class="approach-row"><b>${esc(e.empresa||'Lead')}</b><span>${esc(e.approachLabel||((e.approach||{}).label)||selected.label)}${e.angle?' · '+esc(e.angle):''}${e.responseHours!=null?' · respondeu em '+esc(e.responseHours)+'h':''}</span>${e.question?`<em>${esc(e.question)}</em>`:''}${e.link?`<a href="${esc(e.link)}" target="_blank" rel="noopener">abrir</a>`:''}</div>`).join('')||'<div class="mini-empty">Sem exemplo com retorno neste recorte.</div>';
+  const selectedAngle=(selected&&(selected.angle||selected.question)) || ap.angle || ex.angle || '';
+  return `<div class="follow-ads"><div class="follow-head"><div><em>PERFORMANCE DOS FOLLOW-UPS</em><b>Abordagens que mais geram resposta</b><span>Veja quais mensagens realmente geram resposta — por abordagem enviada, momento da cadência e retorno do lead.</span></div><strong>${pct(globalRate)}<small>taxa de resposta</small></strong></div>
+    <div class="follow-kpis"><div><b>${pct(globalRate)}</b><span>Taxa de resposta</span><small>respostas / mensagens</small></div><div><b>${totalReturns}</b><span>Respostas reais</span><small>leads que responderam</small></div><div><b>${totalSent}</b><span>Mensagens analisadas</span><small>${fp.windowHours?Math.round(fp.windowHours/24):7} dias de janela</small></div><div><b>${best?esc(best.label):'—'}</b><span>Melhor abordagem</span><small>${best?pct(best.responseRate||0):'sem dados'}</small></div></div>
+    <div class="follow-pick"><div class="follow-pick-title">Escolha uma abordagem real para ver mensagem, variações e conversas</div><div class="follow-cards">${cards}</div></div>
+    <div class="follow-detail"><div class="follow-bars"><h4>Conversão por abordagem</h4>${bars}</div><div class="follow-preview"><h4>Mensagem que gerou resposta</h4><div class="chat-preview"><div class="bubble out">${esc(previewMsg)}<small>${esc(ex.time||'09:02')}</small></div><div class="bubble in">${esc(replyText)}<small>${ex.responseHours!=null?'retorno real':'—'}</small></div></div>${ex.link?`<a class="bb-btn" href="${esc(ex.link)}" target="_blank" rel="noopener">Abrir conversa</a>`:''}<div class="follow-trend">${trend}</div></div></div>
+    <div class="approach-panel"><div><h4>Abordagem selecionada</h4><p>${esc((selected&&selected.label)||ap.label||ex.approachLabel||'Abordagem')}</p>${selectedAngle?`<strong>${esc(selectedAngle)}</strong>`:''}<div class="approach-steps">${steps}</div></div><div class="approach-list"><h4>Variações usadas</h4>${variants||exampleRows}</div></div>
+  </div>`;
+}
+function agendaPerformanceBlock(){
+  const ag=(dispatchStats&&dispatchStats.agendaPerformance)||null;
+  if(dispatchStatsLoading && !ag) return `<div class="follow-ads"><div class="follow-head"><div><em>CONVERSÃO PARA AGENDA</em><b>Calculando agendas…</b><span>Ligando envios, respostas e reuniões do HubSpot.</span></div></div></div>`;
+  if(!ag) return '';
+  const board=(ag.ranked||[]).filter(r=>(r.sent||0)>0);
+  const best=board.find(r=>(r.meetings||0)>0)||board[0]||null;
+  const selected=board.find(r=>String(r.key)===String(agendaSelectedType))||best||board[0]||null;
+  if(!agendaSelectedType && selected) agendaSelectedType=String(selected.key||'');
+  const totalSent=ag.totalSent||0, totalMeetings=ag.totalMeetings||0, totalRealized=ag.totalRealizedMeetings||0;
+  const meetingRate=totalSent?totalMeetings/totalSent*100:0;
+  const realizedRate=totalSent?totalRealized/totalSent*100:0;
+  const color=(idx)=>['#25D366','#CDEB00','#1877F2','#8B5CF6','#F59E0B','#EF476F','#14B8A6','#94A3B8'][idx%8];
+  const cards=board.slice(0,8).map((r,i)=>{const sample=((r.meetingExamples||[])[0]||{}).message || ((r.variants||[])[0]||{}).text || r.question || r.angle || ''; return `<button class="follow-card ${selected&&String(selected.key)===String(r.key)?'on':''}" onclick="setAgendaType('${esc(r.key)}')"><span>${esc(r.label||r.parentLabel||'Abordagem')}</span>${r.versionLabel?`<i class="version-pill">${esc(r.versionLabel)}</i>`:''}<b style="color:${color(i)}">${pct(r.meetingRate||0)}</b><small>${r.meetings||0}/${r.sent||0} agendas · ${r.realizedMeetings||0} realizadas</small>${sample?`<em>${esc(sample).slice(0,120)}</em>`:''}</button>`}).join('')||'<div class="mini-empty">Ainda sem agendas atribuídas neste período.</div>';
+  const maxRate=Math.max(1,...board.map(r=>Number(r.meetingRate||0)));
+  const bars=board.slice(0,8).map((r,i)=>`<div class="cadence-bar ${selected&&String(selected.key)===String(r.key)?'on':''}" onclick="setAgendaType('${esc(r.key)}')"><span><b>#${i+1} ${esc(r.label||'Abordagem')}</b><small>${esc(r.parentLabel||'')} · ${r.returns||0} respostas</small></span><div><i style="width:${Math.max(3,Math.round((Number(r.meetingRate||0)/maxRate)*100))}%;background:${color(i)}"></i></div><b>${pct(r.meetingRate||0)}<small>${r.meetings||0}/${r.sent||0}</small></b></div>`).join('')||'<div class="mini-empty">Sem agenda para comparar ainda.</div>';
+  const examples=(selected&&selected.meetingExamples)||[];
+  const ex=examples[0]||{};
+  const previewMsg=ex.message||((selected&&selected.variants&&selected.variants[0]&&selected.variants[0].text)||'Ainda sem mensagem atribuída a agenda nesta abordagem.');
+  const meetLabel=ex.meetingStart?`Agenda marcada para ${esc(hsDateTime(ex.meetingStart))}`:'Agenda atribuída no HubSpot';
+  const outcome=ex.realized?'reunião realizada':(ex.future?'agenda futura':(ex.cancelled?'cancelada':'aguardando outcome'));
+  const variants=((selected&&selected.variants)||[]).map((v,i)=>`<div class="variant-row"><b>Variação ${String.fromCharCode(65+i)}</b><span>${v.sent||0} envios · ${v.meetings||0} agendas · ${v.realizedMeetings||0} realizadas</span><em>${esc(v.text||'')}</em></div>`).join('');
+  const exampleRows=examples.map(e=>`<div class="approach-row"><b>${esc(e.empresa||'Lead')}</b><span>${e.meetingStart?esc(hsDateTime(e.meetingStart)):'agenda'} · ${e.realized?'realizada':(e.future?'futura':(e.cancelled?'cancelada':'sem outcome'))}</span>${e.question?`<em>${esc(e.question)}</em>`:''}${e.link?`<a href="${esc(e.link)}" target="_blank" rel="noopener">abrir</a>`:''}</div>`).join('')||'<div class="mini-empty">Sem exemplo de agenda para esta abordagem.</div>';
+  return `<div class="follow-ads agenda-ads"><div class="follow-head"><div><em>CONVERSÃO PARA AGENDA</em><b>Abordagens que viram reunião</b><span>Além de resposta, veja quais mensagens levam o lead até agenda marcada e quais já aparecem como realizadas no HubSpot.</span></div><strong>${pct(meetingRate)}<small>taxa para agenda</small></strong></div>
+    <div class="follow-kpis"><div><b>${pct(meetingRate)}</b><span>Conv. para agenda</span><small>agendas / mensagens</small></div><div><b>${totalMeetings}</b><span>Agendas marcadas</span><small>reuniões associadas</small></div><div><b>${totalRealized}</b><span>Realizadas</span><small>HubSpot outcome concluído</small></div><div><b>${best?esc(best.label):'—'}</b><span>Melhor abordagem</span><small>${best?pct(best.meetingRate||0):'sem dados'}</small></div></div>
+    <div class="follow-pick"><div class="follow-pick-title">Escolha a abordagem para ver mensagens que levaram a agenda</div><div class="follow-cards">${cards}</div></div>
+    <div class="follow-detail"><div class="follow-bars"><h4>Conversão para agenda por abordagem</h4>${bars}</div><div class="follow-preview"><h4>Mensagem que levou à agenda</h4><div class="chat-preview"><div class="bubble out">${esc(previewMsg)}<small>${esc(ex.time||'')}</small></div><div class="bubble in">${meetLabel}<small>${esc(outcome)}</small></div></div>${ex.link?`<a class="bb-btn" href="${esc(ex.link)}" target="_blank" rel="noopener">Abrir conversa</a>`:''}</div></div>
+    <div class="approach-panel"><div><h4>Leitura comercial</h4><p>${selected?esc(selected.label):'Abordagem'}</p><strong>${selected?`${selected.meetings||0} agendas · ${selected.realizedMeetings||0} realizadas · ${pct(selected.meetingRate||0)}`:'sem dados'}</strong><div class="approach-steps"><span>educar</span><span>converter resposta</span><span>levar para agenda</span><span>realizar reunião</span></div></div><div class="approach-list"><h4>Variações / agendas</h4>${variants||exampleRows}</div></div>
+  </div>`;
+}
+function conversionFunnelBlock(){
+  const cf=(dispatchStats&&dispatchStats.conversionFunnel)||null;
+  if(dispatchStatsLoading && !cf) return `<div class="follow-ads"><div class="follow-head"><div><em>FUNIL POR ABORDAGEM</em><b>Calculando funil completo…</b><span>Mensagem, resposta, agenda e reunião realizada.</span></div></div></div>`;
+  if(!cf) return '';
+  const totalSent=+cf.totalSent||0, totalReturns=+cf.totalReturns||0, totalMeetings=+cf.totalMeetings||0, totalRealized=+cf.totalRealizedMeetings||0;
+  const stages=[['Enviadas',totalSent,100],['Responderam',totalReturns,totalSent?totalReturns/totalSent*100:0],['Agendaram',totalMeetings,totalSent?totalMeetings/totalSent*100:0],['Realizadas',totalRealized,totalSent?totalRealized/totalSent*100:0]];
+  const best=(cf.approaches||[]).slice().sort((a,b)=>(+b.realizedMeetingRate||0)-(+a.realizedMeetingRate||0)||(+b.meetingRate||0)-(+a.meetingRate||0)||(+b.responseRate||0)-(+a.responseRate||0)||(+b.sent||0)-(+a.sent||0)).slice(0,6);
+  const nfmt=(v)=>Number(v||0).toLocaleString('pt-BR');
+  const stageHtml=stages.map((x,i)=>`<div><b>${nfmt(x[1])}</b><span>${esc(x[0])}</span><small>${i?pct(x[2]):'base'}</small></div>`).join('');
+  const max=Math.max(1,...stages.map(x=>+x[1]||0));
+  const pipe=stages.map((x,i)=>`<div class="funnel-step"><span>${esc(x[0])}</span><div><i style="width:${Math.max(4,Math.round((+x[1]||0)/max*100))}%"></i></div><b>${nfmt(x[1])}<small>${i?pct(x[2]):''}</small></b></div>`).join('');
+  const rows=best.map((r,i)=>{const f=r.funnel||[]; const gap=(r.mainGap||{}).label||'analisar gargalo'; return `<div class="cadence-bar"><span><b>#${i+1} ${esc(r.label||'Abordagem')} ${r.versionLabel?`· ${esc(r.versionLabel)}`:''}</b><small>${esc(r.parentLabel||'')} · gargalo: ${esc(gap)}</small></span><div><i style="width:${Math.max(3,+r.meetingRate||0)}%"></i></div><b>${pct(r.meetingRate||0)}<small>${(f[1]&&f[1].count)||0} resp · ${(f[2]&&f[2].count)||0} ag.</small></b></div>`}).join('')||'<div class="mini-empty">Ainda sem funil suficiente.</div>';
+  return `<div class="follow-ads"><div class="follow-head"><div><em>FUNIL COMPLETO POR ABORDAGEM</em><b>Mensagem → resposta → agenda → realizada</b><span>Mostra onde cada versão está perdendo conversão. A realização só entra quando o HubSpot confirma a reunião concluída.</span></div><strong>${pct(totalSent?totalMeetings/totalSent*100:0)}<small>agenda / envio</small></strong></div><div class="follow-kpis">${stageHtml}</div><div class="follow-detail"><div class="follow-bars"><h4>Funil consolidado</h4>${pipe}</div><div class="follow-bars"><h4>Melhores versões por agenda/realizada</h4>${rows}</div></div></div>`;
+}
+function lossRankingBlock(){
+  const lr=(dispatchStats&&dispatchStats.lossRanking)||null;
+  if(!lr) return '';
+  const items=(lr.items||[]).filter(x=>(+x.count||0)>0);
+  if(!items.length) return '';
+  const blocks=items.map(it=>{const rows=(it.approaches||[]).slice(0,4).map(a=>`<div class="focus-row"><div><div class="fn">${esc(a.label||'Abordagem')} ${a.versionLabel?`<span class="version-pill">${esc(a.versionLabel)}</span>`:''}</div><div class="fm">${esc(a.parentLabel||'')} · ${a.returns||0} respostas · ${a.meetings||0} agendas · ${a.realizedMeetings||0} realizadas</div></div><div class="fa"><button onclick="setFollowupType('${esc(a.key)}')">Ver</button></div></div>`).join('')||'<div class="mini-empty">Sem exemplos suficientes.</div>'; return `<div class="focus-section"><h4>${esc(it.label)} <em>${Number(it.count||0).toLocaleString('pt-BR')}</em></h4><p class="mini-hint">${esc(it.nextAction||'Próxima ação')}</p>${rows}</div>`}).join('');
+  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Onde estamos perdendo conversão</b><span>Ranking executivo para transformar métrica em ação: resposta sem agenda, agenda sem realização/status e follow-ups sem retorno.</span></div></div><div class="mgmt-grid">${blocks}</div></div>`;
+}
+function rescueQueueBlock(){
+  const b=focusBuckets();
+  const respondedNoAgenda=b.responder.slice(0,8);
+  const confirmMeeting=b.reunioes.slice(0,8);
+  const revive=b.quentes.slice(0,8);
+  const stuck=b.stress.slice(0,8);
+  const card=(title,items,reason,kind)=>`<div class="focus-section rescue-${kind}"><h4>${esc(title)} <em>${items.length}</em></h4>${items.map(c=>focusRow(c,reason(c))).join('')||'<div class="mini-empty">Nada crítico aqui.</div>'}</div>`;
+  return `<div class="cad-board"><div class="cad-board-head"><div><b>Fila de resgate operacional</b><span>Casos que merecem ação agora. Nada é enviado automaticamente: é abrir conversa, revisar contexto e agir com segurança.</span></div><button onclick="selectFocus('responder',8)">Selecionar respostas</button></div><div class="mgmt-grid">${card('Responder agora',respondedNoAgenda,c=>'lead respondeu · retomar rápido','reply')}${card('Converter para agenda',revive,c=>'respondeu antes · falta próximo passo','agenda')}${card('Confirmar reunião',confirmMeeting,c=>'agenda/reunião no contexto · confirmar presença/status','meeting')}${card('Reativar oportunidade',stuck,c=>`${cadenceProgress(c)} · ${cadenceNextAction(c)}`,'revive')}</div></div>`;
+}
+function todayActionsBlock(){
+  const b=focusBuckets();
+  if(!b.base.length&&!b.pipeTotal) return '';
+  const responder=b.responder.slice(0,20);
+  const converter=b.quentes.filter(c=>+(c.responses||0)>0&&!isMeeting(c)).slice(0,20);
+  const confirmar=b.reunioes.slice(0,20);
+  const noShowDeals=((pipelineFocus&&pipelineFocus.deals)||[]).filter(r=>r.stageId==='1376131958').slice(0,20);
+  const semMov=b.semAtividade.slice(0,20);
+  function todayCard(c,motivo,sla){
+    const owner=c.dealOwnerLabel||ownerLabelOfConv(c)||chipLabel(c.port);
+    const hs=c.hubspotDealId?`<a class="bb-btn" href="https://app.hubspot.com/contacts/48590774/deal/${esc(c.hubspotDealId)}" target="_blank" rel="noopener noreferrer">HubSpot</a>`:'';
+    return `<div class="focus-row"><div><div class="fn">${esc(c.title||'Lead')}</div><div class="fm">${esc(motivo)} · ${esc(owner)} · ${esc(sla)}</div></div><div class="fa"><button onclick="openConv('${esc(c.id)}')">Abrir conversa</button>${hs}</div></div>`;
+  }
+  function dealCard(r,motivo){
+    return `<div class="focus-row"><div><div class="fn">${esc(r.dealName||'Negócio')}</div><div class="fm">${esc(motivo)} · ${esc(r.owner||'—')}</div></div><div class="fa"><a class="bb-btn" href="${esc(r.url||'')}" target="_blank" rel="noopener noreferrer">HubSpot</a></div></div>`;
+  }
+  function sect(title,rows,renderFn){
+    if(!rows.length) return '';
+    const more=rows.length>20?`<div class="modal-limit-note">Mostrando 20 de ${rows.length}</div>`:'';
+    return `<div class="focus-section"><h4>${esc(title)} <em>${rows.length}</em></h4>${rows.slice(0,20).map(renderFn).join('')}${more}</div>`;
+  }
+  const blocks=[
+    sect('Responder agora',responder,c=>todayCard(c,'lead respondeu · retomar rápido',relTime(c.lastIncomingTime||c.lastTime))),
+    sect('Converter para agenda',converter,c=>todayCard(c,'respondeu · falta próximo passo',relTime(c.lastIncomingTime||c.lastTime))),
+    sect('Confirmar reunião',confirmar,c=>todayCard(c,'agenda no contexto',relTime(c.lastTime))),
+    sect('Resolver no-show',noShowDeals,r=>dealCard(r,'No Show · verificar próxima ação')),
+    sect('Sem movimento',semMov,c=>todayCard(c,`parado há ${ageDays(c.lastTime)} dias`,relTime(c.lastTime))),
+  ].filter(Boolean).join('');
+  if(!blocks) return '';
+  return `<div class="cad-board"><div class="cad-board-head"><div><b>Ações de hoje</b><span>O que precisa de atenção agora. Nada é enviado automaticamente.</span></div></div><div class="mgmt-grid">${blocks}</div></div>`;
+}
+function lossByOwnerBlock(){
+  const lr=(dispatchStats&&dispatchStats.lossRanking)||null;
+  if(!lr) return '';
+  const byOwner=(lr.byOwner||[]).filter(x=>(+x.respondedNoMeeting||0)>0||(+x.meetingNoOutcome||0)>0);
+  if(!byOwner.length) return '';
+  const rows=byOwner.map(x=>`<div class="focus-row"><div><div class="fn">${esc(x.owner)}</div><div class="fm">${+x.respondedNoMeeting||0} responderam sem agenda · ${+x.meetingNoOutcome||0} agendas sem status · ${+x.noResponseFollowup||0} sem resposta após follow-up</div></div></div>`).join('');
+  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Perdas por SDR</b><span>Onde cada SDR está perdendo conversão: resposta sem agenda e agenda sem status final.</span></div></div><div class="focus-section">${rows||'<div class="mini-empty">Sem perdas mapeadas ainda.</div>'}</div></div>`;
+}
+function approachReviewBlock(){
+  const ar=(dispatchStats&&dispatchStats.approachReview)||[];
+  if(!ar.length) return '';
+  const rows=ar.map(x=>{
+    const pct2=v=>`${Number(v||0).toFixed(1)}%`;
+    const reasons=(x.reasons||[]).map(r=>`<span class="version-pill">${esc(r.label)}</span>`).join(' ');
+    const preview=x.messagePreview?`<em style="display:block;margin-top:4px;font-size:11px;color:var(--muted)">${esc(x.messagePreview.slice(0,180))}…</em>`:'';
+    return `<div class="focus-row" style="flex-direction:column;align-items:flex-start;gap:4px"><div style="display:flex;align-items:center;gap:8px;width:100%"><div class="fn">${esc(x.label||'Abordagem')}${x.versionLabel?` <span class="version-pill">${esc(x.versionLabel)}</span>`:''}</div>${reasons}</div><div class="fm">${esc(x.parentLabel||'')} · ${x.sent} envios · ${pct2(x.responseRate)} resposta · ${pct2(x.meetingRate)} agenda</div>${preview}</div>`;
+  }).join('');
+  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Abordagens para revisar</b><span>Versões com amostra suficiente mas baixa conversão. Oportunidade de ajustar abertura ou CTA.</span></div></div><div class="focus-section">${rows||'<div class="mini-empty">Nenhuma abordagem com amostra mínima e baixo desempenho.</div>'}</div></div>`;
+}
+function agendaOutcomeBlock(){
+  const ao=(dispatchStats&&dispatchStats.agendaOutcome)||null;
+  if(!ao) return '';
+  const s=ao.summary||{};
+  if(!(+s.total||0)) return '';
+  const kpis=[['Futuras',s.future||0,'agendas marcadas'],['Realizadas',s.realized||0,'HubSpot confirmou'],['Atualizar status',s.pastNoOutcome||0,'passadas sem desfecho'],['Canceladas',s.cancelled||0,'no-show/canceladas']].map(([l,v,sub])=>`<div class="mgmt-card"><b>${v}</b><span>${l}</span><small style="font-size:10px;color:var(--muted)">${sub}</small></div>`).join('');
+  const byOwner=(ao.byOwner||[]).map(x=>`<div class="focus-row"><div><div class="fn">${esc(x.owner)}</div><div class="fm">futuras: ${x.future||0} · realizadas: ${x.realized||0} · atualizar: ${x.pastNoOutcome||0} · canceladas: ${x.cancelled||0}</div></div></div>`).join('');
+  const pastRows=(ao.pastNoOutcome||[]).slice(0,8).map(x=>`<div class="focus-row"><div><div class="fn">${esc(x.empresa)}</div><div class="fm">${esc(x.sdr)} · ${x.meetingStart?hsDateTime(x.meetingStart):'data desconhecida'} · atualizar status da reunião</div></div>${x.dealId?`<div class="fa"><a class="bb-btn" href="https://app.hubspot.com/contacts/48590774/deal/${esc(x.dealId)}" target="_blank" rel="noopener noreferrer">HubSpot</a></div>`:''}</div>`).join('');
+  return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Status das agendas</b><span>Reuniões marcadas pelo Channel: futuras, realizadas, passadas aguardando atualização e canceladas.</span></div></div><div class="follow-kpis">${kpis}</div>${byOwner?`<div class="focus-section"><h4>Por SDR</h4>${byOwner}</div>`:''}${pastRows?`<div class="focus-section"><h4>Atualizar status da reunião <em>${s.pastNoOutcome||0}</em></h4>${pastRows}</div>`:''}</div>`;
+}
+function managementFilterControls(){
+  const all=pfAllDeals();
+  const owners=[...new Set(all.map(r=>r.owner).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'pt-BR'));
+  const stages=(pf().stageRows||[]).filter(r=>r.total||all.some(d=>d.stageId===r.stageId));
+  const opt=(value,label,sel)=>`<option value="${esc(value)}" ${String(value)===String(sel)?'selected':''}>${esc(label)}</option>`;
+  const shown=pfDeals().length;
+  const total=all.length;
+  const active=pfFilterActive();
+  return `<div class="focus-filterbar mgmt-top-filter"><div><b>Filtros da Gestão</b><span>${total?`Mostrando ${shown} de ${total} negócios.`:'Carregando dados do HubSpot…'} Mesmos filtros do Foco, aplicados às matrizes e listas da Gestão.</span></div><label>SDR<select onchange="setPipeFilter('owner',this.value)">${opt('all','Todos os SDRs',focusOwnerFilter)}${owners.map(o=>opt(o,o,focusOwnerFilter)).join('')}</select></label><label>Etapa<select onchange="setPipeFilter('stage',this.value)">${opt('all','5 primeiras etapas',focusStageFilter)}${stages.map(s=>opt(s.stageId,s.label,focusStageFilter)).join('')}</select></label><label>Atividades<select onchange="setPipeFilter('bucket',this.value)">${opt('all','Todas',pipeBucketFilter)}${opt('0','0 atividades',pipeBucketFilter)}${opt('1-3','1–3 atividades',pipeBucketFilter)}${opt('4+','4+ atividades',pipeBucketFilter)}</select></label>${active?'<button class="clear mgmt-clear" onclick="clearManagementFilters()">Limpar</button>':''}</div>`;
+}
+function clearManagementFilters(){ focusOwnerFilter='all'; focusStageFilter='all'; pipeCallFilter='all'; pipeWhatsFilter='all'; pipeBucketFilter='all'; drawCards(); }
 function drawManagement(){
-  resetPipeFilters();
   const el=document.getElementById('cards'), p=pf(), st=pfStats(), c=introConv();
   const scope=(me&&(me.view_all||me.admin))?'consolidado permitido':'somente sua carteira';
   document.getElementById('queueTitle').textContent='Gestão';
@@ -5473,7 +8183,16 @@ function drawManagement(){
   const state=pipeStateNotice();
   el.innerHTML=`<div class="mgmt-panel">
     ${pipeSimpleHeader('Dashboard de evolução para Introdução')}
+    ${managementFilterControls()}
     ${dispatchStatsBlock()}
+    ${dispatchTypeStatsBlock()}
+    ${followupPerformanceBlock()}
+    ${agendaPerformanceBlock()}
+    ${conversionFunnelBlock()}
+    ${lossRankingBlock()}
+    ${lossByOwnerBlock()}
+    ${approachReviewBlock()}
+    ${agendaOutcomeBlock()}
     ${state || `${performanceDashboard()}<div class="perf-secondary">${pfStageMatrix()}<details class="mgmt-section"><summary style="cursor:pointer;font-weight:800;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)">Detalhe por atividade</summary>${pipeSimpleSummary()}<div class="pipe-note"><b>Leitura:</b> 0 atividades = sem follow-up no HubSpot. 1–3 = em cadência. 4+ = já muito tocado, revisar prioridade.</div></details></div>`}
   </div>`;
 }
@@ -5489,8 +8208,10 @@ function pipelineSummaryBlock(){
 }
 function pf(){return pipelineFocus||{total:0,activityBuckets:{},stageRows:[],ownerRows:[],deals:[]}}
 function pfAllDeals(){return (pf().deals||[])}
-function pfFilterActive(){return pipeCallFilter!=='all'||pipeWhatsFilter!=='all'||pipeBucketFilter!=='all'}
+function pfFilterActive(){return pipeCallFilter!=='all'||pipeWhatsFilter!=='all'||pipeBucketFilter!=='all'||focusOwnerFilter!=='all'||focusStageFilter!=='all'}
 function pfDealPass(r){
+  if(focusOwnerFilter!=='all' && String(r.owner||'')!==focusOwnerFilter) return false;
+  if(focusStageFilter!=='all' && String(r.stageId||r.stageLabel||'')!==focusStageFilter && String(r.stageLabel||'')!==focusStageFilter) return false;
   if(pipeCallFilter==='with'&&!r.hasCall) return false;
   if(pipeCallFilter==='without'&&r.hasCall) return false;
   if(pipeWhatsFilter==='with'&&!r.hasWhatsApp) return false;
@@ -5517,6 +8238,9 @@ function setPipeFilter(kind,val){
   if(kind==='call') pipeCallFilter=val||'all';
   if(kind==='whats') pipeWhatsFilter=val||'all';
   if(kind==='bucket') pipeBucketFilter=val||'all';
+  if(kind==='owner') focusOwnerFilter=val||'all';
+  if(kind==='stage') focusStageFilter=val||'all';
+  if(kind==='task') focusTaskFilter=val||'open';
   drawCards();
 }
 function setPipeFilters(callMode,whatsMode,bucketMode){
@@ -5707,18 +8431,159 @@ function focusAutomation(kind){
   selectFocus(kind,10);
   alert('Prévia criada. Próximo passo seguro: criar tarefas no HubSpot ou revisar os leads selecionados. Não disparei WhatsApp automaticamente.');
 }
+function focusSubtabNav(){
+  const tab=(k,label,hint)=>`<button class="focus-subtab ${focusSubtab===k?'on':''}" onclick="setFocusSubtab('${k}')"><b>${esc(label)}</b><span>${esc(hint)}</span></button>`;
+  return `<div class="focus-subtabs">${tab('dia','Meu dia','Tarefas e próximas ações do SDR')}${tab('gestao','Gestão SDR','Quem precisa de apoio e onde o funil trava')}</div>`;
+}
+function setFocusSubtab(k){
+  focusSubtab=(k==='gestao')?'gestao':'dia';
+  if(focusSubtab==='gestao' && !sdrOrch && !sdrOrchLoading) loadSdrOrchestrator();
+  if(viewMode==='foco') drawFocus();
+}
 function drawFocus(){
-  resetPipeFilters();
   const el=document.getElementById('cards'), p=pf(), st=pfStats();
   const loading=!pipelineFocus && pipelineFocusLoading;
   const total=p.total||st.total||0;
   document.getElementById('queueTitle').textContent='Foco SDR';
   document.getElementById('queueCount').textContent=loading?'carregando HubSpot…':`${total} negócios no pipe · etapas x atividades`;
   renderQueues();
+  if(focusSubtab==='gestao'){
+    el.innerHTML=`<div class="focus-panel">${focusSubtabNav()}${sdrOrchestratorBlock()}</div>`;
+    return;
+  }
   const state=pipeStateNotice();
   el.innerHTML=`<div class="focus-panel">
-    ${pipeSimpleHeader('Foco SDR: deals por etapa e atividade')}
+    ${focusSubtabNav()}
+    ${sdrTaskFocusBlock()}
+    ${pipeSimpleHeader('Pipe de apoio: etapas x atividades')}
     ${state || `${pipeSimpleSummary()}${pfStageMatrix()}`}
+  </div>`;
+}
+async function loadSdrOrchestrator(){
+  if(sdrOrchLoading) return;
+  sdrOrchLoading=true; sdrOrchError='';
+  if(viewMode==='foco' && focusSubtab==='gestao') drawFocus();
+  try{
+    const [sum,hyg,ops]=await Promise.all([
+      api('/api/sdr-orchestrator-summary',{timeoutMs:30000}),
+      api('/api/task-hygiene-preview',{timeoutMs:30000}),
+      api('/api/ops-health-summary',{timeoutMs:8000})
+    ]);
+    sdrOrch=Object.assign({}, sum||{}, {hygiene: hyg||null, opsHealth: ops||null});
+  }catch(e){
+    sdrOrchError=String((e&&e.message)||e);
+  }
+  finally{ sdrOrchLoading=false; }
+  if(viewMode==='foco' && focusSubtab==='gestao') drawFocus();
+}
+function orchSevClass(s){return ({red:'sev-red',yellow:'sev-yellow',gray:'sev-gray',green:'sev-green'})[s]||'sev-gray'}
+function orchStatusPill(s){
+  const m={ok:['Em dia','st-ok'],attention:['Atenção','st-attn'],intervention:['Intervir','st-int']};
+  const x=m[s]||m.ok; return `<span class="orch-status ${x[1]}">${x[0]}</span>`;
+}
+function orchSdrCard(c){
+  return `<div class="orch-card ${c.status==='intervention'?'is-int':(c.status==='attention'?'is-attn':'')}">
+    <div class="orch-card-head"><b>${esc(c.name||'SDR')}</b>${orchStatusPill(c.status)}</div>
+    <div class="orch-card-grid">
+      <div><b>${c.activeDeals||0}</b><span>negócios ativos</span></div>
+      <div><b>${c.overdueHumanTasks||0}</b><span>tarefas atrasadas</span></div>
+      <div><b>${c.openHumanTasks||0}</b><span>tarefas em aberto</span></div>
+      <div><b>${c.completedToday||0}</b><span>concluídas hoje</span></div>
+      <div><b>${c.futureMeetings||0}</b><span>reuniões futuras</span></div>
+      <div><b>${c.pastMeetingsWithoutOutcome||0}</b><span>reuniões sem desfecho</span></div>
+      <div><b>${c.responsesAwaitingAction||0}</b><span>aguardando ação</span></div>
+      <div><b>${pct(c.introRate||0)}</b><span>taxa de Introdução</span></div>
+    </div>
+    <div class="orch-card-foot"><span>${(c.manualVsAutomation&&c.manualVsAutomation.human)||0} ações suas · ${(c.manualVsAutomation&&c.manualVsAutomation.automation)||0} envios automáticos</span></div>
+  </div>`;
+}
+function orchInterventionRow(it){
+  const ev=(it.evidence||[]).slice(0,4).map(e=>`<span class="orch-ev">${esc(e)}</span>`).join('');
+  return `<div class="orch-int ${orchSevClass(it.severity)}">
+    <div class="orch-int-top"><span class="orch-sev-dot"></span><b>${esc(it.title||'Intervenção')}</b>${it.owner?`<em>${esc(it.owner)}</em>`:''}</div>
+    <div class="orch-int-reason">${esc(it.reason||'')}</div>
+    ${ev?`<div class="orch-evs">${ev}</div>`:''}
+    <div class="orch-int-action"><b>Sugestão:</b> ${esc(it.suggestedAction||'')}</div>
+  </div>`;
+}
+function orchHumanQueueRow(q){
+  const link=q.hubspotUrl?`<a class="bb-btn" href="${esc(q.hubspotUrl)}" target="_blank" rel="noopener noreferrer">HubSpot</a>`:'';
+  return `<div class="focus-row"><div><div class="fn">${esc(q.company||'Negócio')}</div><div class="fm">${esc(q.owner||'SDR')} · ${esc(q.stage||'')} · ${esc(q.sla||'')}${q.nextAction?' · '+esc(q.nextAction):''}</div><div class="mini-hint">${esc((q.context||'').slice(0,150))}</div></div><div class="fa">${link}</div></div>`;
+}
+function orchBottleneckRow(b){
+  const max=Math.max(1,b.total||0);
+  return `<div class="orch-bottleneck"><div><b>${esc(b.stageLabel||'Etapa')}</b><span>${b.semAtividade||0} sem atividade · ${b.umToque||0} com 1 toque · ${b.total||0} no total</span></div><i style="width:${Math.round(((b.semAtividade||0)/max)*100)}%"></i></div>`;
+}
+function orchHygieneCard(label,count,desc,tone){
+  return `<div class="orch-hyg ${tone||''}"><b>${count||0}</b><span>${esc(label)}</span><small>${esc(desc)}</small></div>`;
+}
+function orchApproachRow(a){
+  const angle=a.angle?` · ${esc(a.angle)}`:'';
+  const ver=a.versionLabel?` · ${esc(a.versionLabel)}`:'';
+  const ex=(a.examples||[]).slice(0,2).map(e=>`<span>${esc(e.empresa||'Lead')}${e.link?` · <a href="${esc(e.link)}">conversa</a>`:''}</span>`).join('');
+  return `<div class="orch-approach-row"><div><b>${esc(a.label||'Abordagem')}</b><span>${angle}${ver}</span>${ex?`<small>${ex}</small>`:''}</div><div class="orch-approach-metrics"><b>${a.responseRate||0}%</b><span>${a.returns||0}/${a.sent||0} respostas</span><em>${a.meetings||0} agendas · ${a.realizedMeetings||0} realizadas</em></div></div>`;
+}
+function orchLossRow(a){
+  const angle=a.angle?` · ${esc(a.angle)}`:'';
+  return `<div class="orch-loss-row"><div><b>${esc(a.label||'Abordagem')}</b><span>${angle}</span></div><div><b>${a.withoutResponse||0}</b><span>sem resposta</span></div></div>`;
+}
+function orchApproachPerformanceBlock(perf){
+  if(!perf || !perf.ok) return `<div class="focus-section"><h4>Performance de abordagens</h4><div class="mini-empty">Performance de abordagem indisponível agora.</div></div>`;
+  const top=(perf.topApproaches||[]).slice(0,5).map(orchApproachRow).join('')||'<div class="mini-empty">Sem abordagem no período.</div>';
+  const loss=(perf.lossRanking||[]).slice(0,5).map(orchLossRow).join('')||'<div class="mini-empty">Sem perda relevante por ausência de resposta.</div>';
+  return `<div class="focus-section orch-approach-board"><h4>Performance de abordagens <em>${perf.periodDays||14} dias</em></h4>
+    <div class="orch-funnel"><div><b>${perf.totalSent||0}</b><span>enviadas</span></div><div><b>${perf.totalReturns||0}</b><span>respostas</span></div><div><b>${perf.totalMeetings||0}</b><span>agendas</span></div><div><b>${perf.totalRealizedMeetings||0}</b><span>realizadas</span></div></div>
+    <div class="focus-split"><div><h4>Abordagens que puxam resposta/agenda</h4>${top}</div><div><h4>Onde estamos perdendo resposta</h4>${loss}</div></div>
+    <div class="mini-hint">Atribuição: ${esc(perf.attribution||'último disparo antes da resposta')}.</div>
+  </div>`;
+}
+function orchOpsHealthBlock(h){
+  if(!h) return '';
+  const cls=h.risk==='critical'?'sev-red':(h.risk==='attention'?'sev-yellow':'sev-green');
+  const files=(h.files||[]).map(f=>`<div><b>${f.ok?'OK':'Atenção'}</b><span>${esc(f.label||'Sinal')}</span><small>${f.ageSeconds==null?'sem idade':Math.round((f.ageSeconds||0)/60)+' min'}</small></div>`).join('');
+  const sig=h.signals||{};
+  const mon=h.watchdog||{};
+  const monAge=mon.ageSeconds==null?'sem sinal':Math.round((mon.ageSeconds||0)/60)+' min';
+  const warn=(h.warnings||[]).slice(0,3).map(w=>`<span>${esc(w)}</span>`).join('');
+  return `<div class="focus-section orch-ops ${cls}"><h4>Saúde da máquina <em>${esc(h.headline||'')}</em></h4>
+    <div class="orch-ops-grid">${files}<div><b>${mon.ok?'OK':'Atenção'}</b><span>Monitoramento</span><small>${monAge}</small></div></div>
+    <div class="mini-hint">Cache: ${sig.conversationCacheEntries||0} listas · ${sig.messageCacheEntries||0} conversas · ${sig.historyCacheEntries||0} históricos aquecidos. ${warn||esc(h.safety||'Somente leitura.')}</div>
+  </div>`;
+}
+function sdrOrchestratorBlock(){
+  if(sdrOrchLoading && !sdrOrch) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Gestão SDR</b><span>Carregando a visão de gestão a partir do HubSpot…</span></div></div></div>`;
+  if(!sdrOrch){
+    const msg=sdrOrchError?('Não foi possível carregar agora: '+sdrOrchError):'Visão de gestão ainda não carregada.';
+    return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Gestão SDR</b><span>${esc(msg)}</span></div><button class="dispatch-total" onclick="sdrOrch=null; loadSdrOrchestrator()">Tentar de novo</button></div></div>`;
+  }
+  const o=sdrOrch;
+  if(o.configured===false) return `<div class="dispatch-board"><div class="dispatch-head"><div><b>Gestão SDR</b><span>${esc(o.reason||'HubSpot indisponível agora.')}</span></div><button class="dispatch-total" onclick="sdrOrch=null; loadSdrOrchestrator()">Tentar de novo</button></div></div>`;
+  const cards=(o.sdrCards||[]).map(orchSdrCard).join('')||'<div class="mini-empty">Sem SDR no escopo agora.</div>';
+  const ints=(o.interventions||[]).map(orchInterventionRow).join('')||'<div class="mini-empty">Nada exige intervenção agora.</div>';
+  const queue=(o.humanQueue||[]).slice(0,12).map(orchHumanQueueRow).join('')||'<div class="mini-empty">Nenhuma ação humana pendente neste escopo.</div>';
+  const necks=(o.pipelineBottlenecks||[]).slice(0,6).map(orchBottleneckRow).join('')||'<div class="mini-empty">Sem gargalos por etapa agora.</div>';
+  const hyg=o.taskHygienePreview||{};
+  const ah=o.automationHealth||{};
+  const stale=o.stale?'<em class="task-stale">atualizando HubSpot em segundo plano</em>':'';
+  return `<div class="dispatch-board task-focus">
+    <div class="dispatch-head"><div><b>Gestão SDR</b><span>Visão de gestão somente leitura: quem precisa de apoio, qual gargalo trava o funil e quais tarefas pedem limpeza com aprovação. ${stale}</span></div><div class="dispatch-total">${(o.sdrCards||[]).length} SDRs</div></div>
+    ${orchOpsHealthBlock(o.opsHealth)}
+    <div class="orch-cards">${cards}</div>
+    <div class="focus-section"><h4>Intervenções recomendadas pelo Dexter <em>${(o.interventions||[]).length}</em></h4><div class="orch-ints">${ints}</div></div>
+    <div class="focus-split">
+      <div class="focus-section"><h4>Fila humana <em>${(o.humanQueue||[]).length}</em></h4>${queue}</div>
+      <div class="focus-section"><h4>Gargalos do funil <em>${(o.pipelineBottlenecks||[]).filter(b=>b.semAtividade>0).length}</em></h4><div class="orch-necks">${necks}</div></div>
+    </div>
+    ${orchApproachPerformanceBlock(o.approachPerformance)}
+    <div class="focus-section"><h4>Higiene de tarefas</h4>
+      <div class="orch-hyg-grid">
+        ${orchHygieneCard('Pode fechar com aprovação',hyg.safeToCloseAfterApproval,'Envios automáticos antigos e tarefas genéricas vencidas',' tone-warn')}
+        ${orchHygieneCard('Revisar antes de agir',hyg.reviewBeforeAction,'Tarefas comerciais antigas que ainda têm contexto','')}
+        ${orchHygieneCard('Não mexer',hyg.doNotTouch,'Diagnóstico futuro, reunião futura e interação recente',' tone-keep')}
+      </div>
+      <div class="focus-safe"><b>Nada é fechado aqui.</b> Esta é uma prévia: limpeza só acontece depois da sua aprovação.</div>
+    </div>
+    <div class="orch-auto-strip"><div><b>${ah.acoesHumanas||0}</b><span>ações suas no funil</span></div><div><b>${ah.automaticos||0}</b><span>envios automáticos</span></div><div><b>${ah.historicoConcluido||0}</b><span>histórico concluído</span></div></div>
   </div>`;
 }
 
@@ -5754,21 +8619,28 @@ function readonlyBadge(c){return c.readOnlyInstitutional?'<span class="badge b-s
 function drawCards(){
   if(viewMode==='gestao') return drawManagement();
   if(viewMode==='foco') return drawFocus();
+  const prevScroll=(getListScroller()&&getListScroller().scrollTop)||0;
   const list=filteredCards();
+  const sig=listSignature();
+  if(sig!==lastListSignature){ lastListSignature=sig; resetListPagination(); }
   document.getElementById('queueTitle').textContent='Conversas';
   document.getElementById('queueCount').textContent=`${list.length} ${list.length===1?'conversa':'conversas'}`;
   renderFilterBar();
   renderQueues();
   const el=document.getElementById('cards');
   if(!list.length){ el.innerHTML=`<div class="empty"><b>Nada por aqui 🎉</b><span>Nenhuma conversa encontrada.</span></div>`; return; }
-  el.innerHTML=list.map(c=>{
+  const visible=list.slice(0, Math.min(listVisibleCount, list.length));
+  const pagerTop=list.length>LIST_PAGE_SIZE?`<div class="list-page-info"><span>Mostrando <b>${visible.length}</b> de ${list.length}</span></div>`:'';
+  const pagerBottom=list.length>visible.length?`<div class="list-pager"><button onclick="showMoreCards()">Mostrar mais ${Math.min(LIST_PAGE_SIZE, list.length-visible.length)}</button><span>${visible.length}/${list.length}</span><button class="ghost" onclick="scrollListTop()">Topo</button></div>`:`<div class="list-pager done"><span>Fim da lista · ${list.length} conversa${list.length===1?'':'s'}</span><button class="ghost" onclick="scrollListTop()">Topo</button></div>`;
+  el.innerHTML=pagerTop+visible.map(c=>{
     const from=previewFrom(c);
-    const preview=(c.last&&(c.last.text||c.last.transcript||c.last.mediaName||c.last.mediaType))||(c.audioTranscriptText?('Áudio: '+c.audioTranscriptText):'');
+    const preview=(c.last&&(c.last.text||c.last.body||c.last.caption||c.last.message||c.last.transcript||c.last.mediaName||c.last.mediaType))||(c.audioTranscriptText?('Áudio: '+c.audioTranscriptText):'');
     const urgent=leadLast(c);
     const owner=ownerOf(c.port);
     const sel=selected.has(c.id);
     const meet=isMeeting(c)?'<span class="badge b-meet">Reunião/tarefa</span>':'';
     const aud=c.audioPending?`<span class="badge b-risk">🎙 ${c.audioPending} áudio(s)</span>`:(c.audioTranscriptText?'<span class="badge b-note">🎙 Transcrito</span>':'');
+    const statusBadges=[readonlyBadge(c),stageBadge(c),hubspotBadge(c),sharedBadge(c),meet,aud,localBadge(c),automationBadge(c)];
     const cardCompany=headCompanyName(c);
     const cardContact=headContactName(c);
     const cardPhone=phoneText(c);
@@ -5778,15 +8650,29 @@ function drawCards(){
     const titlePhone=looksLikePhoneName(cardCompany);
     return `<button class="card ${active===c.id?'active':''} ${sel?'selected':''} ${urgent?'reply unreadcard':''} ${c.readOnlyInstitutional?'readonly':''} ${localStatusOf(c)==='archived'?'archived':''} ${c.id===newTopConvId?'new-top':''}" data-conv="${esc(c.id)}" onclick="openConv('${esc(c.id)}')">
       <input type="checkbox" class="card-check" ${sel?'checked':''} onclick="event.stopPropagation();selToggle(this,'${esc(c.id)}')" title="Selecionar lead">
-      <div class="row1"><span class="company ${titlePhone?'phone-fallback':''}">${esc(cardCompany)}</span><span class="time ${urgent?'urgent':''}">${relTime(c.lastTime)}</span></div>
+      <div class="row1"><span class="company ${titlePhone?'phone-fallback':''}">${esc(cardCompany)}</span><span class="time ${urgent?'urgent':''}" title="${esc(dt(c.lastTime))}">${esc(cardTime(c.lastTime))}</span></div>
       <div class="contact">${contactLine}</div>
       ${!c.readOnlyInstitutional && hasCommunicator(c)?`<div class="inst-map">${communicatorChip(c)}</div>`:''}
       ${institutionalMap(c)}
       <div class="preview"><span class="from ${from.cls}">${from.label}:</span><span class="txt">${esc(preview)}</span></div>
-      <div class="row3">${readonlyBadge(c)}${stageBadge(c)}${hubspotBadge(c)}${sharedBadge(c)}${meet}${aud}${localBadge(c)}${automationBadge(c)}<span class="owner"><span class="av" style="background:${colorFor(c.readOnlyInstitutional?senderLabel(c):owner)}">${esc(initials(c.readOnlyInstitutional?senderLabel(c):owner))}</span>${c.readOnlyInstitutional?`via ${esc(senderLabel(c))}`:esc(chipLabel(c.port))}</span><span class="spacer"></span>${slaTag(c)}</div>
+      <div class="row3">${compactBadges(statusBadges,3)}<span class="owner"><span class="av" style="background:${colorFor(c.readOnlyInstitutional?senderLabel(c):owner)}">${esc(initials(c.readOnlyInstitutional?senderLabel(c):owner))}</span>${c.readOnlyInstitutional?`via ${esc(senderLabel(c))}`:esc(chipLabel(c.port))}</span><span class="spacer"></span>${slaTag(c)}</div>
       <span class="card-archive" onclick="event.stopPropagation(); archiveConv('${esc(c.id)}')">${localStatusOf(c)==='archived'?'Desarquivar':'Arquivar'}</span>
     </button>`;
-  }).join('');
+  }).join('')+pagerBottom;
+  const sc=getListScroller();
+  if(sc && pendingListScrollRestore!=null) restoreListScroll();
+  else if(sc && prevScroll && listVisibleCount>LIST_PAGE_SIZE) sc.scrollTop=prevScroll;
+}
+function showMoreCards(){
+  saveListScroll();
+  listVisibleCount+=LIST_PAGE_SIZE;
+  drawCards();
+  restoreListScroll();
+}
+function scrollListTop(smooth=true){
+  const scroller=getListScroller();
+  if(scroller) scroller.scrollTo({top:0,behavior:smooth?'smooth':'auto'});
+  try{ sessionStorage.setItem(listScrollKey(),'0'); }catch(e){}
 }
 function updateActiveCard(id){
   if(viewMode!=='conversas') return;
@@ -5948,7 +8834,7 @@ function mLabel(m){if(!m) return ''; if(!m.fromMe) return 'Resposta do lead';
   if(mt.includes('follow')) return 'Follow-up';
   if(mt.includes('cadencia')||mt.includes('sumico')) return 'Cadência';
   return 'WhatsApp';}
-function isEvent(m){return m.fromMe && /^cron-/.test(m.type||'')}
+function isEvent(m){return false}
 function isOperationalDispatchMsg(m){
   const t=String((m&&m.type)||'').toLowerCase(), mt=String((m&&m.msg_type)||'').toLowerCase(), a=String((m&&m.automation)||'').toLowerCase();
   return m&&m.fromMe&&(!!(m.dispatchLabel||m.dispatchPort||m.group_bridge_port||m.port)||t.includes('mql')||mt.includes('diagnostico')||mt.includes('mql')||mt.includes('follow')||mt.includes('cadencia')||mt.includes('sumico')||mt.includes('primeiro_contato')||a.includes('diagnóstico')||a.includes('diagnostico')||m.pdf_path||m.hubspot_file_id);
@@ -6010,7 +8896,7 @@ function openFilePreview(url,name,kind){
   if(!modal||!body) return window.open(url,'_blank');
   title.textContent=name||'Arquivo'; sub.textContent=kind==='pdf'?'Pré-visualização do PDF':(kind==='image'?'Pré-visualização da imagem':'Arquivo');
   dl.hidden=false; dl.href=url; dl.setAttribute('download', name||'arquivo');
-  if(kind==='pdf') body.innerHTML=`<div class="file-preview"><iframe src="${url}#toolbar=1&navpanes=0&view=FitH" title="${esc(name||'PDF')}"></iframe></div>`;
+  if(kind==='pdf') body.innerHTML=`<div class="file-preview"><iframe scrolling="yes" src="${url}#toolbar=1&navpanes=0&view=FitH" title="${esc(name||'PDF')}"></iframe></div>`;
   else if(kind==='image') body.innerHTML=`<div class="file-preview-fallback"><img src="${url}" alt="${esc(name||'imagem')}" style="max-width:100%;max-height:100%;object-fit:contain;border-radius:12px"></div>`;
   else body.innerHTML=`<div class="file-preview-fallback"><div><b>Pré-visualização indisponível</b><span>Baixe o arquivo para abrir no aplicativo adequado.</span></div></div>`;
   modal.hidden=false;
@@ -6061,7 +8947,7 @@ function drawTimeline(autoScroll=true){
     const dispatchWho=dispatchIdentityHtml(m);
     const whoHtml=grp?`<span class="bwho">${senderWho}${dispatchWho}${m.automation?`<span class="autobadge">⚙ ${esc(m.automation)}</span>`:''}</span>`:'';
     const anyMedia=!!(m.mediaUrl||m.mediaPath||m.mediaName||m.mimetype||m.mediaType);
-    const body=esc(m.text||'')||(anyMedia?'':'<i style="color:var(--muted)">(mensagem sem texto)</i>');
+    const body=m.deleted?'<i style="color:var(--muted)">Mensagem apagada</i>':(esc(m.text||'')||(anyMedia?'':'<i style="color:var(--muted)">(mensagem sem texto)</i>'));
     const hasMedia=anyMedia;
     html+=`<div class="brow ${m.fromMe?'out':'in'} ${lead?'lead':''} ${grp?'grp-start':''}">
       <div class="bubble ${hasMedia?'has-media':''}">${whoHtml}<span class="btext">${body}${anyMedia?mediaLink(m):''}${transcriptBlock(m)}</span><span class="btime">${esc(hhmm(m.timestamp))}</span></div>
@@ -6339,16 +9225,48 @@ async function loadManagerOverview(){
 async function loadPipelineFocus(){
   if(pipelineFocusLoading) return;
   pipelineFocusLoading=true;
-  try{ pipelineFocus=await api('/api/pipeline/focus'); }
-  catch(e){ pipelineFocus={configured:false,error:String(e&&e.message||e),total:0,activityBuckets:{},stageRows:[],ownerRows:[]}; }
+  if(!pipelineFocus){
+    try{
+      const cached=JSON.parse(localStorage.getItem('zydon:pipelineFocus:last')||'null');
+      if(cached&&cached.total!=null){
+        pipelineFocus=Object.assign({}, cached, {stale:true, warning:'Mostrando último snapshot enquanto atualiza o HubSpot.'});
+        if(viewMode==='foco'||viewMode==='gestao') drawCards();
+      }
+    }catch(_){ }
+  }
+  try{
+    pipelineFocus=await api('/api/pipeline/focus',{timeoutMs:30000});
+    try{ localStorage.setItem('zydon:pipelineFocus:last', JSON.stringify(pipelineFocus)); }catch(_){ }
+  }
+  catch(e){
+    let cached=null;
+    try{ cached=JSON.parse(localStorage.getItem('zydon:pipelineFocus:last')||'null'); }catch(_){ cached=null; }
+    pipelineFocus=cached&&cached.total!=null ? Object.assign({}, cached, {stale:true, warning:'HubSpot demorou para atualizar; mostrando último snapshot enquanto tenta novamente.'}) : {configured:false,error:String(e&&e.message||e),total:0,activityBuckets:{},stageRows:[],ownerRows:[]};
+  }
   finally{ pipelineFocusLoading=false; }
   if(viewMode==='foco'||viewMode==='gestao') drawCards();
 }
 async function loadDispatchStats(force=false){
   if(dispatchStatsLoading && !force) return;
   dispatchStatsLoading=true;
-  try{ dispatchStats=await api('/api/dispatch-stats?days=14'); }
-  catch(e){ dispatchStats={ok:false,error:String(e&&e.message||e),days:[],chips:[],total:0}; }
+  if(!dispatchStats){
+    try{
+      const cached=JSON.parse(localStorage.getItem('zydon:dispatchStats:last')||'null');
+      if(cached&&cached.ok){
+        dispatchStats=Object.assign({}, cached, {stale:true, warning:'Mostrando último snapshot enquanto atualiza a gestão.'});
+        if(viewMode==='gestao') drawCards();
+      }
+    }catch(_){ }
+  }
+  try{
+    dispatchStats=await api('/api/dispatch-stats?days=14'+(force?'&force=1':''),{timeoutMs:30000});
+    try{ localStorage.setItem('zydon:dispatchStats:last', JSON.stringify(dispatchStats)); }catch(_){ }
+  }
+  catch(e){
+    let cached=null;
+    try{ cached=JSON.parse(localStorage.getItem('zydon:dispatchStats:last')||'null'); }catch(_){ cached=null; }
+    dispatchStats=cached&&cached.ok ? Object.assign({}, cached, {stale:true, warning:'Gestão demorou para atualizar; mostrando último snapshot.'}) : {ok:false,error:String(e&&e.message||e),days:[],chips:[],total:0};
+  }
   finally{ dispatchStatsLoading=false; }
   if(viewMode==='gestao') drawCards();
 }
@@ -6375,8 +9293,8 @@ function cadSanitClass(key){
 }
 function cadFonteLabel(r){
   // Indicação curta da fonte de evidência do 1º contato.
-  if(r.attemptSource==='ledger') return {cls:'cad-src-ledger', txt:'fonte: ledger'};
-  if(r.attemptSource==='hubspot_activity') return {cls:'cad-src-hs', txt:'fonte: atividade HubSpot'};
+  if(r.attemptSource==='ledger') return {cls:'cad-src-ledger', txt:'envio confirmado'};
+  if(r.attemptSource==='hubspot_activity') return {cls:'cad-src-hs', txt:'atividade HubSpot'};
   return {cls:'cad-src-none', txt:'sem evidência D0'};
 }
 // Rótulos curtos das decisões locais (espelham CADENCIA_DECISION_ACTIONS no backend).
@@ -6516,7 +9434,7 @@ function drawContext(c){
       <div class="top"><div class="ava" style="background:${colorFor(c.title)}">${esc(initials(c.title))}</div><div class="nm"><b>${esc(c.title)}</b><span>${esc(c.subtitle||phoneText(c))}</span></div></div>
       <div class="tags"><span class="tag ${hot?'hot':''}">${esc(statusLead)}</span><span class="tag">${c.messages} mensagens</span><span class="tag">${esc(chipLabel(c.port))}</span></div>
     </div>
-${c.readOnlyInstitutional?`<div class="section"><div class="readonly-banner"><b>Auditoria institucional — não é bug.</b><br>O lead pertence ao SDR <b>${esc(leadOwnerLabel(c))}</b>. O envio foi feito usando o chip comunicador <b>${esc(senderLabel(c))}</b> para preservar capacidade/entrega. Por privacidade, esta tela mostra só o registro operacional; a resposta deve acontecer na conversa/carteira do SDR responsável.</div></div>`:`<div class="section"><div class="next"><div class="nh">⚡ Próxima ação sugerida</div><p>${esc(next)}</p><div class="nbtns"><button class="btn primary" onclick="document.getElementById('composer').focus()">Responder</button><button class="btn" onclick="hubspotAction('task')">Criar tarefa</button></div></div></div>`}
+${c.readOnlyInstitutional?`<div class="section"><div class="readonly-banner"><b>Conversa institucional — somente leitura.</b><br>O lead pertence ao SDR <b>${esc(leadOwnerLabel(c))}</b>. O envio foi feito usando o chip comunicador <b>${esc(senderLabel(c))}</b> para preservar capacidade/entrega. Por privacidade, esta tela mostra só a conversa operacional; a resposta deve acontecer na carteira do SDR responsável.</div></div>`:`<div class="section"><div class="next"><div class="nh">⚡ Próxima ação sugerida</div><p>${esc(next)}</p><div class="nbtns"><button class="btn primary" onclick="document.getElementById('composer').focus()">Responder</button><button class="btn" onclick="hubspotAction('task')">Criar tarefa</button></div></div></div>`}
     ${ai.summary?`<div class="section"><h5>Resumo da conversa <span class="soon">auto</span></h5>
       <p style="margin:2px 0 9px;color:var(--txt);font-size:13px;line-height:1.5">${esc(ai.summary)}</p>
       ${ai.nextAction?`<div class="kv"><span class="k">Próxima ação</span><span class="v">${esc(ai.nextAction)}</span></div>`:''}
@@ -6791,7 +9709,7 @@ function setMode(m){
   const sb=document.getElementById('sendBtn'); sb.classList.toggle('note',m==='note'); document.getElementById('sendLabel').textContent=m==='note'?'Salvar nota':'Enviar';
 }
 function toggleCtx(force){const app=document.getElementById('app'); if(force===false) app.classList.remove('ctx-open'); else app.classList.toggle('ctx-open')}
-function mobileBack(){document.getElementById('app').classList.remove('conv-open')}
+function mobileBack(){document.getElementById('app').classList.remove('conv-open'); setTimeout(restoreListScroll,30)}
 
 function applyReadonlyComposer(c){
   const ro=!!(c&&c.readOnlyInstitutional);
@@ -6826,11 +9744,13 @@ async function transcribePendingAudioForActive(convId){
     const d=await api('/api/messages?conv='+encodeURIComponent(convId));
     if(active!==convId) return;
     msgs=d.messages||[];
+    msgsConvId=convId;
     drawTimeline(); drawCards();
   }catch(e){ /* transcrição é best-effort; áudio já está visível */ }
 }
 
 async function openConv(id, keep){
+  saveListScroll();
   active=id;
   const c=convs.find(x=>x.id===id)||{};
   const tlBefore=document.getElementById('timeline');
@@ -6855,26 +9775,43 @@ async function openConv(id, keep){
     if(input) input.style.display=''; if(hint) hint.style.display='';
   }
   const tl=document.getElementById('timeline');
-  let loadingTimer=null;
+  const switchingConversation = msgsConvId !== id;
+  if(switchingConversation){
+    msgs=[]; msgsConvId=null;
+    if(tl) tl.innerHTML=`<div class="empty"><b>Carregando mensagens…</b><span>Atualizando a timeline desta conversa.</span></div>`;
+  }
+  let loadingTimer=null, safetyTimer=null;
+  const showMessageLoadError=(msg)=>{
+    if(!tl) return;
+    tl.innerHTML=`<div class="empty"><b>Não consegui carregar mensagens agora</b><span>${esc(msg||'A conexão demorou. Toque em tentar novamente para recarregar só esta conversa.')}</span><button class="ghost" onclick="openConv(active)">Tentar novamente</button></div>`;
+  };
   if(!keep && tl){
     // Não piscar “Carregando mensagens” para requests normais (<350ms).
     // Se aparecer por segundos, é sinal real de gargalo/timeout, não estado normal.
     loadingTimer=setTimeout(()=>{
       if(active===id) tl.innerHTML=`<div class="empty"><b>Carregando mensagens…</b><span>Se houver áudio, ele aparece primeiro e a transcrição vem em seguida.</span></div>`;
     },350);
+    // Guardrail mobile: nunca deixar a tela detalhe presa indefinidamente nesse texto.
+    safetyTimer=setTimeout(()=>{ if(active===id) showMessageLoadError('Ainda não recebi resposta do servidor. Tente novamente ou puxe para atualizar a tela.'); },11000);
   }
   try{
     const d=await api('/api/messages?conv='+encodeURIComponent(id));
-    if(loadingTimer) clearTimeout(loadingTimer);
+    if(loadingTimer) clearTimeout(loadingTimer); if(safetyTimer) clearTimeout(safetyTimer);
     if(active!==id) return;
     msgs=d.messages||[];
+    msgsConvId=id;
+    if(!msgs.length && +(c.messages||0)>0){
+      showMessageLoadError('O card tem mensagens registradas, mas a timeline veio vazia. Tente novamente; se persistir, é falha de permissão/cache e não conversa sem histórico.');
+      return;
+    }
   }catch(e){
-    if(loadingTimer) clearTimeout(loadingTimer);
+    if(loadingTimer) clearTimeout(loadingTimer); if(safetyTimer) clearTimeout(safetyTimer);
     if(active!==id) return;
-    if((msgs||[]).length){
-      // Mantém histórico anterior em vez de piscar “Sem mensagens”.
+    if(msgsConvId===id && (msgs||[]).length){
+      // Mantém histórico desta mesma conversa em retry/refresh; nunca mantém
+      // mensagens da conversa anterior quando o usuário troca de card.
     }else if(tl){
-      tl.innerHTML=`<div class="empty"><b>Não consegui carregar mensagens agora</b><span>A conexão demorou. Vou tentar de novo automaticamente; clique em Atualizar se precisar.</span></div>`;
+      showMessageLoadError(e && e.timeout ? 'Tempo esgotado. Vou manter a conversa aberta para você tentar de novo.' : 'Falha ao carregar esta conversa. Toque em tentar novamente.');
       return;
     }
   }
@@ -7010,6 +9947,11 @@ function markNewTop(id){
   if(newTopTimer) clearTimeout(newTopTimer);
   newTopTimer=setTimeout(()=>{ newTopConvId=''; if(viewMode==='conversas') drawCards(); },8000);
 }
+function refreshInboxNewOnly(){
+  saveListScroll();
+  pendingListScrollRestore=(getListScroller()&&getListScroller().scrollTop)||0;
+  return loadAll({fast:true,force:true,preserveListScroll:true});
+}
 async function loadAll(opts={}){
   // Em telas analíticas, não recalcule a inbox inteira em background.
   // Foco/Gestão têm rota e carga própria; competir com /api/messages derrubava fluidez.
@@ -7024,8 +9966,11 @@ async function loadAll(opts={}){
   // cargas pesadas continuam no máximo a cada 30s.
   if(loadAllInFlight && !opts.force) return;
   loadAllInFlight=true;
+  if(opts.preserveListScroll) pendingListScrollRestore=(getListScroller()&&getListScroller().scrollTop)||0;
+  if(opts.fast || opts.preserveListScroll) setListLoading(true);
   try{
-    const d=await api('/api/conversations',{timeoutMs: opts.fast?9000:20000});
+    const url='/api/conversations'+(opts.force?'?force=1':'');
+    const d=await api(url,{timeoutMs: opts.force?60000:(opts.fast?9000:20000)});
     let incoming=d.conversations||[];
     if(!incoming.length){
       try{
@@ -7035,6 +9980,13 @@ async function loadAll(opts={}){
     }
     const prevFirst=(convs[0]&&convs[0].id)||'';
     convs=incoming; me=d.user;
+    if(active && !convs.some(x=>x.id===active)){
+      active=null; msgs=[]; msgsConvId=null;
+      document.getElementById('app').classList.remove('conv-open');
+      const timeline=document.getElementById('timeline');
+      if(timeline) timeline.innerHTML='<div class="empty"><b>Nenhuma conversa selecionada</b><span>Selecione uma conversa operacional na lista.</span></div>';
+      drawHead({}); drawContext({});
+    }
     lastInboxUpdatedAt=Date.now();
     // Card novo no topo: marca antes de desenhar para o destaque já sair no 1º draw.
     if(prevFirst && convs[0] && convs[0].id!==prevFirst && viewMode==='conversas') markNewTop(convs[0].id);
@@ -7043,6 +9995,8 @@ async function loadAll(opts={}){
     document.getElementById('meSub').textContent=(me.admin?'Admin · ':(me.view_all?'Supervisor · ':''))+(me.ports||[]).length+' conexões';
     const ava=document.getElementById('meAva'); ava.textContent=initials(me.name); ava.style.background=colorFor(me.name);
     renderQueues(); drawCards();
+    saveInboxSnapshot();
+    if(opts.preserveListScroll || pendingListScrollRestore!=null) setTimeout(restoreListScroll,20);
     if(deepConv && !deepConvOpened){
       deepConvOpened=true;
       setViewMode('conversas',{skipHistory:true});
@@ -7068,13 +10022,15 @@ async function loadAll(opts={}){
     }
   }finally{
     loadAllInFlight=false;
+    setListLoading(false);
   }
 }
 
 renderShell();
 setViewMode(initialViewModeFromPath(), {skipHistory:true});
 window.addEventListener('popstate',()=>setViewMode(initialViewModeFromPath(), {skipHistory:true}));
-loadAll({force:true});
+restoreInboxSnapshot();
+loadAll({force:true,preserveListScroll:true});
 setInterval(()=>{ if(!document.hidden) loadAll({fast:true}); },45000);
 setInterval(()=>loadAll({fast:false}),180000);
 setInterval(()=>{ const composing=document.activeElement && document.activeElement.id==='composer'; if(!document.hidden && active && !composing) openConv(active,true); },30000);
@@ -7083,12 +10039,28 @@ document.addEventListener('visibilitychange',()=>{ updateLiveStatus(); if(!docum
 window.addEventListener('focus',()=>{ updateLiveStatus(); });
 </script></body></html>'''
 
+def conversation_from_cache(uid, conv_id):
+    """Busca conversa já montada sem recalcular a inbox inteira."""
+    cache_keys = []
+    cache_keys.append('__view_all__' if user_can_view_all(uid) else uid)
+    cache_keys.extend(k for k in CONVERSATIONS_API_CACHE.keys() if k not in cache_keys)
+    for key in cache_keys:
+        cache = CONVERSATIONS_API_CACHE.get(key) or {}
+        for c in cache.get('conversations') or []:
+            if c.get('id') == conv_id:
+                return c
+    return None
+
+
 def background_refresh_conversations(uid, cache_key):
     def run():
         try:
             convs=conversations(uid)
+            deps_mtime=conversations_dependency_mtime()
             with CONVERSATIONS_API_LOCK:
-                CONVERSATIONS_API_CACHE[cache_key]={'ts':time.time(),'conversations':convs}
+                CONVERSATIONS_API_CACHE[cache_key]={'ts':time.time(),'deps_mtime':deps_mtime,'conversations':convs}
+            if cache_key == '__view_all__':
+                _write_conversations_prewarm_cache(convs, deps_mtime)
         except Exception as e:
             try:
                 log_oauth_error(f'conversations background refresh failed uid={uid} cache_key={cache_key}: {e}')
@@ -7223,8 +10195,16 @@ class H(BaseHTTPRequestHandler):
         secure = request_is_https(self)
         return self.redirect('/login', cookies=[build_cookie(SESSION_COOKIE, '', 0, secure)])
     def do_GET(self):
-        parsed=urlparse(self.path); path=parsed.path; uid=self.auth()
+        parsed=urlparse(self.path); path=parsed.path
+        # /health é probe de liveness: responde ANTES de auth()/sessão/OAuth-env.
+        # auth() relê e parseia o env do OAuth do disco e valida HMAC de sessão a
+        # cada request; nada disso é necessário para um liveness check e o uid nem
+        # era usado aqui. Em rajada de disparo o recompute de /api/conversations
+        # segura o GIL (json.loads de history grande) e até esse trabalho extra
+        # ajudava /health 8280 a estourar o timeout de 3s do watchdog enquanto as
+        # rotas/inbox seguiam dentro do orçamento (incidente 20260629T123227Z).
         if path=='/health': return self.sendb(200, json.dumps({'ok':True,'ui':'v2','users':list(USERS),'googleConfigured':google_configured(),'time':datetime.now().isoformat()}).encode())
+        uid=self.auth()
         if path=='/logo.png':
             try:
                 return self.sendb(200, LOGO_PATH.read_bytes(), 'image/png')
@@ -7247,22 +10227,55 @@ class H(BaseHTTPRequestHandler):
             refresh_session = build_cookie(SESSION_COOKIE, make_session(uid), SESSION_TTL, request_is_https(self), same_site='None')
             return self.sendb(200, HTML.encode(), 'text/html; charset=utf-8', cookies=[refresh_session])
         if path in ('/api/conversations','/api/conversations-safe'):
-            now=time.time(); cache_key='__view_all__' if user_can_view_all(uid) else uid; cache=CONVERSATIONS_API_CACHE.get(cache_key)
-            u=USERS[uid]; ports=[{'port':p, **PORTS.get(int(p),{})} for p in effective_ports(uid) if int(p) not in load_paused_ports()]
+            qs=parse_qs(parsed.query)
+            force_refresh=str((qs.get('force') or [''])[0]).lower() in ('1','true','yes')
+            now=time.time(); cache_key='__view_all__' if user_can_view_all(uid) else uid; cache=CONVERSATIONS_API_CACHE.get(cache_key); deps_mtime=conversations_dependency_mtime()
+            u=USERS[uid]; paused=load_paused_ports(); ports=[{'port':p, **PORTS.get(int(p),{}), 'paused': int(p) in paused} for p in effective_ports(uid)]
             user_payload={'id':uid,'name':u['name'],'admin':u.get('admin'), 'view_all':bool(u.get('view_all') or u.get('admin')), 'ports':ports}
-            if cache:
-                if now-cache.get('ts',0) >= CONVERSATIONS_API_TTL:
+            if cache and not force_refresh:
+                # CH-API-SWR: /api/conversations é a rota crítica do mobile. Quando
+                # controle/wpp_envios.json muda durante disparos em lote, recomputar a
+                # inbox síncronamente (e sob lock global) faz o processo público 8280
+                # empilhar threads até o mobile ficar em "0 conversas / Atualizando".
+                # Se já existe qualquer cache, devolve stale imediatamente e atualiza
+                # em background. Só a primeira carga sem cache pode calcular síncrona.
+                cache_age = now-cache.get('ts',0)
+                if cache_age >= CONVERSATIONS_API_TTL or (float(cache.get('deps_mtime') or 0) < deps_mtime and cache_age >= CONVERSATIONS_MIN_REFRESH_INTERVAL):
                     background_refresh_conversations(uid, cache_key)
                 body=json.dumps({'user':user_payload, 'conversations':cache['conversations']}, ensure_ascii=False).encode()
                 return self.sendb(200, body)
-            # Primeiro carregamento sem cache ainda precisa calcular; depois disso nunca bloqueia a UI.
+            # Primeiro carregamento sem cache: singleflight. Sem isso, várias abas/
+            # smoke/mobile pedem /api/conversations ao mesmo tempo depois de restart e
+            # cada thread recomputa a inbox view_all (~10s), deixando até /health lento.
             with CONVERSATIONS_API_LOCK:
-                cache=CONVERSATIONS_API_CACHE.get(cache_key)
-                if cache:
-                    body=json.dumps({'user':user_payload, 'conversations':cache['conversations']}, ensure_ascii=False).encode()
-                    return self.sendb(200, body)
+                if cache_key in CONVERSATIONS_REFRESHING:
+                    should_compute=False
+                else:
+                    CONVERSATIONS_REFRESHING.add(cache_key); should_compute=True
+            if not should_compute:
+                deadline=time.time()+60
+                while time.time()<deadline:
+                    time.sleep(0.1)
+                    with CONVERSATIONS_API_LOCK:
+                        cache=CONVERSATIONS_API_CACHE.get(cache_key)
+                    if cache:
+                        body=json.dumps({'user':user_payload, 'conversations':cache['conversations']}, ensure_ascii=False).encode()
+                        return self.sendb(200, body)
+                # Ainda sem cache após aguardar o primeiro cálculo: não iniciar outro
+                # recompute concorrente, senão o processo empilha threads e trava.
+                # O cliente deve tentar novamente; nunca devolvemos lista vazia falsa.
+                body=json.dumps({'error':'inbox ainda atualizando, tente novamente em instantes','retry':True,'conversations':[]}, ensure_ascii=False).encode()
+                return self.sendb(503, body)
+            try:
                 convs=conversations(uid)
-                CONVERSATIONS_API_CACHE[cache_key]={'ts':time.time(),'conversations':convs}
+                deps_mtime=conversations_dependency_mtime()
+                with CONVERSATIONS_API_LOCK:
+                    CONVERSATIONS_API_CACHE[cache_key]={'ts':time.time(),'deps_mtime':deps_mtime,'conversations':convs}
+                if cache_key == '__view_all__':
+                    _write_conversations_prewarm_cache(convs, deps_mtime)
+            finally:
+                with CONVERSATIONS_API_LOCK:
+                    CONVERSATIONS_REFRESHING.discard(cache_key)
             body=json.dumps({'user':user_payload, 'conversations':convs}, ensure_ascii=False).encode()
             return self.sendb(200, body)
         if path=='/api/messages':
@@ -7275,10 +10288,39 @@ class H(BaseHTTPRequestHandler):
                     background_refresh_messages(uid, conv, cache_key)
                 return self.sendb(200, cache['body'])
             # Primeiro carregamento sem cache calcula síncrono; depois usa stale-while-revalidate.
-            payload={'messages':messages_for(uid, conv)}
-            payload.update(local_state_summary(state_for_conversation(conv)))  # CH-010
-            body=json.dumps(payload, ensure_ascii=False).encode()
-            MESSAGES_API_CACHE[cache_key]={'ts':time.time(),'body':body}
+            # Singleflight: se já há um cálculo em voo p/ esta conv, aguardamos o cache
+            # quente em vez de disparar outra varredura síncrona. Coalesce o pico de
+            # threads que disparos em lote provocam ao invalidar caches a cada segundos.
+            with MESSAGES_API_LOCK:
+                cache=MESSAGES_API_CACHE.get(cache_key)
+                if cache:
+                    should_compute=False
+                elif cache_key in MESSAGES_COMPUTING:
+                    should_compute=False
+                else:
+                    MESSAGES_COMPUTING.add(cache_key); should_compute=True
+            if cache:
+                return self.sendb(200, cache['body'])
+            if not should_compute:
+                # Outra thread já está computando: espera o resultado quente. Limite
+                # generoso (cold institucional ~7s); se estourar, caímos no cálculo
+                # próprio (correção > dedupe) para nunca devolver lista vazia falsa.
+                deadline=time.time()+9
+                while time.time()<deadline:
+                    time.sleep(0.05)
+                    cache=MESSAGES_API_CACHE.get(cache_key)
+                    if cache:
+                        return self.sendb(200, cache['body'])
+            try:
+                payload={'messages':messages_for(uid, conv)}
+                payload.update(local_state_summary(state_for_conversation(conv)))  # CH-010
+                body=json.dumps(payload, ensure_ascii=False).encode()
+                with MESSAGES_API_LOCK:
+                    MESSAGES_API_CACHE[cache_key]={'ts':time.time(),'body':body}
+            finally:
+                if should_compute:
+                    with MESSAGES_API_LOCK:
+                        MESSAGES_COMPUTING.discard(cache_key)
             return self.sendb(200, body)
         if path=='/api/chips':
             now=time.time(); cache=CHIPS_API_CACHE.get(uid)
@@ -7297,11 +10339,22 @@ class H(BaseHTTPRequestHandler):
             # HubSpot, fatiados por atividades HubSpot associadas ao deal.
             # Não lê/contempla mensagens WhatsApp e não escreve nada.
             return self.sendb(200, json.dumps(pipeline_focus(uid), ensure_ascii=False).encode())
+        if path=='/api/sdr-orchestrator-summary':
+            # Gestão SDR (Rafael/Dexter): visão somente leitura derivada do pipe.
+            # Não consulta HubSpot além do snapshot já cacheado; nunca escreve.
+            return self.sendb(200, json.dumps(sdr_orchestrator_summary(uid), ensure_ascii=False).encode())
+        if path=='/api/task-hygiene-preview':
+            # Prévia de higiene de tarefas, somente leitura. NÃO fecha/exclui nada.
+            return self.sendb(200, json.dumps(task_hygiene_preview(uid), ensure_ascii=False).encode())
+        if path=='/api/ops-health-summary':
+            # Cockpit leve de garantia operacional. Só lê arquivos/cache; sem HubSpot/WhatsApp.
+            return self.sendb(200, json.dumps(ops_health_summary(uid), ensure_ascii=False).encode())
         if path=='/api/dispatch-stats':
             # Gestão operacional: volume de mensagens disparadas por dia/chip.
             # Fonte local read-only: controle/wpp_envios.json. Sem bridge/HubSpot.
             qs=parse_qs(parsed.query)
-            return self.sendb(200, json.dumps(dispatch_stats(uid, (qs.get('days') or [14])[0]), ensure_ascii=False).encode())
+            _force=str((qs.get('force') or [''])[0]).lower() in ('1','true','yes')
+            return self.sendb(200, json.dumps(dispatch_stats(uid, (qs.get('days') or [14])[0], force=_force), ensure_ascii=False).encode())
         if path=='/api/cadencia/preview':
             # CH: prévia read-only do limbo de Primeiro Contato. Apenas lê o JSON do
             # dry-run (NÃO roda o script, NÃO envia WhatsApp, NÃO escreve HubSpot).
@@ -7314,7 +10367,8 @@ class H(BaseHTTPRequestHandler):
         if path=='/api/admin/users':
             if not USERS.get(uid,{}).get('admin'):
                 return self.sendb(403, json.dumps({'ok':False,'error':'admin_required'}).encode())
-            return self.sendb(200, json.dumps({'ok':True,'users':users_public(),'ports':[{'port':p, **cfg} for p,cfg in sorted(PORTS.items())]}, ensure_ascii=False).encode())
+            paused=load_paused_ports()
+            return self.sendb(200, json.dumps({'ok':True,'users':users_public(),'ports':[{'port':p, **cfg, 'paused': int(p) in paused} for p,cfg in sorted(PORTS.items())]}, ensure_ascii=False).encode())
         if path=='/api/hubspot':
             # CH-030: lateral HubSpot read-only. Nunca quebra a UI: token ausente
             # ou erro de API devolvem 200 com found=false.
@@ -7327,7 +10381,9 @@ class H(BaseHTTPRequestHandler):
             if not conversation_id_allowed(uid, conv_id):
                 return self.sendb(403, json.dumps({'found':False,'error':'Conversa nao permitida'}).encode())
             try:
-                conv=next((c for c in conversations(uid) if c.get('id')==conv_id), None)
+                conv=conversation_from_cache(uid, conv_id)
+                if conv is None:
+                    conv=next((c for c in conversations(uid) if c.get('id')==conv_id), None)
                 if not conv:
                     return self.sendb(200, json.dumps({'found':False,'configured':True,'contact':None,'deals':[]}).encode())
                 email, empresa = _conv_hubspot_hints(port, chat)
@@ -7352,24 +10408,28 @@ class H(BaseHTTPRequestHandler):
             # de sessão (mesma origem). Evita vazar credencial na página.
             auth=f"port={port}"
             return self.sendb(200, qr_page(port, label, auth, bridge_status(port)).encode(), 'text/html; charset=utf-8')
-        if path=='/api/media':
-            qs=parse_qs(parsed.query); port=int((qs.get('port') or [0])[0]); fname=os.path.basename((qs.get('file') or [''])[0]); chat=(qs.get('chat') or [''])[0]
-            allowed_media = port in effective_ports(uid)
-            if not allowed_media and chat:
-                try:
-                    allowed_media = conversation_id_allowed(uid, f'{port}::{chat}')
-                except Exception:
-                    allowed_media = False
-            if not allowed_media: return self.sendb(403,b'Forbidden','text/plain')
-            f=DATA_DIR/'media'/str(port)/fname
-            if not f.exists(): return self.sendb(404,b'Not found','text/plain')
+        if path.startswith(MEDIA_PROXY_PREFIX):
+            fname = os.path.basename(unquote(path[len(MEDIA_PROXY_PREFIX):]))
+            f = resolve_media_file_for_user(uid, fname)
+            if not f: return self.sendb(404,b'Not found','text/plain')
             data=f.read_bytes(); ctype=mimetypes.guess_type(str(f))[0] or 'application/octet-stream'
-            low=fname.lower()
+            low=f.name.lower()
             if low.endswith(('.ogg','.opus')): ctype='audio/ogg'
             elif low.endswith('.m4a'): ctype='audio/mp4'
             elif low.endswith('.mp3'): ctype='audio/mpeg'
             elif low.endswith('.wav'): ctype='audio/wav'
-            self.send_response(200); self.send_header('Content-Type',ctype); self.send_header('Content-Disposition',f'inline; filename="{fname}"'); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','private, max-age=300'); self.end_headers(); self.wfile.write(data); return
+            self.send_response(200); self.send_header('Content-Type',ctype); self.send_header('Content-Disposition',f'inline; filename="{f.name}"'); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','private, max-age=300'); self.end_headers(); self.wfile.write(data); return
+        if path=='/api/media':
+            qs=parse_qs(parsed.query); port=int((qs.get('port') or [0])[0]); fname=os.path.basename((qs.get('file') or [''])[0]); chat=(qs.get('chat') or [''])[0]
+            f=resolve_media_file_for_user(uid, fname, port, chat)
+            if not f: return self.sendb(404,b'Not found','text/plain')
+            data=f.read_bytes(); ctype=mimetypes.guess_type(str(f))[0] or 'application/octet-stream'
+            low=f.name.lower()
+            if low.endswith(('.ogg','.opus')): ctype='audio/ogg'
+            elif low.endswith('.m4a'): ctype='audio/mp4'
+            elif low.endswith('.mp3'): ctype='audio/mpeg'
+            elif low.endswith('.wav'): ctype='audio/wav'
+            self.send_response(200); self.send_header('Content-Type',ctype); self.send_header('Content-Disposition',f'inline; filename="{f.name}"'); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','private, max-age=300'); self.end_headers(); self.wfile.write(data); return
         return self.sendb(404,b'Not found','text/plain')
     def do_POST(self):
         global USERS, PORTS, INSTITUTIONAL_PRIVATE_PORTS
@@ -7526,11 +10586,16 @@ class H(BaseHTTPRequestHandler):
                 if port not in effective_ports(uid): return self.sendb(403,b'Porta nao permitida','text/plain')
                 if is_institutional_port(port): return self.sendb(403,b'Chip institucional/pessoal somente leitura no Channel','text/plain')
                 if not chat or not text: return self.sendb(400,b'Missing chat/text','text/plain')
-                if _dedupe_send(uid, port, chat, 'text', text):
+                target_jid, target_err = outbound_delivery_jid(port, chat)
+                if target_err:
+                    return self.sendb(400,json.dumps({'ok':False,'error':target_err},ensure_ascii=False).encode())
+                if _dedupe_send(uid, port, target_jid, 'text', text):
                     return self.sendb(200,json.dumps({'ok':True,'duplicate':True,'skipped':True},ensure_ascii=False).encode())
-                resp=post_json(f'http://127.0.0.1:{port}/send', {'to':chat,'text':text})
-                invalidate_channel_api_cache(uid, f'{port}::{canonical_chat_id(chat)}')
-                return self.sendb(200,json.dumps({'ok':True,'bridge':resp},ensure_ascii=False).encode())
+                resp=post_json(f'http://127.0.0.1:{port}/send', {'to':target_jid,'text':text})
+                audit=record_outbound_audit(uid, port, chat, target_jid, 'text', {'to':target_jid,'text':text}, resp, normalized_to_pn=(target_jid!=chat))
+                schedule_outbound_reconciliation(audit)
+                invalidate_channel_api_cache(uid, f'{port}::{canonical_chat_id(target_jid)}')
+                return self.sendb(200,json.dumps({'ok':True,'bridge':resp,'to':target_jid,'normalizedToPN':target_jid!=chat},ensure_ascii=False).encode())
             except Exception as e:
                 return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())
         if parsed.path=='/api/send-file':
@@ -7554,6 +10619,9 @@ class H(BaseHTTPRequestHandler):
                 return self.sendb(403,json.dumps({'ok':False,'error':'Chip institucional/pessoal somente leitura no Channel'},ensure_ascii=False).encode())
             if not chat:
                 return self.sendb(400,json.dumps({'ok':False,'error':'chat obrigatório'}).encode())
+            target_jid, target_err = outbound_delivery_jid(port, chat)
+            if target_err:
+                return self.sendb(400,json.dumps({'ok':False,'error':target_err},ensure_ascii=False).encode())
             if not file_name:
                 return self.sendb(400,json.dumps({'ok':False,'error':'fileName obrigatório'}).encode())
             if not data_b64:
@@ -7570,15 +10638,17 @@ class H(BaseHTTPRequestHandler):
                 dest_dir=UPLOADS_DIR/str(port)
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 safe_name=safe_upload_name(file_name)
-                if _dedupe_send(uid, port, chat, 'file', f'{safe_name}|{len(raw)}|{caption.strip()}'):
+                if _dedupe_send(uid, port, target_jid, 'file', f'{safe_name}|{len(raw)}|{caption.strip()}'):
                     return self.sendb(200,json.dumps({'ok':True,'duplicate':True,'skipped':True},ensure_ascii=False).encode())
                 dest=dest_dir/safe_name
                 dest.write_bytes(raw)
-                payload={'to':chat,'filePath':str(dest),'fileName':os.path.basename(file_name) or safe_name}
+                payload={'to':target_jid,'filePath':str(dest),'fileName':os.path.basename(file_name) or safe_name}
                 if caption: payload['caption']=caption
                 resp=post_json(f'http://127.0.0.1:{port}/send-file', payload)
-                invalidate_channel_api_cache(uid, f'{port}::{canonical_chat_id(chat)}')
-                return self.sendb(200,json.dumps({'ok':True,'bridge':resp},ensure_ascii=False).encode())
+                audit=record_outbound_audit(uid, port, chat, target_jid, 'file', payload, resp, normalized_to_pn=(target_jid!=chat))
+                schedule_outbound_reconciliation(audit)
+                invalidate_channel_api_cache(uid, f'{port}::{canonical_chat_id(target_jid)}')
+                return self.sendb(200,json.dumps({'ok':True,'bridge':resp,'to':target_jid,'normalizedToPN':target_jid!=chat},ensure_ascii=False).encode())
             except Exception as e:
                 return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())
         if parsed.path=='/api/state':
@@ -7751,11 +10821,61 @@ class H(BaseHTTPRequestHandler):
             return self.sendb(200,json.dumps({'ok':True,'action':action,'id':obj_id,'contactId':contact_id,'dealId':deal_id,'status':status},ensure_ascii=False).encode())
         return self.sendb(404,b'Not found','text/plain')
 
+def _write_conversations_prewarm_cache(convs, deps_mtime=None):
+    try:
+        CONVERSATIONS_PREWARM_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {'deps_mtime': float(deps_mtime or conversations_dependency_mtime()),
+                   'generated_at': time.time(), 'conversations': convs}
+        tmp = CONVERSATIONS_PREWARM_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(CONVERSATIONS_PREWARM_FILE)
+    except Exception:
+        pass
+
+
+def prewarm_conversations_cache():
+    """Carrega snapshot de inbox para evitar cold-start público pesado.
+
+    Não recalcula aqui: recomputar antes de abrir a porta deixa /health fora do ar
+    por ~40s e o watchdog pode subir processos duplicados. O snapshot é atualizado
+    quando `/api/conversations` calcula a lista com sucesso.
+    """
+    try:
+        if not CONVERSATIONS_PREWARM_FILE.exists():
+            print('Channel V2 prewarm: sem snapshot; cache será criado após primeira carga', flush=True)
+            return
+        payload = json.loads(CONVERSATIONS_PREWARM_FILE.read_text(encoding='utf-8'))
+        convs = payload.get('conversations') or []
+        caches = payload.get('caches') if isinstance(payload.get('caches'), dict) else None
+        deps_mtime = float(payload.get('deps_mtime') or 0)
+        if caches:
+            loaded = 0
+            for key, rows in caches.items():
+                if isinstance(rows, list) and rows:
+                    CONVERSATIONS_API_CACHE[str(key)] = {'ts': time.time(), 'deps_mtime': deps_mtime, 'conversations': rows}
+                    loaded += len(rows)
+            print(f'Channel V2 prewarm: {len(caches)} escopos carregados do snapshot ({loaded} conversas somadas)', flush=True)
+            return
+        if not isinstance(convs, list) or not convs:
+            return
+        CONVERSATIONS_API_CACHE['__view_all__'] = {'ts': time.time(), 'deps_mtime': deps_mtime, 'conversations': convs}
+        print(f'Channel V2 prewarm: {len(convs)} conversas carregadas do snapshot', flush=True)
+    except Exception as e:
+        print(f'Channel V2 prewarm falhou: {e}', flush=True)
+
+
 def main():
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
     ap=argparse.ArgumentParser(); ap.add_argument('--host',default='0.0.0.0'); ap.add_argument('--port',type=int,default=8791); ap.add_argument('--print-links',action='store_true')
     args=ap.parse_args();
     if args.print_links:
         for uid,cfg in USERS.items(): print(f"{cfg['name']}: http://127.0.0.1:{args.port}/?u={uid}&t={cfg['token']}")
         return
+    prewarm_conversations_cache()
+    warm_history_caches_background()
+    ThreadingHTTPServer.allow_reuse_address = True
     httpd=ThreadingHTTPServer((args.host,args.port),H); print(f'Channel V2 rodando em {args.host}:{args.port}', flush=True); httpd.serve_forever()
 if __name__=='__main__': main()

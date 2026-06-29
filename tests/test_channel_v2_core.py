@@ -1227,6 +1227,27 @@ class ChannelV2CoreTests(unittest.TestCase):
         self.assertEqual(pdfs[0]['id'], '3EBPDFREAL')
         self.assertIn('Automação', pdfs[0].get('automation', ''))
 
+    def test_real_api_send_pdf_and_cron_pdf_text_collapse_to_one_bubble(self):
+        real_pdf = {
+            'type': 'api-send', 'fromMe': True, 'chat': '5511981839853@s.whatsapp.net',
+            'id': '3EB05E3B7DA0D86D534ABA', 'timestamp': 1782774136,
+            'mediaType': 'document', 'mimetype': 'application/pdf',
+            'mediaName': 'Schutzmann - Potencial de Digitalizacao B2B.pdf',
+        }
+        synthetic_pdf = {
+            'type': 'cron-mql-pdf', 'fromMe': True, 'chat': '5511981839853@c.us',
+            'id': 'wpp_1114_schutzmann-maximilian-cordioli_1782774300_mql_pdf',
+            'timestamp': 1782774301,
+            'text': 'PDF enviado: Schutzmann - Potencial de Digitalizacao B2B.pdf',
+            'mediaType': 'document', 'mimetype': 'application/pdf',
+            'mediaName': 'Schutzmann - Potencial de Digitalizacao B2B.pdf',
+        }
+        collapsed = self.mod.collapse_automation([real_pdf, synthetic_pdf])
+        pdfs = [m for m in collapsed if self.mod._is_diagnostic_pdf_message(m)]
+        self.assertEqual(len(pdfs), 1)
+        self.assertEqual(pdfs[0]['id'], '3EB05E3B7DA0D86D534ABA')
+        self.assertNotIn('PDF enviado:', pdfs[0].get('text') or '')
+
     def test_inbox_list_is_paginated_for_mobile_performance(self):
         s = MODULE_PATH.read_text(encoding='utf-8')
         self.assertIn('const LIST_PAGE_SIZE=60', s)
