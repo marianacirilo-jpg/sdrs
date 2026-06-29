@@ -19,6 +19,8 @@ import sys
 import json
 import time
 import urllib.request
+import os
+from scripts.whatsapp_safe_send import safe_send_text
 
 # ─── Config ───
 BRIDGES = {
@@ -27,7 +29,20 @@ BRIDGES = {
     'lucas': {'port': 4603, 'owner_id': '85778446', 'owner_name': 'Lucas Batista'},
 }
 
-PAT = ""  # set HUBSPOT_ACCESS_TOKEN in environment
+def _load_hubspot_token():
+    token = os.environ.get('HUBSPOT_API_KEY') or os.environ.get('HUBSPOT_PRIVATE_APP_TOKEN')
+    if token:
+        return token.strip()
+    try:
+        with open('/root/.hermes/credentials/hubspot.env', 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('HUBSPOT_API_KEY='):
+                    return line.split('=', 1)[1].strip().strip('"\'')
+    except FileNotFoundError:
+        pass
+    raise RuntimeError('HUBSPOT_API_KEY não configurado')
+
+PAT = _load_hubspot_token()
 HUBSPOT_HEADERS = {"Authorization": f"Bearer {PAT}", "Content-Type": "application/json"}
 
 LEADS_FILE = '/tmp/sdr_primeiro_contato_enriquecido.json'
@@ -82,15 +97,7 @@ MSG_BUILDERS = {
 
 def send_whatsapp(port, jid, text):
     """Envia mensagem via bridge Baileys. Retorna (ok, response)."""
-    url = f"http://localhost:{port}/send"
-    body = json.dumps({"to": jid, "text": text}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            r = json.loads(resp.read().decode())
-            return r.get('success', False), r
-    except Exception as e:
-        return False, {"error": str(e)}
+    return safe_send_text(port, jid, text, uid='disparo_primeiro_contato', timeout=30)
 
 
 def get_contact_id(deal_id):

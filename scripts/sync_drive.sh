@@ -77,6 +77,7 @@ do_sync() {
     --exclude "*.pyc" \
     --exclude "*.tar" \
     --exclude "*secret*" \
+    --exclude "controle/dashboard_token.txt" \
     --exclude "roteiro-standalone/**" \
     --exclude "logs/**" \
     --transfers 1 \

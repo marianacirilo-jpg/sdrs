@@ -21,3 +21,11 @@ outputs/
 *.tar
 *.tgz
 .DS_Store
+
+# Zydon operational runtime / sensitive
+tmp/
+controle/runtime/
+controle/releases/
+controle/backups/
+controle/*.lock
+controle/*.tmp

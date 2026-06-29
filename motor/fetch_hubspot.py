@@ -2,9 +2,17 @@
 # -*- coding: utf-8 -*-
 import urllib.request, urllib.error, json, os, sys, time
 
-HUBSPOT_API_KEY = os.environ.get("HUBSPOT_API_KEY") or os.environ.get("HUBSPOT_ACCESS_TOKEN")
-if not HUBSPOT_API_KEY:
-    raise SystemExit("Set HUBSPOT_API_KEY or HUBSPOT_ACCESS_TOKEN in the environment")
+def _load_hubspot_token():
+    token = os.environ.get('HUBSPOT_API_KEY') or os.environ.get('HUBSPOT_PRIVATE_APP_TOKEN')
+    if token:
+        return token.strip()
+    with open('/root/.hermes/credentials/hubspot.env', 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('HUBSPOT_API_KEY='):
+                return line.split('=', 1)[1].strip().strip('"\'')
+    raise RuntimeError('HUBSPOT_API_KEY não configurado')
+
+HUBSPOT_API_KEY=_load_hubspot_token()
 HUBSPOT_REGION="na1"
 BASE_URL="https://api.hubapi.com"
 

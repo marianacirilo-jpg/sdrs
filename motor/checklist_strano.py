@@ -2,7 +2,17 @@
 """Final verification checklist for Strano lead"""
 import json, os, urllib.request
 
-T = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+def _load_hubspot_token():
+    token = os.environ.get('HUBSPOT_API_KEY') or os.environ.get('HUBSPOT_PRIVATE_APP_TOKEN')
+    if token:
+        return token.strip()
+    with open('/root/.hermes/credentials/hubspot.env', 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('HUBSPOT_API_KEY='):
+                return line.split('=', 1)[1].strip().strip('"\'')
+    raise RuntimeError('HUBSPOT_API_KEY não configurado')
+
+T = _load_hubspot_token()
 
 # 1. Verify lifecyclestage
 url = "https://api.hubapi.com/crm/v3/objects/contacts/230944551687?properties=lifecyclestage"

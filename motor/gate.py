@@ -50,7 +50,7 @@ PROPERTIES = [
     'firstname', 'lastname', 'email', 'company', 'phone',
     'hs_whatsapp_phone_number', 'hs_searchable_calculated_phone_number',
     'lifecyclestage', 'hs_lead_status',
-    'hubspot_owner_id', 'createdate',
+    'hubspot_owner_id', 'createdate', 'lastmodifieddate', 'hs_lastmodifieddate',
     # Reentrada por formulário em contato já existente: HubSpot mantém o
     # createdate antigo, então o gate precisa olhar a conversão recente também.
     'recent_conversion_date', 'recent_conversion_event_name',
@@ -377,13 +377,76 @@ def load_sent_phones():
         log(f'[gate] erro lendo wpp_envios.json: {e}')
         return set()
     phones = set()
-    if isinstance(data, list):
-        for entry in data:
-            if isinstance(entry, dict):
-                d = only_digits(entry.get('to'))
-                if d:
-                    phones.add(d)
+    if isinstance(data, dict):
+        envios = data.get('envios', [])
+    elif isinstance(data, list):
+        envios = data
+    else:
+        envios = []
+    inbound_done_statuses = {
+        'enviado_lead',
+        'enviado_mql',
+        'enviado_lead_manual_mql',
+        'manual_nao_mql_convertido_mql',
+        'mql_diagnostico_em_andamento',
+    }
+    for entry in envios:
+        if not isinstance(entry, dict):
+            continue
+        status = (entry.get('status') or entry.get('msg_type') or '').strip().lower()
+        # Evita contaminar o dedup inbound com fluxos SDR genéricos sem status
+        # de qualificação/diagnóstico. Mas inclui status manuais auditáveis que
+        # também significam "este telefone já foi tratado no inbound".
+        if status and status not in inbound_done_statuses:
+            continue
+        for field in ('to', 'phone', 'telefone', 'jid', 'lead_jid'):
+            d = only_digits(entry.get(field))
+            if d:
+                phones.add(d)
+                # Normaliza @s.whatsapp.net/@c.us e números BR com 55 para a
+                # mesma chave usada pelos leads vindos do HubSpot.
+                if d.startswith('55') and len(d) >= 12:
+                    phones.add(d[2:])
     return phones
+
+
+def is_form_reentry_event(props):
+    """Retorna True só para conversões recentes que podem ser novo formulário.
+
+    HubSpot também atualiza `recent_conversion_date` para eventos que NÃO são
+    novo diagnóstico/formulário, especialmente `Meetings Link: ...`. Usar esses
+    eventos como reentrada fura o dedup e reenvia diagnóstico para lead já
+    tratado. Reentrada automática é apenas para novo preenchimento/conversão de
+    formulário; eventos de agenda/conversa/WhatsApp ficam bloqueados.
+    """
+    props = props or {}
+    event = (props.get('recent_conversion_event_name') or '').strip()
+    if not event:
+        return False
+    norm = norm_text(event)
+    non_form_tokens = (
+        'meetings link', 'meeting link', 'meeting', 'reuniao', 'reunioes',
+        'agenda', 'calendly', 'conversations', 'conversation', 'whatsapp',
+        'whats app', 'chat', 'inbox', 'offline', 'offline sources',
+    )
+    if any(tok in norm for tok in non_form_tokens):
+        return False
+    return True
+
+
+def is_forms_channel_lead(props):
+    """Trilho principal do Rafael: processar forms/forms/forms.
+
+    Contato criado por FORM entra. Contato antigo só reentra se o evento recente
+    parecer formulário real. Eventos offline/conversation/meeting não devem gastar
+    qualificação nem pesquisa automática.
+    """
+    props = props or {}
+    source = (props.get('hs_object_source') or '').strip().upper()
+    source_label = (props.get('hs_object_source_label') or '').strip().upper()
+    if source == 'FORM' or source_label in {'FORM', 'FORMS'}:
+        return True
+    return is_form_reentry_event(props)
 
 
 def is_landline(digits):
@@ -530,6 +593,80 @@ def hubspot_search():
         sys.exit(1)
 
 
+MANUAL_MQL_SOURCE_TYPES = {'CRM_UI', 'MOBILE_IOS', 'MOBILE_ANDROID'}
+
+
+def is_manual_mql_history_item(item):
+    """True só quando o HubSpot mostra MQL alterado manualmente por usuário/app.
+
+    MQL vindo de AUTOMATION_PLATFORM, INTEGRATION/Intercom ou formulário não é
+    override humano do Rafael/time; nesses casos o crivo Não-MQL continua valendo.
+    """
+    if not isinstance(item, dict):
+        return False
+    if str(item.get('value') or '').strip().lower() != 'marketingqualifiedlead':
+        return False
+    source_type = str(item.get('sourceType') or '').strip().upper()
+    if source_type in MANUAL_MQL_SOURCE_TYPES:
+        return True
+    # Fallback conservador para formatos HubSpot que trazem userId sem sourceType
+    # explícito. Sem userId, não tratar como manual.
+    return not source_type and bool(item.get('updatedByUserId'))
+
+
+def latest_manual_mql_lifecycle_timestamp_from_history(history):
+    """Último timestamp em que lifecyclestage virou MQL manualmente no HubSpot/app."""
+    latest = None
+    for item in history or []:
+        if not is_manual_mql_history_item(item):
+            continue
+        ts = parse_hs_datetime(item.get('timestamp'))
+        if ts and (latest is None or ts > latest):
+            latest = ts
+    return latest
+
+
+def fetch_lifecycle_history(contact_id, token):
+    """Busca histórico de lifecyclestage para diferenciar MQL manual real de update qualquer."""
+    if not contact_id:
+        return []
+    url = f'{BASE_URL}/crm/v3/objects/contacts/{contact_id}?propertiesWithHistory=lifecyclestage'
+    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'}, method='GET')
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        return (((data.get('propertiesWithHistory') or {}).get('lifecyclestage')) or [])
+    except Exception as e:
+        log(f'[gate] erro buscando histórico lifecyclestage contato {contact_id}: {e}')
+        return []
+
+
+def is_manual_mql_trigger(contact, props, processed_at, token, now=None):
+    """True quando a mudança para MQL ocorreu depois do último processamento.
+
+    Não basta `lifecyclestage=MQL + lastmodifieddate recente`: qualquer update
+    posterior (ex.: owner/task) também muda lastmodifieddate. O sinal seguro é o
+    histórico da própria propriedade `lifecyclestage` ter virado MQL dentro da
+    janela recente E depois do processed_at.
+
+    Rafael 28/06: "não fica lendo nada antigo; só lead novo". Portanto, se o
+    contato nunca foi processado localmente mas a virada para MQL é antiga/herdada,
+    não é trigger manual: precisa nova conversão real ou lifecycle virando MQL agora.
+    """
+    lifecycle = (props.get('lifecyclestage') or '').strip().lower()
+    if lifecycle != 'marketingqualifiedlead':
+        return False
+    history = fetch_lifecycle_history(contact.get('id'), token)
+    mql_at = latest_manual_mql_lifecycle_timestamp_from_history(history)
+    if not mql_at:
+        return False
+    now = now or datetime.now(timezone.utc)
+    recent_cutoff = now - timedelta(hours=WINDOW_HOURS)
+    if mql_at < recent_cutoff:
+        return False
+    return processed_at is None or mql_at > processed_at
+
+
 def write_output(leads, duplicates=None):
     payload = {
         'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -551,9 +688,11 @@ def main():
     sent_phones = load_sent_phones()
 
     # --- HubSpot ---
+    token = os.environ.get('HUBSPOT_API_KEY', '')
     search = hubspot_search()
     contacts = search.get('results', []) if isinstance(search, dict) else []
     total_hubspot = len(contacts)
+    window_cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
 
     candidates = []
     dedup_count = 0  # quantos foram barrados pelo dedup/regras
@@ -566,17 +705,30 @@ def main():
             dedup_count += 1
             continue
 
+        lifecycle = (props.get('lifecyclestage') or '').strip().lower()
+        processed_at = processed.get(email)
+        # Rafael 29/06: NÃO usar lastmodifieddate como gatilho de "gol de mão".
+        # Esse campo muda por owner, task, nota, automação e qualquer toque no CRM;
+        # ontem ele cavou backlog/falso positivo. MQL manual/F5 só entra quando
+        # Rafael avisar explicitamente ou por uma fila/override auditável separado.
+        manual_mql_trigger = False
+
         # Contatos criados manualmente pela UI do CRM são tratativa interna;
-        # não investigar/prospectar. Só liberar origens automáticas/externas
-        # (FORM, INTEGRATION, IMPORT, API etc.).
+        # exceção: Marketing marcou/atualizou lifecyclestage=MQL depois do último
+        # processamento, então precisa investigar e poder disparar diagnóstico.
         source = (props.get('hs_object_source') or '').strip().upper()
         source_label = (props.get('hs_object_source_label') or '').strip().upper()
-        if source == 'CRM_UI' or source_label in {'CRM_UI', 'CRM UI'}:
+        if (source == 'CRM_UI' or source_label in {'CRM_UI', 'CRM UI'}) and not manual_mql_trigger:
+            dedup_count += 1
+            continue
+
+        # Rafael 28/06: atuar principalmente em forms/forms/forms.
+        # Exceção manual/F5 NÃO vem de lastmodifieddate; precisa override explícito.
+        if not is_forms_channel_lead(props) and not manual_mql_trigger:
             dedup_count += 1
             continue
 
         # Rejeitar customers (clientes ativos NÃO são prospecção nova).
-        lifecycle = (props.get('lifecyclestage') or '').strip().lower()
         if lifecycle == 'customer':
             dedup_count += 1
             continue
@@ -591,15 +743,27 @@ def main():
         processed_at = processed.get(email)
         recent_at = parse_hs_datetime(props.get('recent_conversion_date'))
         created_at = parse_hs_datetime(props.get('createdate'))
+        # Rafael 28/06: "não fica lendo nada antigo não, só vê e lê lead novo".
+        # Como `hubspot_search` também busca lastmodifieddate para detectar MQL manual,
+        # contatos antigos podem entrar no payload bruto. Filtrar aqui: se não foi
+        # criado na janela, não teve conversão/formulário recente e não é MQL manual
+        # recente confirmado pelo histórico de lifecyclestage, NÃO entra no gate.
+        is_created_recent = bool(created_at and created_at >= window_cutoff)
+        is_conversion_recent = bool(recent_at and recent_at >= window_cutoff)
+        if not (is_created_recent or is_conversion_recent or manual_mql_trigger):
+            dedup_count += 1
+            continue
         # Só é reentrada quando a conversão é posterior à criação do contato.
         # Em contato novo, HubSpot também preenche recent_conversion_date ~= createdate;
         # isso NÃO deve furar dedup antigo.
-        is_reentry = bool(
+        is_form_reentry = bool(
             recent_at
             and created_at
             and (recent_at - created_at).total_seconds() > 300
             and (processed_at is None or recent_at > processed_at)
+            and is_form_reentry_event(props)
         )
+        is_reentry = is_form_reentry or manual_mql_trigger
         if email in processed and not is_reentry:
             dedup_count += 1
             continue
@@ -624,9 +788,11 @@ def main():
             phone_valid = False
             phone_invalid_reason = 'telefone fixo ou inválido para WhatsApp'
 
-        # Dedup secundário estrito só quando há telefone utilizável já enviado.
-        # Reenvio de formulário posterior ao processamento entra novamente.
-        if phone_valid and phone_digits and phone_digits in sent_phones and not is_reentry:
+        # Dedup secundário estrito quando já há diagnóstico MQL em andamento/final
+        # para o telefone. Reenvio REAL de formulário ainda pode reentrar; MQL
+        # manual recente não pode repetir se um diagnóstico manual anterior já
+        # gravou status auditável no ledger.
+        if phone_valid and phone_digits and phone_digits in sent_phones and not is_form_reentry:
             dedup_count += 1
             continue
 
@@ -640,6 +806,8 @@ def main():
             'phone_valid': phone_valid,
             'phone_invalid_reason': phone_invalid_reason,
             'createdate': props.get('createdate') or '',
+            'gate_trigger': 'manual_hubspot_mql' if manual_mql_trigger else ('form_reentry' if is_form_reentry else 'new_form'),
+            'hs_lastmodifieddate': props.get('lastmodifieddate') or props.get('hs_lastmodifieddate') or '',
             'properties': props,
         }
         candidates.append(lead)
@@ -652,7 +820,8 @@ def main():
     # Já vem ordenado ASC do HubSpot para leads novos; para reenvio de formulário
     # em contato antigo, FIFO deve usar recent_conversion_date quando existir.
     primaries.sort(key=lambda l: (
-        (l.get('properties') or {}).get('recent_conversion_date')
+        (l.get('hs_lastmodifieddate') if l.get('gate_trigger') == 'manual_hubspot_mql' else '')
+        or (l.get('properties') or {}).get('recent_conversion_date')
         or l.get('createdate')
         or ''
     ))

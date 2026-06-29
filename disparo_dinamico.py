@@ -27,6 +27,7 @@ import atexit
 import os
 import re
 from datetime import datetime, timezone, timedelta
+from scripts.whatsapp_safe_send import safe_send_text
 
 # ─── Config ───
 BRIDGES = {
@@ -36,9 +37,25 @@ BRIDGES = {
     'lucas': {'port': 4603, 'owner_id': '85778446', 'owner_name': 'Lucas Batista'},
 }
 
-PAT = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+def _load_hubspot_token():
+    token = os.environ.get('HUBSPOT_API_KEY') or os.environ.get('HUBSPOT_PRIVATE_APP_TOKEN')
+    if token:
+        return token.strip()
+    env_path = '/root/.hermes/credentials/hubspot.env'
+    try:
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('HUBSPOT_API_KEY='):
+                    return line.split('=', 1)[1].strip().strip('"\'')
+    except FileNotFoundError:
+        pass
+    raise RuntimeError('HUBSPOT_API_KEY não configurado em env ou /root/.hermes/credentials/hubspot.env')
+
+PAT = _load_hubspot_token()
 HS_HEADERS = {"Authorization": f"Bearer {PAT}", "Content-Type": "application/json"}
 PIPELINE = '671008549'
+STAGE_LEAD_SEM_CONTATO = '984052829'
+STAGE_PRIMEIRO_CONTATO = '1214320997'
 FIRST_5_STAGES = ['984052829', '1214320997', '998099482', '1151853491', '1376131958']
 
 WPP_ENVIOS = '/root/.hermes/zydon-prospeccao/controle/wpp_envios.json'
@@ -232,6 +249,29 @@ def envios_phone_set(envios):
     return chaves
 
 
+def diagnostico_ports_for_phone(envios, phone_key):
+    ports = set()
+    if not phone_key:
+        return ports
+    for r in envios:
+        if not isinstance(r, dict):
+            continue
+        status = str(r.get('status') or '').lower()
+        msg_type = str(r.get('msg_type') or '').lower()
+        if status not in {'enviado_lead', 'enviado_mql'} and msg_type not in {'diagnostico_mql', 'mql_diagnostico'}:
+            continue
+        vals = [str(r.get(c) or '') for c in PHONE_FIELDS]
+        if not any(normalize_phone(v) == phone_key for v in vals):
+            continue
+        for field in ('bridge_port', 'port', 'sender_port'):
+            try:
+                if r.get(field):
+                    ports.add(int(r.get(field)))
+            except Exception:
+                pass
+    return ports
+
+
 def diagnostico_context_for_phone(envios, phone_key):
     """Retorna contexto curto do diagnóstico/MQL já enviado para o telefone."""
     if not phone_key:
@@ -255,6 +295,11 @@ def diagnostico_context_for_phone(envios, phone_key):
     txt = re.sub(r'\s+', ' ', matches[-1])
     # Pegar um trecho útil, sem transformar em afirmação forte.
     return txt[:360]
+
+
+def intent_question_already_asked(text):
+    t = re.sub(r'\s+', ' ', str(text or '').lower())
+    return ('como você imagina' in t or 'como voce imagina' in t or 'por que se cadastrou' in t or 'o que te chamou atenção' in t or 'o que te chamou atencao' in t)
 
 
 def parse_envio_datetime(record):
@@ -573,19 +618,22 @@ def filtrar_deals_sem_atividade_valida(deals):
     return elegiveis
 
 
-def buscar_deals_sem_tarefa(owner_id):
+def buscar_deals_sem_tarefa(owner_id, stages=None):
     """
-    Busca deals nas 5 primeiras etapas pertencentes ao owner.
+    Busca deals pertencentes ao owner nas etapas informadas.
+    Padrão histórico: 5 primeiras etapas. Para primeiro contato automático,
+    Rafael definiu escopo estrito: somente Lead Sem Contato.
     Retorna lista de {deal_id, dealname, dealstage, createdate}.
     Prioridade do Rafael: lead novo/quente primeiro — quem acabou de entrar
     deve ser chamado antes do backlog antigo.
     """
+    stages = list(stages or FIRST_5_STAGES)
     url = "https://api.hubapi.com/crm/v3/objects/deals/search"
     body = {
         "filterGroups": [{
             "filters": [
                 {"propertyName": "pipeline", "operator": "EQ", "value": PIPELINE},
-                {"propertyName": "dealstage", "operator": "IN", "values": FIRST_5_STAGES},
+                {"propertyName": "dealstage", "operator": "IN", "values": stages},
                 {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": owner_id},
             ]
         }],
@@ -805,24 +853,101 @@ def saudacao_por_variacao(nome_ok, idx, casual='Oi'):
     return opts[idx % len(opts)]
 
 
+FIRST_SDR_QUESTION = 'Como você imagina que a Zydon poderia te apoiar?'
+FIRST_SDR_QUESTION_ALT = 'Como você imagina que a Zydon poderia te apoiar?'
+SECOND_INTENT_QUESTION = 'Para eu não repetir a mesma pergunta: hoje você está buscando um portal B2B próprio, reduzir pedido manual ou entender se a Zydon é diferente de marketplace/site comum?'
+MIN_HOURS_AFTER_DIAG_FOR_SDR_FOLLOW = 3.0
+
+
+def first_sdr_question_for_key(key):
+    try:
+        import hashlib
+        h = int(hashlib.sha256(str(key or '').encode()).hexdigest()[:8], 16)
+        return FIRST_SDR_QUESTION_ALT if h % 2 else FIRST_SDR_QUESTION
+    except Exception:
+        return FIRST_SDR_QUESTION
+
+
+def diagnostico_intro(empresa=''):
+    # Régua Rafael 27/06: primeiro contato precisa explicar rapidamente a Zydon
+    # antes de perguntar. Evita mensagem abstrata de "diagnóstico" sem o lead
+    # entender o produto.
+    if empresa:
+        return f"Vi seu cadastro da {empresa} e queria te contextualizar rápido."
+    return "Vi seu cadastro e queria te contextualizar rápido."
+
+
+def zydon_explicacao_curta():
+    return (
+        "O cliente entra com login, vê catálogo, tabela comercial e formas de pagamento dele, "
+        "e faz o pedido direto."
+    )
+
+
+FALLBACK_PORTAL_EXAMPLES = [
+    'https://voolt3datacado.com.br/',
+    'https://stoky.com.br/',
+    'https://portal.ceasamais.com.br/',
+]
+
+
+def portal_real_para_lead(empresa='', nome='', erp=''):
+    key = f"{empresa}|{nome}|{erp}"
+    idx = int(hashlib.sha256(key.encode('utf-8')).hexdigest()[:8], 16) % len(FALLBACK_PORTAL_EXAMPLES)
+    return FALLBACK_PORTAL_EXAMPLES[idx]
+
+
+def bloco_portal_real(empresa='', nome='', erp=''):
+    return f"Separei um portal real para visualizar a experiência:\n\n{portal_real_para_lead(empresa, nome, erp)}"
+
+
+def contextualizacao_obrigatoria(text='', empresa=''):
+    """Contextualiza sem repetir diagnóstico nem fazer questionário abstrato."""
+    return "Isso conversa com o que vocês estão buscando?"
+
+
+SDR_PORTS = {4601, 4603, 4605}
+CALL_CTA = 'Você tem um tempo agora? Posso te ligar rapidinho?'
+
+
+def is_business_hours_brt(dt=None):
+    dt = dt or datetime.now(timezone(timedelta(hours=-3)))
+    return dt.weekday() < 5 and 8 <= dt.hour < 18
+
+
+def can_offer_call(port=None, is_sdr_sender=True, dt=None):
+    try:
+        port_ok = int(port) in SDR_PORTS
+    except Exception:
+        port_ok = False
+    return bool(is_sdr_sender and port_ok and is_business_hours_brt(dt))
+
+
+def apply_contact_cta(text, port=None, is_sdr_sender=True, dt=None):
+    # Rafael: só falar de ligação se sair do WhatsApp do SDR e em horário comercial.
+    # Se não couber ligação, não adicionar CTA genérico do tipo "responde por aqui".
+    for phrase in (CALL_CTA, 'Prefere que eu te chame por aqui ou uma ligação rápida?',
+                   'Pode me responder por aqui mesmo.', 'Pode me responder por aqui?', 'Pode ser por aqui?'):
+        text = text.replace('\n\n' + phrase, '').replace(phrase, '').strip()
+    if can_offer_call(port, is_sdr_sender=is_sdr_sender, dt=dt) and CALL_CTA not in text:
+        text = text.rstrip() + '\n\n' + CALL_CTA
+    return text
+
+
 def montar_msg_breno(nome, empresa, erp):
     nome_ok = primeiro_nome_valido(nome)
     empresa_ok = empresa_valida(empresa)
-    var_idx = escolher_variacao('breno', nome, empresa, erp, 8)
+    var_idx = escolher_variacao('breno', nome, empresa, erp, 3)
     saudacao = saudacao_por_variacao(nome_ok, var_idx, 'Oi')
     empresa_txt = f" da {empresa_ok}" if empresa_ok else ""
-    empresa_contexto = f"a {empresa_ok}" if empresa_ok else "a empresa"
     erp_txt = f" Vi aqui também que vocês usam {erp}." if erp else ""
+    contexto = contextualizacao_obrigatoria(empresa=empresa_ok or empresa)
+    portal = bloco_portal_real(empresa_ok or empresa, nome, erp)
+    explicacao = zydon_explicacao_curta()
     variacoes = [
-        # Ideia do Breno aprovada pelo Rafael: variar entre ligação e conversa por WhatsApp.
-        f"{saudacao} Breno aqui da Zydon. Vi que você preencheu nosso formulário para conhecer nossa plataforma de digitalização comercial.{erp_txt}\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Breno aqui, da Zydon. Vi seu diagnóstico{empresa_txt} e queria entender melhor o cenário antes de te direcionar.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Breno aqui da Zydon. Recebi seu formulário sobre digitalização comercial B2B e queria tirar 2 dúvidas rápidas para orientar melhor {empresa_contexto}.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Aqui é o Breno, da Zydon. Vi que você deixou seus dados para conhecer a Zydon{empresa_txt}.{erp_txt}\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Breno da Zydon por aqui. Chegou pra mim seu cadastro{empresa_txt}; queria entender rapidinho o momento de vocês.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Aqui é o Breno, da Zydon. Recebi o interesse{empresa_txt} e queria só entender qual canal hoje concentra mais os pedidos B2B de vocês.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Breno aqui da Zydon. Estou olhando seu cadastro{empresa_txt} e queria validar se faz sentido falar de portal B2B agora ou mais pra frente.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Breno, da Zydon. Vi o formulário{empresa_txt} e queria te fazer 2 perguntas para não te mandar uma apresentação fora do contexto.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
+        f"{saudacao} Breno aqui da Zydon. Vi seu cadastro{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
+        f"{saudacao} Aqui é o Breno, da Zydon. Recebi seu interesse{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
+        f"{saudacao} Breno da Zydon por aqui. Estou com seu cadastro{empresa_txt} aqui.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
     ]
     return variacoes[var_idx % len(variacoes)]
 
@@ -830,22 +955,17 @@ def montar_msg_breno(nome, empresa, erp):
 def montar_msg_sarah(nome, empresa, erp):
     nome_ok = primeiro_nome_valido(nome)
     empresa_ok = empresa_valida(empresa)
-    var_idx = escolher_variacao('sarah', nome, empresa, erp, 10)
+    var_idx = escolher_variacao('sarah', nome, empresa, erp, 3)
     saudacao = saudacao_por_variacao(nome_ok, var_idx, 'Oie')
     empresa_txt = f" da {empresa_ok}" if empresa_ok else ""
-    empresa_contexto = f"a {empresa_ok}" if empresa_ok else "a empresa"
-    erp_txt = f" Vi aqui que vocês usam {erp}, então queria entender como está o fluxo comercial hoje." if erp else ""
+    erp_txt = f" Vi aqui que vocês usam {erp}." if erp else ""
+    contexto = contextualizacao_obrigatoria(empresa=empresa_ok or empresa)
+    portal = bloco_portal_real(empresa_ok or empresa, nome, erp)
+    explicacao = zydon_explicacao_curta()
     variacoes = [
-        f"{saudacao} Sarah aqui, da Zydon. Recebi o cadastro{empresa_txt} e queria entender melhor o cenário antes de te direcionar.{erp_txt}\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Aqui é a Sarah, da Zydon. Vi que {empresa_contexto} demonstrou interesse em digitalizar vendas B2B.{erp_txt}\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Sarah da Zydon por aqui. Chegou pra mim o cadastro{empresa_txt}; queria entender melhor como vocês vendem hoje.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Aqui é a Sarah, da Zydon. Vi seu interesse em e-commerce B2B e queria entender se hoje os pedidos ainda chegam por WhatsApp, ligação ou vendedor.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Sarah aqui da Zydon. Recebi seu formulário{empresa_txt} e queria tirar 2 dúvidas rápidas para ver se a Zydon encaixa no cenário de vocês.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Sarah, da Zydon. Estou com seu cadastro{empresa_txt} aqui e queria entender se vocês já têm algum canal B2B online ou se ainda centralizam no time comercial.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Aqui é a Sarah da Zydon. Vi que vocês buscaram saber mais sobre digitalização comercial{empresa_txt}.{erp_txt}\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Sarah da Zydon por aqui. Antes de te encaminhar um diagnóstico, queria entender uma coisa: hoje o cliente de vocês compra mais por pedido recorrente, catálogo ou contato direto com vendedor?",
-        f"{saudacao} Aqui é a Sarah, da Zydon. Recebi seu formulário e queria confirmar se a prioridade aí é organizar pedidos B2B ou abrir um canal de venda online para clientes atuais.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{saudacao} Sarah aqui. Vi seu interesse na Zydon{empresa_txt} e queria entender rapidamente o cenário.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
+        f"{saudacao} Sarah aqui, da Zydon. Recebi seu cadastro{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
+        f"{saudacao} Aqui é a Sarah, da Zydon. Vi o interesse{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
+        f"{saudacao} Sarah da Zydon por aqui. Chegou para mim o cadastro{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
     ]
     return variacoes[var_idx % len(variacoes)]
 
@@ -855,14 +975,14 @@ def montar_msg_lucas(nome, empresa, erp):
     empresa_ok = empresa_valida(empresa)
     empresa_txt = f" da {empresa_ok}" if empresa_ok else ""
     erp_txt = f" Vi também que vocês usam {erp}." if erp else ""
-    var_idx = escolher_variacao('lucas_batista', nome, empresa, erp, 6)
+    contexto = contextualizacao_obrigatoria(empresa=empresa_ok or empresa)
+    portal = bloco_portal_real(empresa_ok or empresa, nome, erp)
+    explicacao = zydon_explicacao_curta()
+    var_idx = escolher_variacao('lucas_batista', nome, empresa, erp, 3)
     variacoes = [
-        f"Olá {nome_ok}! Tudo bem?\nLucas Batista aqui da Zydon.\n\nVocê solicitou um contato para fazer o *Diagnóstico Comercial B2B*{empresa_txt}.{erp_txt}\n\nQueria confirmar algumas informações. Você tem um tempo agora? Posso te ligar rapidinho?",
-        f"Oi, {nome_ok}. Lucas Batista, da Zydon. Recebi o pedido de diagnóstico{empresa_txt} e queria entender rapidinho o cenário comercial de vocês antes de avançar.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"{nome_ok}, tudo bem? Lucas Batista aqui. Vi seu cadastro{empresa_txt} para falar sobre digitalização comercial B2B.{erp_txt}\n\nPrefere que eu te chame por aqui ou uma ligação rápida?",
-        f"Olá, {nome_ok}. Aqui é o Lucas Batista da Zydon. Chegou para mim sua solicitação de diagnóstico{empresa_txt}.\n\nQueria validar 2 pontos para encaminhar corretamente. Você tem um tempo agora? Posso te ligar rapidinho?",
-        f"Oi {nome_ok}, tudo certo? Lucas Batista por aqui, da Zydon. Antes de te mandar qualquer material, queria entender como vocês recebem pedidos B2B hoje.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
-        f"Bom dia, {nome_ok}. Lucas Batista da Zydon. Estou com o cadastro{empresa_txt} aqui e queria confirmar se o objetivo é organizar pedidos atuais ou abrir um canal B2B online.\n\nVocê tem um tempo agora? Posso te ligar rapidinho?",
+        f"Olá {nome_ok}! Tudo bem?\nLucas Batista aqui da Zydon. Recebi seu cadastro{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
+        f"Oi, {nome_ok}. Lucas Batista, da Zydon. Estou com seu interesse{empresa_txt} aqui.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
+        f"{nome_ok}, tudo bem? Lucas Batista aqui. Vi seu cadastro{empresa_txt}.{erp_txt}\n\n{portal}\n\n{explicacao}\n\n{contexto}",
     ]
     return variacoes[var_idx % len(variacoes)]
 
@@ -875,15 +995,169 @@ MSG_BUILDERS = {
 
 
 def send_whatsapp(port, jid, text):
-    url = f"http://localhost:{port}/send"
-    body = json.dumps({"to": jid, "text": text}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            r = json.loads(resp.read().decode())
-            return r.get('success', False), r
-    except Exception as e:
-        return False, {"error": str(e)}
+    return safe_send_text(port, jid, text, uid='disparo_dinamico', timeout=30)
+
+
+def greeting_period_brt(dt=None):
+    dt = dt or datetime.now(timezone(timedelta(hours=-3)))
+    if dt.hour < 12:
+        return 'Bom dia'
+    if dt.hour < 18:
+        return 'Boa tarde'
+    return 'Boa noite'
+
+
+def first_para_is_greeting_or_intro(first_para):
+    """Detecta se o primeiro parágrafo é abertura pessoal, não conteúdo operacional."""
+    text = str(first_para or '').strip()
+    if re.match(r'^(Bom dia|Boa tarde|Boa noite),\s*([^.!?\n,]{2,40})\.\s*Tudo bem\??$', text, re.I):
+        return True
+    if re.match(r'^(?:fala\s+|oi\s+|olá\s+)?([^,!.?\n]{2,40})[,!.?]\s*(?:aqui|tudo bem|bom dia|boa tarde|boa noite|oi|olá|fala)\b', text, re.I):
+        return True
+    if re.match(r'^(?:oi|olá|ola|fala)\s+[^\n]{2,40}(?:,|!|\.)', text, re.I):
+        return True
+    return False
+
+
+def greeting_from_intro(first_para):
+    """Transforma a abertura em cumprimento curto: 'Bom dia, Nome. Tudo bem?'"""
+    text = str(first_para or '').strip()
+    # Se já vier no formato aprovado (Bom dia/Boa tarde/Boa noite, Nome. Tudo bem?), preserva.
+    m0 = re.match(r'^(Bom dia|Boa tarde|Boa noite),\s*([^.!?\n,]{2,40})\.\s*Tudo bem\??$', text, re.I)
+    if m0:
+        name0 = m0.group(2).strip()
+        return f"{greeting_period_brt()}, {name0}. Tudo bem?"
+    # Pega o nome antes da primeira vírgula em aberturas tipo
+    # 'Andre, aqui é Rafael...' ou 'Fala Andre!'.
+    name = ''
+    m = re.match(r'^(?:fala\s+|oi\s+|olá\s+)?([^,!.?\n]{2,40})[,!.?]', text, re.I)
+    if m:
+        name = m.group(1).strip()
+    if not name or name.lower() in {'tudo bem', 'tudo certo', 'cliente', 'lead'}:
+        return f"{greeting_period_brt()}, tudo bem?"
+    return f"{greeting_period_brt()}, {name}. Tudo bem?"
+
+
+def split_whatsapp_text(text, max_parts=3):
+    """Divide abordagem em mensagens menores sem esconder link.
+
+    Rafael 29/06: primeira mensagem é só saudação por horário + pergunta se
+    está bem; depois de 1 minuto vem a parte operacional. Sempre que possível,
+    a pergunta final fica em uma mensagem separada. Mantém URL limpa em linha
+    própria para preview do WhatsApp.
+    """
+    raw = str(text or '').strip()
+    if not raw:
+        return []
+    paras = [p.strip() for p in re.split(r'\n\s*\n+', raw) if p.strip()]
+    if not paras:
+        return []
+
+    if first_para_is_greeting_or_intro(paras[0]):
+        greeting = greeting_from_intro(paras[0])
+        # A primeira bolha é sempre só a saudação; o conteúdo operacional começa na segunda.
+        body_paras = paras[1:]
+    else:
+        # Se o texto já começa com conteúdo operacional (ex.: "Separei um portal..."),
+        # NÃO descartar esse parágrafo. Gera uma saudação curta e preserva o conteúdo.
+        greeting = f"{greeting_period_brt()}, tudo bem?"
+        body_paras = paras[:]
+
+    # Remove CTAs antigos que o Rafael pediu para não usar.
+    banned = {'pode me responder por aqui mesmo.', 'pode me responder por aqui?', 'pode ser por aqui?'}
+    body_paras = [p for p in body_paras if p.strip().lower() not in banned]
+
+    # Se a última pergunta está dentro de um bloco com explicação, separa para
+    # virar a última bolha própria.
+    question = ''
+    if body_paras:
+        last = body_paras[-1]
+        matches = list(re.finditer(r'([^?\n][^?]*\?)\s*$', last, re.S))
+        if matches:
+            q = matches[-1].group(1).strip()
+            before_q = last[:matches[-1].start(1)].strip()
+            if before_q:
+                # Se o último parágrafo já é um CTA composto por duas perguntas
+                # curtas (ex.: "Faz sentido...? Podemos...?"), manter tudo junto
+                # na última bolha em vez de jogar a primeira pergunta no corpo.
+                if '?' in before_q:
+                    question = last
+                    body_paras = body_paras[:-1]
+                else:
+                    body_paras[-1] = before_q
+                    question = q
+            else:
+                question = q
+                body_paras = body_paras[:-1]
+
+    url_idx = next((i for i, p in enumerate(body_paras) if re.search(r'https?://', p, re.I)), None)
+    parts = [greeting]
+    if url_idx is not None:
+        before = body_paras[:url_idx]
+        url_para = body_paras[url_idx]
+        after = body_paras[url_idx + 1:]
+        second_chunks = []
+        if before:
+            second_chunks.extend(before)
+        second_chunks.append(url_para)
+        parts.append('\n\n'.join(second_chunks))
+        if after:
+            parts.append('\n\n'.join(after))
+    else:
+        if len(body_paras) <= 1:
+            if body_paras:
+                parts.append(body_paras[0])
+        else:
+            mid = max(1, (len(body_paras) + 1) // 2)
+            parts.extend(['\n\n'.join(body_paras[:mid]), '\n\n'.join(body_paras[mid:])])
+
+    if question:
+        parts.append(question)
+
+    # Se passar de max_parts, compacte corpo, mas preserve saudação e pergunta separadas.
+    while len(parts) > max_parts:
+        if question and len(parts) > 3:
+            parts[1] = parts[1].rstrip() + '\n\n' + parts.pop(2)
+        else:
+            parts[-2] = parts[-2].rstrip() + '\n\n' + parts.pop(-1)
+    return [p for p in parts if p.strip()]
+
+
+def delay_before_next_part(idx, total_parts, pause_seconds=12.0, final_pause_seconds=60.0):
+    """Intervalo entre bolhas do follow-up.
+
+    Rafael 29/06: entre saudação e mensagem de contexto pode ser curto (~12s),
+    mas antes da pergunta final deve parecer mais natural: ~1 minuto.
+    """
+    if idx < total_parts and idx == total_parts - 1:
+        return final_pause_seconds
+    return pause_seconds
+
+
+def send_whatsapp_sequence(port, jid, text, pause_seconds=12.0, final_pause_seconds=60.0, max_parts=3, delay_schedule=None):
+    parts = split_whatsapp_text(text, max_parts=max_parts)
+    if not parts:
+        return False, {"error": "empty text"}
+    responses = []
+    for idx, part in enumerate(parts, 1):
+        ok, resp = send_whatsapp(port, jid, part)
+        responses.append({'part': idx, 'text': part, 'ok': ok, 'response': resp})
+        if not ok:
+            return False, {'error': 'partial_sequence_failed', 'failed_part': idx, 'responses': responses}
+        if idx < len(parts):
+            if delay_schedule and idx <= len(delay_schedule):
+                wait = float(delay_schedule[idx - 1])
+            else:
+                wait = delay_before_next_part(idx, len(parts), pause_seconds=pause_seconds, final_pause_seconds=final_pause_seconds)
+            time.sleep(wait)
+    message_ids = [(r.get('response') or {}).get('messageId') for r in responses]
+    return True, {
+        'success': True,
+        'messageId': next((m for m in reversed(message_ids) if m), None),
+        'messageIds': [m for m in message_ids if m],
+        'parts': len(parts),
+        'responses': responses,
+    }
 
 
 def escolher_porta_online(bridge, envios):
@@ -1026,6 +1300,57 @@ def port_within_external_limits(envios, port, max_per_hour=MAX_EXTERNAL_PER_PORT
     return ok, reason
 
 
+def create_retorno_task(deal_id, contact_id, owner_id, owner_name, lead_name, tel, incoming_messages):
+    snippets = []
+    for m in (incoming_messages or [])[-5:]:
+        txt = re.sub(r'\s+', ' ', str(m.get('text') or '')).strip()
+        if txt:
+            snippets.append(f"- {txt[:500]}")
+    body_txt = "Lead respondeu após mensagem/diagnóstico da Zydon. Não enviar follow-up por cima; abrir histórico e seguir de forma contextual, sem repetir apresentação ou explicação já enviada.\n\n"
+    if snippets:
+        body_txt += "Últimas mensagens do lead:\n" + "\n".join(snippets)
+    body_txt += "\n\nPróxima ação: se for resposta fraca, continuar aquecimento; se houver dúvida/intenção real, conduzir para agenda ou Retorno Contato conforme contexto."
+    url = "https://api.hubapi.com/crm/v3/objects/tasks"
+    body = {
+        "properties": {
+            "hs_timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "hs_task_subject": f"Retorno WhatsApp - {lead_name} ({tel})",
+            "hs_task_body": body_txt,
+            "hs_task_status": "NOT_STARTED",
+            "hs_task_priority": "HIGH",
+            "hubspot_owner_id": owner_id,
+        },
+        "associations": [
+            {"to": {"id": int(contact_id)}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]},
+            {"to": {"id": int(deal_id)}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 216}]},
+        ]
+    }
+    result = hs_request(url, 'POST', body)
+    return result.get('id') if result else None
+
+
+def resposta_fraca_whatsapp(incoming_messages):
+    """Resposta curta/fraca não deve mover automaticamente para Retorno Contato."""
+    texts = []
+    for m in (incoming_messages or [])[-3:]:
+        txt = re.sub(r'\s+', ' ', str(m.get('text') or '')).strip().lower()
+        if txt:
+            texts.append(txt)
+    if not texts:
+        return False
+    last = texts[-1]
+    weak_exact = {'oi', 'olá', 'ola', 'bom dia', 'boa tarde', 'boa noite', 'ok', 'okk', 'obrigado', 'obrigada', 'valeu', 'sim', 'whatsapp', 'wpp', 'zap'}
+    normalized = re.sub(r'[^a-z0-9áàâãéêíóôõúç ]+', '', last).strip()
+    if normalized in weak_exact:
+        return True
+    words = normalized.split()
+    if len(words) <= 2 and any(w in weak_exact for w in (normalized, words[0] if words else '')):
+        return True
+    # Se já há conteúdo comercial, não é fraca.
+    commercial_terms = ('agenda', 'reuni', 'preço', 'preco', 'valor', 'erp', 'omie', 'bling', 'tiny', 'pedido', 'vendedor', 'cliente', 'portal', 'tabela', 'pagamento', 'integr')
+    return len(words) <= 2 and not any(t in normalized for t in commercial_terms)
+
+
 def create_hubspot_task(deal_id, contact_id, owner_id, owner_name, lead_name, tel, bridge_port=None, sender_phone=None, sender_label=None, message_id=None):
     url = "https://api.hubapi.com/crm/v3/objects/tasks"
     sender_label = sender_label or owner_name
@@ -1141,6 +1466,18 @@ def main():
 
     dry_run = '--dry-run' in args
 
+    stage_scope = 'first5'
+    if '--stage-scope' in args:
+        idx = args.index('--stage-scope')
+        if idx + 1 < len(args):
+            stage_scope = str(args[idx + 1]).strip().lower()
+    if stage_scope in ('lead_sem_contato', 'lead-sem-contato', 'lsc'):
+        search_stages = [STAGE_LEAD_SEM_CONTATO]
+        stage_label = 'Lead Sem Contato'
+    else:
+        search_stages = FIRST_5_STAGES
+        stage_label = '5 primeiras etapas'
+
     bridge = BRIDGES[sdr_key]
     owner_id = bridge['owner_id']
     owner_name = bridge['owner_name']
@@ -1191,8 +1528,8 @@ def main():
 
     # 3. Buscar deals AO VIVO
     print(f"🔍 Consultando HubSpot (owner {owner_id})...")
-    all_deals = buscar_deals_sem_tarefa(owner_id)
-    print(f"   {len(all_deals)} deals nas 5 primeiras etapas.")
+    all_deals = buscar_deals_sem_tarefa(owner_id, stages=search_stages)
+    print(f"   {len(all_deals)} deals em {stage_label}.")
 
     all_deals = filtrar_deals_por_idade(all_deals, min_age_hours=min_age_hours, max_age_hours=max_age_hours)
 
@@ -1227,6 +1564,11 @@ def main():
         deal_id = deal['id']
         props = deal.get('properties', {})
         dealname = props.get('dealname', 'Sem nome')
+        dealstage = str(props.get('dealstage') or '')
+        if dealstage == '998099482':
+            # Já está em Retorno Contato. Não repetir task/movimentação a cada ciclo.
+            ja_enviado += 1
+            continue
 
         # Buscar contato
         result = get_contact_for_deal(deal_id)
@@ -1249,31 +1591,75 @@ def main():
         phone_key = normalize_phone(jid)
         bridge_ports = bridge.get('ports') or [bridge['port']]
         diag_context = diagnostico_context_for_phone(envios, phone_key)
+        history_ports = sorted(set(int(p) for p in bridge_ports) | diagnostico_ports_for_phone(envios, phone_key))
         recent_diag_hours = diagnostico_recente_hours(envios, phone_key)
         # Se o lead já respondeu depois de uma mensagem nossa/diagnóstico, não mandar
-        # follow-up por cima. Move direto para Retorno Contato para o SDR assumir.
-        incoming = history_incoming_after_outgoing(phone_key, bridge_ports)
+        # follow-up por cima. Nova régua Rafael: resposta fraca NÃO move sozinha
+        # para Retorno Contato; cria tarefa/alerta e mantém aquecimento.
+        incoming = history_incoming_after_outgoing(phone_key, history_ports)
         if incoming:
-            try:
-                hs_request(
-                    f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
-                    'PATCH',
-                    {'properties': {'dealstage': '998099482'}},
-                )
-                print(f"   ↪️  {dealname}: lead já respondeu após mensagem nossa; movido para Retorno Contato ({len(incoming)} msg).")
-            except Exception as e:
-                print(f"   ⚠️  {dealname}: resposta detectada, mas falhou mover para Retorno Contato: {e}")
+            fraca = resposta_fraca_whatsapp(incoming)
+            if dry_run:
+                acao = 'criaria tarefa e manteria na etapa atual (resposta fraca)' if fraca else 'criaria tarefa e moveria para Retorno Contato'
+                print(f"   🧪 DRY-RUN: {dealname}: lead já respondeu após mensagem nossa em portas {history_ports}; {acao} ({len(incoming)} msg).")
+            else:
+                task_id = create_retorno_task(deal_id, contact_id, owner_id, owner_name, dealname, tel_fmt, incoming)
+                if fraca:
+                    if dealstage == STAGE_LEAD_SEM_CONTATO:
+                        try:
+                            hs_request(
+                                f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
+                                'PATCH',
+                                {'properties': {'dealstage': STAGE_PRIMEIRO_CONTATO}},
+                            )
+                            print(f"   ↪️  {dealname}: resposta fraca detectada; movido de Lead Sem Contato para Primeiro Contato. Task={task_id} ({len(incoming)} msg).")
+                        except Exception as e:
+                            print(f"   ⚠️  {dealname}: resposta fraca, task={task_id}, mas falhou mover para Primeiro Contato: {e}")
+                    else:
+                        print(f"   ↪️  {dealname}: resposta fraca detectada; NÃO movido para Retorno. Task={task_id} ({len(incoming)} msg).")
+                else:
+                    try:
+                        hs_request(
+                            f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
+                            'PATCH',
+                            {'properties': {'dealstage': '998099482'}},
+                        )
+                        print(f"   ↪️  {dealname}: resposta com sinal/contexto; movido para Retorno Contato. Task={task_id} ({len(incoming)} msg).")
+                    except Exception as e:
+                        print(f"   ⚠️  {dealname}: resposta detectada, task={task_id}, mas falhou mover para Retorno Contato: {e}")
             ja_enviado += 1
             continue
 
-        # Diagnóstico/PDF antigo pode orientar o follow-up, mas nunca deve ser
-        # copiado no corpo da mensagem. Histórico solto só bloqueia quando não
-        # há diagnóstico contextual para tratar como origem.
+        # Diagnóstico/PDF orienta o follow-up, mas não pode virar mensagem colada.
+        # Se acabou de sair, aguardar algumas horas; se já passou do fim do dia,
+        # o próprio cron só volta no próximo horário útil.
+        if diag_context and recent_diag_hours is not None and recent_diag_hours < MIN_HOURS_AFTER_DIAG_FOR_SDR_FOLLOW:
+            ja_enviado += 1
+            if dealstage == STAGE_LEAD_SEM_CONTATO and not dry_run:
+                try:
+                    hs_request(
+                        f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
+                        'PATCH',
+                        {'properties': {'dealstage': STAGE_PRIMEIRO_CONTATO}},
+                    )
+                    print(f"   ⏳ {dealname}: diagnóstico enviado há {recent_diag_hours:.2f}h; movido para Primeiro Contato e aguardando respiro antes do follow SDR.")
+                except Exception as e:
+                    print(f"   ⚠️  {dealname}: diagnóstico recente, mas falhou mover para Primeiro Contato: {e}")
+            else:
+                print(f"   ⏳ {dealname}: diagnóstico enviado há {recent_diag_hours:.2f}h; aguardando antes do follow SDR para não repetir contato colado.")
+            continue
         if phone_key in enviados_keys or (history_outgoing_exists(phone_key, bridge_ports) and not diag_context):
             ja_enviado += 1
-            # Não mover fase aqui. Rafael: etapa só muda quando o lead receber
-            # o primeiro contato/follow-up SDR confirmado, não por diagnóstico
-            # nem por evidência histórica solta.
+            if dealstage == STAGE_LEAD_SEM_CONTATO and not dry_run:
+                try:
+                    hs_request(
+                        f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
+                        'PATCH',
+                        {'properties': {'dealstage': STAGE_PRIMEIRO_CONTATO}},
+                    )
+                    print(f"   ↪️  {dealname}: já tinha contato/saída registrada; movido de Lead Sem Contato para Primeiro Contato.")
+                except Exception as e:
+                    print(f"   ⚠️  {dealname}: já tinha contato, mas falhou mover para Primeiro Contato: {e}")
             continue
 
         # Se a mesma empresa já teve outro negócio/contato abordado recentemente,
@@ -1319,9 +1705,12 @@ def main():
 
         if lead.get('diagnostico_context'):
             nome_msg = lead['nome'] if lead['nome'] and lead['nome'] != 'tudo bem' else 'tudo bem'
+            question = SECOND_INTENT_QUESTION if intent_question_already_asked(lead.get('diagnostico_context')) else first_sdr_question_for_key(lead.get('deal_id') or lead.get('jid'))
             msg = (
-                f"{nome_msg}, seguindo o diagnóstico que te mandei, queria entender qual é o principal gargalo hoje nas vendas B2B.\n\n"
-                "Você tem um tempo agora? Posso te ligar rapidinho?"
+                f"{nome_msg}, seguindo o diagnóstico que te mandei, quero começar pelo motivo principal.\n\n"
+                f"{bloco_portal_real(lead.get('empresa') or '', lead.get('nome') or '', lead.get('erp') or '')}\n\n"
+                f"{zydon_explicacao_curta()}\n\n"
+                f"{question}"
             )
         else:
             msg = msg_builder(lead['nome'], lead['empresa'], lead['erp'])
@@ -1341,6 +1730,7 @@ def main():
                 print(f"        - {err}")
             break
         print(f"     🔁 Porta escolhida: {port}")
+        msg = apply_contact_cta(msg, port=port, is_sdr_sender=True)
         sender_phone = ''
         sender_label = owner_name
         try:
@@ -1369,9 +1759,9 @@ def main():
             enviados += 1
             continue
 
-        ok, resp = send_whatsapp(port, lead['jid'], msg)
+        ok, resp = send_whatsapp_sequence(port, lead['jid'], msg)
         if ok:
-            print(f"     ✅ Enviado!")
+            print(f"     ✅ Enviado em {resp.get('parts', 1)} partes!")
             enviados += 1
 
             # Registrar envio na fonte ÚNICA (read-modify-write: append,
@@ -1395,6 +1785,8 @@ def main():
                 'send_response': resp,
                 'empresa': lead['empresa'],
                 'msg_type': 'primeiro_contato',
+                'attempt_number': 1,
+                'campaign_id': 'lead_sem_contato_follow1',
                 'deal_id': lead['deal_id'],
                 'contact_id': lead['contact_id'],
             })

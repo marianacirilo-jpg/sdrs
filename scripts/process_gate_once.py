@@ -7,6 +7,9 @@ import json, os, re, sys, time, shutil, subprocess, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from whatsapp_safe_send import safe_post_bridge
+from mql_dedupe_guard import can_send_diagnostic
+from mql_execution_queue import dedupe_keys, load_queue, mark_step, save_queue, upsert_and_save
 
 PROJ = Path(__file__).resolve().parents[1]
 GATE = Path('/tmp/gate_qualified.json')
@@ -20,11 +23,17 @@ HS = 'https://api.hubapi.com'
 DEALS_PIPELINE_ID = '671008549'
 DEALSTAGE_LEADS_INVALIDOS = '1388724005'
 TOKEN_PATH = Path('/root/.hermes/credentials/hubspot.env')
+TEXT_TO_PDF_DELAY_SECONDS = 60
+PDF_TO_QUESTION_DELAY_SECONDS = 30
+QUESTION_TO_AGENDA_DELAY_SECONDS = 20 * 60
 OWNER_MAP = {
     '88063842': {'nome':'Sarah', 'porta':4601, 'portas':[4601], 'assinatura':'Aqui é a Sarah, da Zydon', 'agenda':'https://meetings.hubspot.com/sarah-bento'},
     # Breno usa somente o chip ativo 4605; 4602 foi removido/desativado.
     '86265630': {'nome':'Breno', 'porta':4605, 'portas':[4605], 'assinatura':'Aqui é o Breno, da Zydon', 'agenda':'https://meetings.hubspot.com/breno-mendonca'},
     '85778446': {'nome':'Lucas Batista', 'porta':4603, 'assinatura':'Aqui é o Lucas Batista, da Zydon', 'agenda':'https://meetings.hubspot.com/lucas-alcantara-nogueira-batista'},
+    # Owner legado visto em negócios antigos/reinscritos; tratar como Lucas Batista
+    # para não cair em mensagem genérica sem agenda do consultor.
+    '76764091': {'nome':'Lucas Batista', 'porta':4603, 'assinatura':'Aqui é o Lucas Batista, da Zydon', 'agenda':'https://meetings.hubspot.com/lucas-alcantara-nogueira-batista'},
 }
 INSTITUTIONAL_PORTS = {
     4600: {'nome':'Mariana', 'assinatura':'Aqui é a Mariana, da Zydon'},
@@ -43,6 +52,684 @@ NON_MQL_NOTIFY_OWNER = {'nome':'Institucional', 'porta':4600, 'portas':INSTITUTI
 
 # Pesquisa feita via Claude Code neste ciclo (salva também em pesquisas/*.md)
 RESEARCH = {
+  'thiago@secchiautopecas.com.br': {
+    'slug':'secchi-autopecas-thiago-secchi', 'mql': True,
+    'empresa_real':'Secchi Auto Peças / Secchi Autopeças — empresa de autopeças com domínio oficial secchiautopecas.com.br, catálogo público amplo e envio para todo o Brasil.',
+    'dominio_site':'secchiautopecas.com.br — site oficial ativo. A página pública mostra “Secchi Auto Peças”, “ENVIAMOS PARA TODO O BRASIL”, menu de produtos por categorias e vários itens com CTA “Comprar pelo WhatsApp”. Categorias identificadas: acessórios para carro, buchas/coxins, cabos, correias/tensores, elétrica, embreagem/câmbio, escapamentos, filtros, freio, injeção/carburação/ignição, lubrificantes, motor, radiadores/eletroventiladores, rolamentos/cubos/homocinéticas, suspensão/direção, tanque de combustível e utilidades.',
+    'redes':'Pesquisa pública real neste ciclo: Firecrawl/web_search falhou por billing externo, então foi feito fallback por urllib/curl direto em https://secchiautopecas.com.br e variações www/http. O site respondeu HTTP 200, confirmou catálogo de autopeças e compra pelo WhatsApp. Buscas textuais via Bing/DuckDuckGo/Google por “Secchi Autopeças” trouxeram pouco sinal útil ou challenge anti-bot; a fonte confiável usada foi o domínio oficial acessível e os campos do formulário HubSpot.',
+    'segmento':'Distribuição/comércio de autopeças com varejo e catálogo amplo de peças automotivas, reposição recorrente, preço/disponibilidade por item e atendimento por WhatsApp; fit com oficinas, autopeças, frotas e clientes comerciais que precisam repor estoque ou montar pedidos com frequência.',
+    'motivo':'Passa no crivo MQL acirrado: formulário informa distribuição de autopeças com varejo, faturamento de R$10 a R$50 milhões/ano, 21 a 100 pessoas, 6 a 20 vendedores internos, venda hoje por WhatsApp, ERP Outro, sem loja virtual e dor de dificuldade de escalar sem contratar mais gente. O site oficial validado confirma empresa real de autopeças, catálogo amplo, envio nacional e compra pelo WhatsApp. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de reposição, reduzindo atendimento manual e dependência de vendedor para cada orçamento.',
+    'insight':'oficinas, frotas e compradores recorrentes consultarem catálogo, preço e disponibilidade de autopeças para repor estoque ou montar pedidos sem depender de cada atendimento por WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 46 99917-2079. O site oficial usa CTA “Comprar pelo WhatsApp”; neste ciclo não foi necessário substituir o número do formulário.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 46 99917-2079.',
+  },
+  'contato@bancobr2.com.br': {
+    'slug':'bancobrii-jornal-cabeleireiroonline', 'mql': False,
+    'empresa_real':'Bancobrii Assessoria Banco de Negócios / Jornal do Cabeleireiroonline Digital — lead de Facebook com domínio bancobr2.com.br e formulário informando atuação como Cabeleireiro/Jornal do Cabeleireiroonline digital.',
+    'dominio_site':'bancobr2.com.br — domínio acessado diretamente no ciclo; retornou apenas página em manutenção, sem catálogo, operação B2B, loja ou evidência pública de indústria/distribuição/atacado.',
+    'redes':'Pesquisa pública no ciclo tentou buscar Bancobrii Assessoria Banco de Negócios, bancobr2.com.br e Jornal do Cabeleireiroonline Digital; as ferramentas web gerenciadas falharam por billing, então foi usado curl direto no site e buscas via Bing/DuckDuckGo por terminal. Não apareceu validação pública segura de atacado, indústria, distribuidora, importadora, autopeças, agro, frotas ou venda recorrente para revendas/lojistas.',
+    'segmento':'Serviço/mídia/beleza informado no formulário, ligado a cabeleireiro/jornal digital; não é operação T1 de indústria, distribuidor, importador ou atacado com reposição de estoque e compra B2B recorrente.',
+    'motivo':'Não passa no crivo MQL acirrado/fail-closed: formulário informa ainda não faturamos, 1 a 10 pessoas, 1 vendedor, ERP Outro, sem loja virtual, venda por visita física, dor de carteira de clientes parada e atuação Cabeleireiro/Jornal digital. A pesquisa pública não comprovou empresa com catálogo físico, estoque, tabela comercial, abastecimento recorrente ou canal B2B para revendas/lojistas. Como MQL errado ensina o Facebook a buscar mais leads errados, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+    'insight':'',
+  },
+  'contato@gaiamotopecas.com.br': {
+   'slug':'gaia-moto-parts-renato-gaia', 'mql': True,
+   'empresa_real':'GAIA MOTO PARTS LTDA — empresa de Campo Limpo Paulista/SP ligada a Renato Gaia, com domínio gaiamotopecas.com.br e operação de peças/acessórios para motocicletas em canais digitais e marketplace.',
+   'dominio_site':'gaiamotopecas.com.br — storefront público ligado a Mercado Shops/Mercado Livre; pesquisa pública encontrou também página Gaia Moto Parts no Mercado Livre, loja Gaia Moto Parts na Shopee e perfis sociais da marca. O domínio apresentou limitação/certificado de Mercado Shops no acesso automatizado, então a validação operacional foi cruzada com bases públicas de CNPJ e canais de marketplace.',
+   'redes':'Pesquisa pública real neste ciclo via Claude Code com WebSearch/WebFetch: Econodata e CNPJ.biz confirmaram GAIA MOTO PARTS LTDA, CNPJ 53.568.665/0001-62, abertura em 19/01/2024, sócio-administrador Renato Rodrigues Gaia, porte ME, CNAE principal 4541-2/02 — comércio por atacado de peças e acessórios para motocicletas e motonetas; CNAEs secundários incluem fabricação de peças para motocicletas e comércio atacadista/varejista de autopeças. Também foram localizados canais gaiamotopecas.com.br, Mercado Livre gaiamotoparts, Shopee gaia.motoparts, Instagram e Facebook. ML/Shopee bloquearam fetch de volume/reputação, então não foi inventado dado de vendas.',
+   'segmento':'Atacado/varejo multicanal de motopeças e acessórios para motocicletas, com sinal público de atacado de autopeças/motopeças e fabricação leve; produto físico de reposição recorrente, catálogo, estoque, preço e disponibilidade, com potencial de atendimento a oficinas, lojistas, revendas e compradores recorrentes.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa ERP Olist/Tiny, faturamento de R$500 mil a R$1 milhão/ano, 2 a 5 vendedores internos, venda atual por Mercado Livre e Shopee, dor de vendedores gastarem tempo só tirando pedido e crença de que o cliente compraria sozinho 24h. A pesquisa pública confirmou empresa real de motopeças/autopeças, CNAE principal de atacado de peças e acessórios para motocicletas, canais digitais e marketplace. Há fit claro para digitalizar catálogo, preço, estoque e pedidos recorrentes de reposição, reduzindo dependência de atendimento manual e marketplaces.',
+   'insight':'oficinas, lojistas e compradores recorrentes consultarem catálogo, preço e disponibilidade de motopeças para repor estoque ou montar pedidos sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98485-4894; nenhum telefone público alternativo mais seguro foi necessário neste ciclo.',
+   'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 98485-4894.',
+ },
+ 'huang@chinabraziltrade.com': {
+   'slug':'kartel-ind-com-miro-huang', 'mql': False,
+   'empresa_real':'Kartel Ind e Com. Ltda — empresa informada no formulário como atuação em armarinhos; contato Miro Huang com e-mail no domínio chinabraziltrade.com.',
+   'dominio_site':'chinabraziltrade.com — domínio do e-mail responde em HTTP/HTTPS, mas a página inicial, sitemap e wp-json retornaram conteúdo vazio neste ciclo; robots.txt existe, mas não trouxe páginas operacionais úteis. Não foi possível validar catálogo, CNPJ, atacado, distribuição, indústria/importação ou canal B2B estruturado pelo site oficial.',
+   'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback local via curl/urllib acessou diretamente chinabraziltrade.com, www.chinabraziltrade.com, robots.txt, sitemap e wp-json. O domínio respondeu, porém sem conteúdo público operacional. Buscas textuais por Bing/Google/DuckDuckGo para Kartel Ind e Com Ltda, chinabraziltrade.com, Miro Huang e armarinhos retornaram ruído ou desafio anti-bot, sem evidência confiável de operação atacadista/distribuidora/industrial.',
+   'segmento':'Armarinhos conforme formulário, com loja virtual e venda por WhatsApp. Sem confirmação pública de indústria, distribuidor, importador ou atacado T1 vendendo para revendas/lojistas com reposição recorrente de estoque; formulário indica porte baixo, faturamento de R$250 mil a R$500 mil/ano, 1 a 10 pessoas e 1 vendedor interno.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: lead válido de Facebook e telefone celular válido, mas os campos indicam operação pequena de armarinhos, ERP Outro, apenas 1 vendedor, faturamento de R$250 mil a R$500 mil/ano, venda por WhatsApp e resposta de que o cliente não compraria sozinho 24h. A pesquisa pública não comprovou site/catálogo ativo, atacado/distribuição, indústria/importação ou venda recorrente para revendas/lojistas. Como MQL errado ensina o Facebook a buscar mais leads errados, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 94119-8094; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não usado; contato externo bloqueado por não-MQL.',
+ },
+ 'contato@ideiasforyou.com.br': {
+   'slug':'ideias-for-you-amanda-silva', 'mql': False,
+   'empresa_real':'Ideias For You — empresa/loja informada no formulário por Amanda Silva, ainda em fase inicial de digitalização.',
+   'dominio_site':'ideiasforyou.com.br — domínio do e-mail resolve para Shopify (23.227.38.65/74), mas o acesso público em http/https/www retornou HTTP 423 Locked neste ciclo. Não foi possível validar catálogo, CNPJ, segmento, mix de produtos, atacado, revenda ou operação B2B estruturada pelo site oficial.',
+   'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback via urllib/curl acessou diretamente ideiasforyou.com.br e www.ideiasforyou.com.br, confirmou DNS/Shopify e loja bloqueada por HTTP 423. Buscas textuais por Bing para “Ideias For You”, “ideiasforyou.com.br”, “contato@ideiasforyou.com.br” e “Amanda Silva” retornaram ruído/sem evidência operacional confiável. DuckDuckGo exigiu desafio anti-bot e não pôde ser usado.',
+   'segmento':'Segmento não comprovado. O formulário declara venda para PF e PJ de forma muito lenta, loja online ainda em vias de subir, ERP Outro, sem faturamento, 1 a 10 pessoas e 1 vendedor interno. Há dor de pedidos desorganizados e intenção de digitalizar, mas sem evidência clara de indústria, distribuidor, importador, atacado, autopeças, postos, frotas ou agro B2B com venda recorrente/abastecimento.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: lead de Facebook válido e telefone celular válido, mas a própria resposta informa empresa ainda sem faturamento, operação muito inicial, loja online ainda não publicada e venda para PF e PJ sem canal B2B definido. A pesquisa pública não confirmou segmento, catálogo, atacado/distribuição, indústria/importação ou venda recorrente para revendas/lojistas. Como MQL errado ensina o Facebook a buscar leads errados, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 12 98147-5485; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não usado; contato externo bloqueado por não-MQL.',
+ },
+ 'claudia@multcabos.com.br': {
+   'slug':'multcabos-claudia-melo', 'mql': False,
+   'empresa_real':'MultCabos — loja/fornecedora de produtos para redes e telecomunicações em Londrina/PR.',
+   'dominio_site':'multcabos.com.br — site oficial ativo. O HTML público identifica “MultCabos - Redes e Telecom”, descrição de loja especializada em cabos, conectores, roteadores, fibra óptica e soluções de infraestrutura de redes, com endereço Rua Pirapó, 267, Londrina/PR, telefone (43) 3305-7777, e-mail multcabos@multcabos.com.br e CNPJ 30.184.999/0001-37.',
+   'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por billing externo; fallback por urllib/curl acessou diretamente multcabos.com.br e o bundle público do site. A fonte confirmou catálogo de cabos de rede, conectores RJ45, roteadores empresariais, fibra óptica, ferramentas, entrega rápida, suporte técnico e atendimento por WhatsApp/telefone. Buscas textuais por Bing/DuckDuckGo não trouxeram evidência adicional confiável de atacado/distribuição para revendas.',
+   'segmento':'Comércio/loja especializada em redes e telecomunicações, cabos, conectores, roteadores e fibra óptica para empresas e profissionais. Produto físico e B2B leve, mas sem comprovação clara de indústria, distribuidor/importador ou atacado vendendo para revendas/lojistas com abastecimento recorrente de estoque.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: apesar de empresa real, site ativo, ERP Bling, loja virtual e dor de pedidos desorganizados, o formulário informa faturamento até R$250 mil/ano e área “Geral”, e a pesquisa pública confirmou uma loja especializada de redes/telecom, não uma operação T1 clara de indústria, distribuição, importação ou atacado para revendas/lojistas. Como MQL errado ensina o Facebook a buscar leads errados, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 43 98821-8474; site oficial publica telefone corporativo (43) 3305-7777 e link WhatsApp para 4333057777.',
+   'whatsapp_publico':'Não usado; contato externo bloqueado por não-MQL.',
+ },
+ 'dryfestembalagens@dryfest.com.br': {
+   'slug':'dryfest-embalagens-flavio', 'mql': False,
+   'empresa_real':'Dryfest Embalagens e Panificação Ltda — empresa informada no formulário como atuação em lojas de embalagens.',
+   'dominio_site':'dryfest.com.br — domínio inferido pelo e-mail, mas neste ciclo não resolveu DNS em http/https/www. Não houve site oficial acessível para validar catálogo, CNPJ, atacado ou distribuição.',
+   'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por billing externo; fallback por urllib/curl tentou dryfest.com.br, www.dryfest.com.br e buscas textuais via Bing/Google por “Dryfest Embalagens e Panificação”, “dryfest.com.br”, “Dryfest embalagens” e CNPJ. As buscas disponíveis retornaram ruído/sem evidência operacional confiável; não foi localizado site, rede social ou base pública segura que comprovasse operação B2B estruturada.',
+   'segmento':'Possível comércio/fornecedor de embalagens para panificação/lojas de embalagens conforme formulário, com venda por representantes externos. Sem confirmação pública suficiente de indústria, distribuidor/importador ou atacado T1 com canal recorrente de abastecimento para revendas/lojistas.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: o formulário sugere embalagens e algum potencial B2B, mas a empresa é pequena (1 a 10 pessoas), ERP “Outro”, sem loja virtual, e a pesquisa pública não confirmou site ativo, catálogo, atacado/distribuição, indústria/importação ou venda recorrente estruturada para estoque. Na dúvida real, não marcar MQL e não enviar diagnóstico externo automático.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 35 99920-1500; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não encontrado WhatsApp público corporativo alternativo seguro; contato externo bloqueado por não-MQL.',
+ },
+ 'marketing@goldenprime.com.br': {
+   'slug':'golden-prime-vanessa', 'mql': False,
+   'empresa_real':'Golden Prime — lead de varejo alimentar informado no formulário; não houve confirmação pública suficiente de domínio/site ativo ou operação de atacado/distribuição neste ciclo.',
+   'dominio_site':'goldenprime.com.br — domínio inferido pelo e-mail, mas as tentativas diretas em http/https e www terminaram em timeout neste ciclo. Buscas textuais por Golden Prime, goldenprime.com.br, marketing@goldenprime.com.br e varejo alimentar não retornaram evidência operacional confiável da empresa.',
+   'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback via Bing/urllib e acesso direto ao domínio não encontrou evidência útil. O formulário é a fonte operacional disponível: varejo alimentar, venda por representantes, ERP Outro, faturamento de R$250 mil a R$500 mil/ano, 21 a 100 pessoas, 1 vendedor interno, sem loja virtual e resposta de que o cliente não compraria sozinho 24h.',
+   'segmento':'Varejo alimentar informado no formulário, com venda por representantes. Sem evidência de indústria, distribuidor, importador, atacado ou canal B2B recorrente de abastecimento para revendas/lojistas.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: o formulário aponta varejo alimentar, porte baixo, apenas 1 vendedor interno, sem loja virtual e sem crença de autosserviço 24h. A pesquisa pública não confirmou site ativo, catálogo, atacado, distribuição, importação, indústria ou venda recorrente B2B para reposição de estoque. Como MQL errado ensina o Facebook a buscar leads errados, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 99248-5809; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não usado; contato externo bloqueado por não-MQL.',
+ },
+ 'diretoria@plimed.com.br': {
+   'slug':'plimed-distribuidora-plie-med-frederico', 'mql': True,
+   'empresa_real':'Plimed Distribuidora Plié Med — distribuidora/regional ligada à marca Plié Med, linha de produtos pós-cirúrgicos como sutiãs, tops, cintas, placas, faixas, mangas e meias de compressão para lipoaspiração, mamoplastia, abdominoplastia, mastectomia e outros procedimentos. O formulário informa atuação com cirurgiões plásticos, mastologistas, oncologistas, dermatologistas e ortopedistas.',
+   'dominio_site':'pliemed.com.br — site oficial ativo da Plié Med. A página pública mostra catálogo/e-commerce de produtos pós-cirúrgicos, “Todos os Produtos”, categorias por tipo de cirurgia, página “Nossas Lojas/Lojas Parceiras/Seja um revendedor” e lista JSON pública de lojas/revendedores da marca com WhatsApps regionais.',
+   'redes':'Pesquisa pública real neste ciclo: DuckDuckGo Lite retornou site oficial pliemed.com.br, página “Revendedores PlieMed”, Linktree “PLIÉ MED MT”, Facebook, LinkedIn e Instagram oficiais. Acesso direto local ao site confirmou catálogo de produtos pós-cirúrgicos, página de revendedores e WhatsApp oficial +55 11 96635-9056; o arquivo público lojas-revendedores.json confirmou múltiplas lojas/revendedores com WhatsApp.',
+   'segmento':'Distribuição/comércio B2B de produtos pós-cirúrgicos e compressivos para clínicas, consultórios, médicos especialistas e pontos parceiros/revendedores; produto físico com grade/tamanho, disponibilidade, reposição e catálogo para compras recorrentes ou indicações profissionais.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário declara uma distribuidora Plié Med atendendo cirurgiões plásticos, mastologistas, oncologistas, dermatologistas e ortopedistas, com venda presencial, loja virtual e dor de perder vendas pela demora no atendimento. A pesquisa pública confirmou marca real com catálogo amplo de produtos físicos pós-cirúrgicos, página de revendedores/lojas parceiras e WhatsApps regionais. Embora o formulário informe porte inicial e ERP “Outro”, o fit se sustenta por distribuição especializada, catálogo/grade/preço/disponibilidade e potencial de pedido/indicação recorrente em canal B2B de saúde.',
+   'insight':'médicos, clínicas e parceiros consultarem grade, tamanhos, preço e disponibilidade de produtos pós-cirúrgicos para indicar ou repor itens sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 65 98111-3030. Site oficial publica WhatsApp +55 11 96635-9056; pesquisa também encontrou presença pública “PLIÉ MED MT” via Linktree.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no HubSpot/formulário: +55 65 98111-3030; WhatsApp corporativo público alternativo da marca no site oficial: +55 11 96635-9056.',
+ },
+ 'comercial@branderbrindes.com.br': {
+   'slug':'brander-brindes-silvano', 'mql': False,
+   'empresa_real':'Brander Brindes — empresa de Curitiba/PR de brindes e uniformes personalizados para empresas, com domínio branderbrindes.com.br, catálogo online, projetos especiais e orçamento sob demanda.',
+   'dominio_site':'branderbrindes.com.br — site oficial ativo. A página inicial e “Quem Somos” informam foco em brindes personalizados que contam a história da empresa do cliente, projetos especiais, catálogo com canetas, cadernos, copos térmicos, mochilas, squeezes, chaveiros, kits e uniformes, além de contato comercial e endereço em Curitiba.',
+   'redes':'Pesquisa pública real neste ciclo: DuckDuckGo Lite retornou site oficial, LinkedIn, Instagram e Facebook da Brander Brindes. Acesso direto local ao site confirmou “Brander Brindes e Uniformes Personalizados para Empresas”, catálogo, área de cliente, WhatsApp público +55 47 99219-1185, e-mail comercial@branderbrindes.com.br e endereço Rua Leonardo Pianowski, 1289, Pinheirinho, Curitiba/PR.',
+   'segmento':'Brindes e uniformes personalizados sob orçamento para empresas e eventos; operação B2B real, porém com característica de projeto/campanha personalizada, não atacado/distribuição/indústria de alto giro para revendas ou abastecimento recorrente de estoque.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: é B2B e possui catálogo/loja, mas a pesquisa pública e o formulário apontam brindes personalizados/projetos especiais para empresas, operação pequena/inicial, faturamento “Ainda não faturamos” e dor genérica. Não há evidência clara de indústria, distribuidor, importador ou atacado vendendo para revendas/lojistas/clientes recorrentes com abastecimento de estoque, preço/tabela e recompra de alto giro. ERP Olist/Tiny e loja virtual ajudam, mas não substituem ICP T1.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 41 99609-3325. Site oficial publica WhatsApp +55 47 99219-1185.',
+   'whatsapp_publico':'Não usado porque o lead foi reprovado no crivo MQL acirrado; aviso somente interno.',
+ },
+ 'jean@hmartin.com.br': {
+   'slug':'hmartin-copos-tacas-jean', 'mql': True,
+   'empresa_real':'H.Martin / DECORMARTIN IND COM DE VID E CRIST LTDA — empresa tradicional de Cotia/SP, com domínio oficial hmartin.com.br, loja/catálogo próprio HMartin Glass Design e operação de copos, taças e canecas de vidro lisos e personalizados há mais de 125 anos.',
+   'dominio_site':'hmartin.com.br — site oficial ativo. A página “Sobre a empresa H.Martin Arte em Copos” informa que a H.Martin é líder no mercado de copos personalizados, está há mais de 125 anos decorando copos e taças, e chama explicitamente “Aumente as vendas em seu estabelecimento com a linha de produtos da H.Martin”. O site tem catálogo, linha presentes, cadastro/login, “Seja nosso representante”, catálogos baixáveis, contato comercial e WhatsApp público.',
+   'redes':'Pesquisa pública real neste ciclo: Claude Code com WebSearch/WebFetch retornou fontes oficiais do site hmartin.com.br, Instagram @hmartinoficial, Facebook HMartinoficial, YouTube H.Martin Arte em Copos e LinkedIn H.Martin. Acesso direto local ao site confirmou title “HMartin Glass Design”, página “Sobre a empresa H.Martin Arte em Copos”, descrição de 125 anos, linha de copos/taças, CTA para estabelecimentos, telefone (11) 4243-7000, WhatsApp público (11) 95078-5865, e-mail comercial@hmartin.com.br e CNPJ 09.357.931/0001-16.',
+   'segmento':'Indústria/comércio B2B de copos, taças e canecas de vidro lisos e personalizados para lojas de presentes, bares, bazares, indústria de bebidas, restaurantes e estabelecimentos que revendem ou usam itens de giro/abastecimento; catálogo físico com modelos, decorações, preço, disponibilidade, pedidos recorrentes e potencial de representantes/revenda.',
+   'motivo':'Passa no crivo MQL acirrado: formulário declara venda para lojas de presentes, bares, bazares, indústria de bebidas e similares, faturamento de R$1 milhão a R$5 milhões/ano, 21 a 100 pessoas, 2 a 5 vendedores, venda hoje por telefone, cliente compraria sozinho 24h se bem feito e dor de escalar sem contratar mais gente. A pesquisa pública confirmou empresa real, tradicional, com domínio próprio, catálogo de copos/taças, CTA para estabelecimentos e canal de representantes/catálogos, sustentando operação B2B recorrente de produto físico para revenda/abastecimento.',
+   'insight':'lojas, bares e clientes da indústria de bebidas consultarem modelos, decorações, preço e disponibilidade de copos e taças para repor ou montar pedidos sem depender de cada atendimento por telefone',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98942-9000. Site oficial publica telefone corporativo +55 11 4243-7000.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no HubSpot/formulário: +55 11 98942-9000; WhatsApp corporativo público alternativo no site oficial: +55 11 95078-5865.',
+ },
+ 'iron.san@evermax.com.br': {
+   'slug':'evermax-distribuidor-iron-santana', 'mql': True,
+   'empresa_real':'Evermax Distribuidor / Evermax Logística e Distribuição de Peças Ltda — distribuidora autorizada Moove para produtos Mobil nos estados de Mato Grosso e Mato Grosso do Sul, com operação de lubrificantes, aditivos e pneus para carros, motos, caminhões, máquinas agrícolas e industriais.',
+   'dominio_site':'evermax.com.br — site oficial ativo. A página inicial informa “Desde 1997 entregando soluções em distribuição das melhores marcas de Lubrificantes, Aditivos e Pneus”, atuação em Mato Grosso e Mato Grosso do Sul, unidades em Cuiabá/MT e Campo Grande/MS, CNPJ 02.215.635/0001-31, e distribuição autorizada Moove/Mobil.',
+   'redes':'Pesquisa pública real neste ciclo: acesso direto ao site oficial https://evermax.com.br e sitemap público. O HTML confirmou Evermax Distribuidor, área de atuação no Centro-Oeste, foco em distribuição de lubrificantes, aditivos e pneus para segmentos de carros, motos, caminhões, máquinas agrícolas e industriais, contatos corporativos sac@evermax.com.br, marketing@evermax.com.br, telefone 0800 643 7300 e unidades em MT/MS. Buscas gerenciadas Firecrawl/WebSearch falharam por billing externo, então a fonte usada foi o site oficial acessado via urllib/curl.',
+   'segmento':'Distribuidora autorizada de lubrificantes, aditivos e pneus para clientes automotivos, transporte, agro, máquinas agrícolas e industriais no Centro-Oeste; produto físico de reposição recorrente, com tabela, estoque, preço, disponibilidade, pedidos frequentes e venda B2B/atacado para oficinas, autopeças, postos, frotas, transportadoras, agro e clientes comerciais.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa atacadista/autopeças/motopeças/postos de combustível, ERP TOTVS, faturamento de R$5 a R$10 milhões/ano, 21 a 100 pessoas, 6 a 20 vendedores internos, venda por presença no cliente e dor de perda de vendas pela demora no atendimento. A pesquisa pública confirmou distribuidora real desde 1997, autorizada Moove/Mobil, com lubrificantes, aditivos e pneus para carros, motos, caminhões, máquinas agrícolas e industriais em MT/MS. Há potencial claro para digitalizar catálogo, tabela, preço, disponibilidade e pedidos recorrentes de reposição/abastecimento.',
+   'insight':'postos, oficinas, autopeças e frotas consultarem catálogo, preço e disponibilidade de lubrificantes, aditivos e pneus para repor estoque sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 67 9965-1396. Site oficial publica telefones corporativos 0800 643 7300 e +55 65 3618-7300, ambos não usados para WhatsApp externo por serem fixo/0800.',
+   'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 67 9965-1396; o site oficial não exibiu WhatsApp corporativo celular alternativo seguro neste ciclo.',
+ },
+ 'leonardo@lleida.com.br': {
+   'slug':'lleida-leonardo-negrao', 'mql': True,
+   'empresa_real':'Lleida Máquinas e Equipamentos — empresa de Tietê/SP com domínio próprio lleida.com.br, fornecedora de máquinas/equipamentos para metais, laboratório, reciclagem e papéis.',
+   'dominio_site':'lleida.com.br — site oficial ativo “lleida - HOME”. A página informa linhas de máquinas para metais (corte e conformação de metais, chapas e tubos), máquinas para laboratório, mini linhas de reciclagem/plástico e equipamentos para papéis/perfurações; publica endereço na Rodovia Cornélio Pires, Distrito Industrial, Tietê/SP, e WhatsApp/atendimento +55 15 98817-6381.',
+   'redes':'Pesquisa pública real neste ciclo: acesso direto ao site oficial https://lleida.com.br via urllib/curl. O HTML público confirmou “Lleida Máquinas e Equipamentos”, menu Produtos/Contato/Sobre, CTA “Fale conosco pelo Whatsapp”, WhatsApp wa.me/5515988176381, e-mails leonardo@lleida.com.br, wilson@lleida.com.br e lleida@lleida.com.br, além de Facebook/Instagram oficiais.',
+   'segmento':'Fornecedor/comércio técnico de máquinas e equipamentos industriais/laboratoriais para empresas e prefeituras, com domínio próprio, WhatsApp corporativo e portfólio de máquinas/equipamentos; Rafael reclassificou manualmente como MQL.',
+   'motivo':'Rafael corrigiu a classificação: este lead deve ser MQL. Empresa real, domínio próprio, telefone/WhatsApp corporativo válido, portfólio técnico de máquinas/equipamentos e potencial de organizar catálogo, orçamento e pedidos B2B. Reclassificação manual vence o crivo fail-closed anterior.',
+   'insight':'empresas e compradores públicos consultarem catálogo, linhas de máquinas/equipamentos, orçamento e disponibilidade sem depender de cada atendimento manual por WhatsApp',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 15 98117-3635. Site oficial também publica WhatsApp corporativo de atendimento +55 15 98817-6381 e comercial +55 15 98117-0411.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no HubSpot/formulário: +55 15 98117-3635; WhatsApp público corporativo alternativo localizado no site oficial: +55 15 98817-6381.',
+ },
+ 'juliana@medix.ind.br': {
+   'slug':'medix-produtos-medicos-juliana-sousa', 'mql': True,
+   'empresa_real':'MEDIX / Promedix Produtos Médicos — fornecedora/distribuidora de produtos médicos, hospitalares, materiais laboratoriais, saneantes e instrumentais, com domínio oficial medix.ind.br e operação voltada a compras recorrentes do setor de saúde.',
+   'dominio_site':'medix.ind.br — site oficial ativo em HTTP com título “MEDIX - PRODUTOS MÉDICOS E HOSPITALARES”. A página informa mais de 10 anos de mercado, mais de 1.000 itens no portfólio, fornecimento de medicamentos, materiais médico-hospitalares, saneantes, instrumentais e material laboratorial, marcas nacionais/importadas e logística integrada atendendo todo o Brasil. O site disponibiliza lista completa XLSX e PDFs por categoria, incluindo material de consumo, curativos, esterilização, gasoterapia, eletrocirurgia, colostomia, papéis/filmes e acessórios.',
+   'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por cobrança/billing, então foi feito acesso direto via urllib/curl ao site oficial http://medix.ind.br. O HTML e metadados confirmam MEDIX Produtos Médicos e Hospitalares; o texto público cita compra/orçamento, equipe de vendas, ícone de WhatsApp, telefone corporativo (11) 2375-0331, portfólio com mais de 1.000 itens e atendimento nacional. Links públicos do próprio site apontam para “LISTA-DE-PRODUTOS-COMPLETA-MEDIX.xlsx” e PDFs de várias linhas hospitalares, reforçando catálogo amplo e recorrência de itens de saúde.',
+   'segmento':'Distribuidora/fornecedora de produtos médicos e hospitalares para casas cirúrgicas, hospitais, clínicas, laboratórios e compradores recorrentes de saúde; produto físico de alto giro e reposição, com catálogo amplo, marcas nacionais/importadas, preço, disponibilidade e pedidos/orçamentos recorrentes.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa atuação em casas cirúrgicas e distribuição, ERP Bling, loja virtual ativa, venda por telefone/WhatsApp, 2 a 5 vendedores e dor de perda de vendas pela demora no atendimento. A pesquisa pública confirmou empresa real com domínio próprio, catálogo amplo de mais de 1.000 produtos médicos/hospitalares, materiais consumíveis e logística nacional. Há potencial claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de abastecimento para clientes de saúde.',
+   'insight':'casas cirúrgicas, clínicas e compradores de saúde consultarem catálogo, preço e disponibilidade de materiais hospitalares para repor itens sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98163-2390. Site oficial também publica telefone corporativo fixo +55 11 2375-0331 e menciona atendimento por ícone de WhatsApp.',
+   'whatsapp_publico':'Usar o celular válido informado no HubSpot/formulário: +55 11 98163-2390; o site oficial só confirmou fixo corporativo +55 11 2375-0331 além do canal de WhatsApp visual, sem número alternativo seguro extraído.',
+ },
+ 'contato@porummundomelhor.net': {
+   'slug':'por-um-mundo-melhor-arnaldo', 'mql': True,
+   'empresa_real':'Por um Mundo Melhor — distribuidora de alimentos B2B em São Paulo/SP, com site próprio porummundomelhor.net, fornecimento para pizzarias, restaurantes, padarias, cozinhas industriais e franquias.',
+   'dominio_site':'porummundomelhor.net — site oficial ativo com título “Distribuidora de Alimentos B2B em SP | Carnes, Hortifruti e Frios | Faturamento PJ”; informa faturamento PJ em boleto a partir do segundo pedido, distribuidores autorizados Scala e Aurora, entrega em até 24h, frota própria SIF/SIV, pedido mínimo para entrega e venda em peças inteiras/caixas fechadas.',
+   'redes':'Pesquisa pública real neste ciclo: acesso direto ao site oficial http://porummundomelhor.net. O site confirma distribuidora de alimentos para restaurantes, padarias e lanchonetes, atendimento a pizzarias/hamburguerias/restaurantes/padarias/cozinhas industriais/franquias, catálogo de carnes, hortifruti, laticínios/frios, congelados, marcas Scala, Aurora, Solito, Camil, Galo e Andorinha, CNPJ 13.485.739/0001-82, endereço na Vila Matilde/SP, e WhatsApp/telefone corporativo (11) 95608-3848.',
+   'segmento':'Distribuidora/atacado de alimentos e insumos de giro para food service, restaurantes, padarias, pizzarias, cozinhas industriais e franquias, com venda B2B recorrente para abastecimento de estoque, tabela de preço variável, pedido mínimo, entrega programada e faturamento PJ.',
+   'motivo':'Passa no crivo MQL acirrado: embora o campo empresa no HubSpot esteja divergente, o domínio/e-mail do lead e o site oficial confirmam distribuidora de alimentos B2B com produto físico de alto giro, faturamento PJ, caixas fechadas, pedido mínimo e clientes comerciais recorrentes. O formulário informa ERP Omie, venda por WhatsApp, atuação com cozinhas industriais, 2 a 5 vendedores e dor de dependência de poucos clientes grandes. Há potencial claro para digitalizar catálogo, tabela, preço, disponibilidade e pedidos recorrentes de abastecimento para food service.',
+   'insight':'restaurantes, padarias e cozinhas industriais consultarem catálogo, preço e disponibilidade de alimentos de giro para repor estoque sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 96443-0677. Site oficial também publica WhatsApp corporativo +55 11 95608-3848.',
+   'whatsapp_publico':'Usar primeiro o celular válido do HubSpot/formulário: +55 11 96443-0677; WhatsApp público corporativo alternativo localizado no site oficial: +55 11 95608-3848.',
+ },
+ 'contato@deliciasdointerior.com.br': {
+   'slug':'delicias-do-interior-fernando-ruiz', 'mql': False,
+   'empresa_real':'Delícias do Interior — dados públicos não confirmados neste ciclo; o site deliciasdointerior.com.br não respondeu às tentativas de acesso e as buscas textuais disponíveis não retornaram evidência útil da operação.',
+   'dominio_site':'deliciasdointerior.com.br — domínio informado no e-mail/formulário, mas inacessível por timeout neste ciclo em http/https e robots.txt.',
+   'redes':'Pesquisa pública real neste ciclo: tentativas de acesso direto a https://deliciasdointerior.com.br, https://www.deliciasdointerior.com.br, http://deliciasdointerior.com.br e robots.txt terminaram em timeout; buscas via Bing RSS por Delícias do Interior, domínio, padarias/adegas e Fernando Ruiz não retornaram evidência operacional confiável da empresa.',
+   'segmento':'Possível fornecedor de alimentos/produtos para padarias, conveniências, mercados e adegas conforme formulário, mas sem confirmação pública suficiente de indústria, distribuidor, importador ou atacado T1 com canal recorrente de abastecimento.',
+   'motivo':'Reprovado no crivo MQL acirrado/fail-closed: o formulário declara público B2B e dor de escala, mas a pesquisa pública deste ciclo não confirmou site ativo, catálogo, atacado/distribuição, indústria/importação ou operação recorrente de abastecimento de estoque. Como há dúvida relevante e a regra é fail-closed, não recebe diagnóstico externo automático.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 14 99751-1020; não usado para contato externo porque o lead foi classificado como não-MQL fail-closed.',
+   'whatsapp_publico':'Não foi localizado WhatsApp público corporativo seguro além do telefone do formulário; contato externo bloqueado por não-MQL.',
+ },
+ 'atendimento@redenacionalpack.com.br': {
+   'slug':'rede-nacional-pack-nilson-santos', 'mql': True,
+   'empresa_real':'Rede Nacional Pack — distribuidora de embalagens e artigos para festas em Cascavel/PR, dedicada ao segmento supermercadista e clientes comerciais de abastecimento.',
+   'dominio_site':'redenacionalpack.com.br — site oficial ativo. A página inicial se apresenta como distribuidora de confiança de embalagens e artigos para festas para o segmento supermercadista. Páginas Empresa, Catálogos, Marcas, Ser um Distribuidor e Contato confirmam endereço em Cascavel/PR, telefone 0800, WhatsApp corporativo +55 45 99837-2322, catálogos Pró-Casa/Oxford e Start Festas e formulário para fazer parte do time de distribuidores.',
+   'redes':'Pesquisa pública real neste ciclo: ferramentas web gerenciadas falharam por quota, então foi feito acesso direto ao site oficial via urllib/curl. O site confirmou Rede Nacional Pack, foco em embalagens práticas/seguras e artigos de festas, marcas próprias/linhas Oxford, Pro Casa e Start Festas, catálogos baixáveis, atendimento ao dia a dia de supermercados e eventos, e link wa.me para +55 45 99837-2322. O formulário HubSpot informa venda por representantes comerciais, atuação com supermercados, faturamento de R$1 milhão a R$5 milhões, 11 a 25 pessoas e dor de dependência de poucos clientes grandes.',
+   'segmento':'Distribuidora/atacado de embalagens descartáveis e artigos para festas para supermercados e clientes comerciais, com catálogo de produtos físicos, reposição recorrente de estoque, representantes comerciais, marcas próprias e potencial de venda por tabela, preço e disponibilidade.',
+   'motivo':'Passa no crivo MQL acirrado: o site oficial confirma distribuidora de embalagens e artigos para festas voltada ao segmento supermercadista, com catálogo, marcas próprias, WhatsApp corporativo e formulário de distribuidores. O formulário reforça venda por representantes, público de supermercados, porte de R$1 milhão a R$5 milhões e 11 a 25 pessoas. Há potencial claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de embalagens para abastecimento de supermercados e distribuidores.',
+   'insight':'supermercados e distribuidores consultarem catálogo, preço e disponibilidade de embalagens e artigos de festa para repor estoque sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 41 99109-1485. Site oficial publica WhatsApp corporativo alternativo +55 45 99837-2322.',
+   'whatsapp_publico':'Usar primeiro o celular válido do HubSpot/formulário: +55 41 99109-1485; WhatsApp público corporativo alternativo encontrado no site oficial: +55 45 99837-2322.',
+ },
+ 'compras@paregesso.com.br': {
+   'slug':'paregesso-sandro-muniz', 'mql': True,
+   'empresa_real':'Paregesso / Paregesso Colamill — empresa de Belo Horizonte/MG com site próprio paregesso.com.br e catálogo de ferramentas e insumos para gesseiros, drywall, colas, gesso, retardantes e itens de jardinagem/plantio.',
+   'dominio_site':'paregesso.com.br — site oficial ativo com catálogo de ferramentas para gesseiro, gesso cola, gesso de secagem rápida, retardantes, colas Colamill, produtos de fibra de coco, argila expandida, kits de ferramentas, carril/guidão/reco/baguete e links de compra em Mercado Livre, Shopee e Amazon. Facebook oficial divulga preço especial para compras no atacado, telefone (31) 98598-0840 e e-mail vendas@paregesso.com.br.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por Paregesso, compras@paregesso.com.br e paregesso.com.br; WebExtract do site oficial; resultado do Facebook Paregesso Colamill com “Preços Especial para compras no Atacado”; TikTok/Instagram com posts de produtos para gesseiros e preço especial no atacado. O site confirma catálogo de produtos físicos, venda por marketplaces e WhatsApp corporativo +55 31 98598-0840.',
+   'segmento':'Fornecedor/distribuidor e marca de insumos e ferramentas para gesseiros, drywall e construção leve, com mix de produtos físicos, compra por kits/variações e potencial de venda recorrente para profissionais, aplicadores, lojas e obras.',
+   'motivo':'Passa no crivo MQL acirrado: formulário informa ferramentas, ERP Bling, loja virtual ativa e cliente compraria sozinho 24h; pesquisa pública confirmou empresa real com domínio próprio, catálogo de produtos físicos de gesso/ferramentas, canais de e-commerce/marketplace, WhatsApp corporativo e comunicação de preço especial no atacado. Há potencial claro para digitalizar catálogo, preço, disponibilidade e recompras de insumos/ferramentas por gesseiros, obras, profissionais e clientes comerciais.',
+   'insight':'gesseiros, obras e clientes comerciais consultarem catálogo, preço e disponibilidade de colas, gesso e ferramentas para repor materiais sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 31 98714-2102. Site/Facebook oficial publicam WhatsApp corporativo alternativo +55 31 98598-0840.',
+   'whatsapp_publico':'Usar primeiro o celular válido do HubSpot/formulário: +55 31 98714-2102; WhatsApp público corporativo alternativo localizado no site/Facebook: +55 31 98598-0840.',
+ },
+ 'atendimento@produtosdangelo.com.br': {
+   'slug':'doces-dangelo-joao', 'mql': True,
+   'empresa_real':'Doces D’angelo / Produtos D’angelo — fábrica brasileira de doces à base de ovos, suspiros, quindins, chuviscos, ambrosias e fios de ovos, com história ligada à Confeitaria D’angelo desde 1914 e produção reformulada desde 1992.',
+   'dominio_site':'produtosdangelo.com.br — site oficial ativo descreve a marca, fábrica de doces e linha de produtos; página inicial fala explicitamente com lojistas que querem oferecer produtos D’angelo aos clientes. A loja revenda.quindimnalata.com.br é uma operação B2B/revenda, com cadastro, tabela e condições comerciais, pedido online, restrição de venda exclusiva para CNPJ ligado ao comércio de produtos alimentícios e WhatsApp de atendimento +55 24 99864-7393.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por Doces D’angelo, produtosdangelo.com.br e revenda quindimnalata; WebExtract do site oficial e da loja de revenda. Fontes confirmam fábrica de doces, linha de quindins/suspiros/ambrosias/fios de ovos, atendimento a lojistas e plataforma B2B exclusiva para CNPJs de comércio alimentício com tabela/condições comerciais e pedido online. Instagram/snippets reforçam revenda dos doces.',
+   'segmento':'Indústria/fábrica de doces e alimentos com canal B2B de revenda para empórios, padarias, delicatessens, mini mercados e outros CNPJs de comércio alimentício; produto físico consumível de recompra, com tabela, condição comercial, catálogo e pedidos recorrentes.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa empórios, padarias, delicatessens e mini mercados, ERP Omie, faturamento de R$1 milhão a R$5 milhões/ano, site B2C e B2B, loja virtual ativa e autosserviço já usado. A pesquisa pública confirmou fábrica real de doces e uma loja B2B/revenda com venda exclusiva para CNPJ de comércio alimentício, cadastro, tabela, condições comerciais e pedido online. Há potencial claro para digitalizar catálogo, preço, condições comerciais e recompra recorrente por clientes alimentícios.',
+   'insight':'empórios, padarias e mini mercados consultarem catálogo, preço e condições dos doces para recomprar estoque sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 21 99568-0226. Loja pública de revenda também publica WhatsApp corporativo +55 24 99864-7393.',
+   'whatsapp_publico':'Usar primeiro o celular válido do HubSpot/formulário: +55 21 99568-0226; WhatsApp público corporativo alternativo localizado na loja de revenda: +55 24 99864-7393.',
+ },
+ 'comercial@natuflores.com.br': {
+   'slug':'natuflores-cosmeticos-wender-rodrigues', 'mql': True,
+   'empresa_real':'Natuflores Cosméticos — marca/indústria brasileira de cosméticos com mais de 25 anos, linhas de cuidados capilares, corporais, faciais, dermocosméticos, aromatizantes e sprays bucais, atuação nacional e página pública para distribuidores autorizados.',
+   'dominio_site':'natuflores.com.br — site oficial ativo com história de 25 anos, tecnologia e alta performance em produtos de beleza, categorias de cosméticos capilares, faciais, corporais e dermocosméticos, atuação em todas as regiões do Brasil e seção de parceiros/clientes. Página /querodistribuir tem chamada “Leve a Natuflores para sua Região: Seja um Distribuidor Autorizado”.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por Natuflores Cosméticos, natuflores.com.br, distribuidor Natuflores; WebExtract do site oficial e da página Quero Distribuir. Resultados confirmam marca real de cosméticos há 25 anos, catálogo de produtos de beleza/cuidado, atuação nacional e chamada explícita para distribuidores autorizados. Facebook/snippets divulgam “Seja um Distribuidor da Natuflores Cosméticos” e catálogo.',
+   'segmento':'Indústria/marca de cosméticos com produto físico de alto giro e recompra para redes de farmácias, distribuidores, lojas de cosméticos e canais comerciais; catálogo, preço, disponibilidade, condição comercial e reposição de estoque são centrais.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa Redes e farmácias / Distribuidor, ERP Sankhya, faturamento de R$5 a R$10 milhões/ano, 21 a 100 pessoas, 6 a 20 vendedores, loja virtual ativa e dor de dependência de poucos clientes grandes. A pesquisa pública confirmou empresa real de cosméticos há 25 anos, catálogo amplo, atuação nacional e chamada para distribuidores autorizados. Há potencial claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de distribuidores, farmácias e canais de revenda.',
+   'insight':'distribuidores e redes de farmácias consultarem catálogo, preço e disponibilidade dos cosméticos para repor estoque sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 62 98582-9823. Busca pública confirmou canal de distribuição/autorizado, mas o número seguro para este ciclo é o telefone informado no formulário.',
+   'whatsapp_publico':'Usar o celular válido do HubSpot/formulário: +55 62 98582-9823; nenhum WhatsApp público corporativo alternativo mais seguro foi localizado no site extraído.',
+ },
+ 'kibelleza@kibelleza.com.br': {
+   'slug':'ki-belleza-distribuidora-fabio-cota', 'mql': True,
+   'empresa_real':'Ki-Belleza Distribuidora / Ki-Belleza Distribuidora de Cosméticos — distribuidora de cosméticos, higiene pessoal e acessórios em João Monlevade/MG, com domínio próprio kibelleza.com.br.',
+   'dominio_site':'kibelleza.com.br — site oficial ativo “Kibelleza - Distribuidora de Cosméticos”, com categorias de higiene pessoal e cosméticos; página Quem Somos descreve distribuição de produtos de beleza e cosméticos; cadastro permite comprar como Cliente PF ou Cliente PJ. Bases públicas indicam Ki-Belleza Distribuidora Ltda - EPP, CNPJ 12.791.749/0001-83, sede em João Monlevade/MG e cerca de 15 anos de atividade.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por Ki-belleza distribuidora, kibelleza.com.br e Ki-Belleza CNPJ; resultados do site oficial, Serasa Experian, Facebook e LinkedIn. LinkedIn descreve “Distribuidora de Cosméticos | Acessórios”, Serasa confirma empresa ativa e Facebook publica telefone +55 31 3851-3576. Resultado de Consulta Remédios lista produtos da Distribuidora Ki-Belleza, reforçando catálogo de produtos de higiene/cosméticos.',
+   'segmento':'Distribuidora de cosméticos, higiene pessoal e acessórios, com produto físico de reposição e venda para supermercados, farmácias, mercearias, salões/perfumarias e clientes comerciais que precisam consultar catálogo, preço e disponibilidade.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa atuação com supermercados, farmácias e mercearias, venda por vendedor presencial, loja virtual, autosserviço possível e dor de escalar sem contratar mais gente. A pesquisa pública confirmou empresa real, distribuidora de cosméticos/higiene/acessórios com domínio próprio, cadastro PJ, LinkedIn e bases públicas. Há potencial claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de produtos de giro para clientes de varejo e abastecimento.',
+   'insight':'supermercados, farmácias e mercearias consultarem catálogo, preços e disponibilidade de cosméticos e higiene pessoal para repor estoque sem depender da visita do vendedor',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 31 99676-0308. Facebook/ZoomInfo publicam telefone corporativo alternativo +55 31 3851-3576.',
+   'whatsapp_publico':'Usar primeiro o celular válido do HubSpot/formulário: +55 31 99676-0308; telefone público corporativo alternativo localizado no Facebook/ZoomInfo: +55 31 3851-3576.',
+ },
+ 'vendas@artralos.com.br': {
+   'slug':'art-ralos-jander', 'mql': True,
+   'empresa_real':'Art Ralos — fabricante brasileira especializada em ralos lineares, tampas para casa de máquina, grelhas, perfis, calhas e acessórios em aço inox/alumínio para banheiros, piscinas, áreas gourmet, cozinhas industriais e construção civil.',
+   'dominio_site':'artralos.com.br — site oficial ativo com catálogo de ralos lineares, ralos de piscina, tampas de casa de máquina, grelhas, perfil de transição, calha úmida, cascata de embutir e produtos sob medida/variações para obra. Facebook/Instagram oficiais divulgam contato (34) 99293-8012 e posicionamento para aço inox, arquitetura, design de interiores, construção civil e engenharia.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por Art Ralos, vendas@artralos.com.br e artralos.com.br; WebExtract do site oficial; resultados de Facebook e Instagram. O site confirma catálogo extenso de produtos físicos para piscina, banheiro, área externa, garagem, cozinha industrial e casa de máquina, com produtos técnicos e sob medida.',
+   'segmento':'Fabricante/fornecedor de produtos de construção em aço inox/alumínio e ralos técnicos para lojas de piscina, construção civil, obras, arquitetos, engenheiros e clientes profissionais, com catálogo, variações, preço, disponibilidade e pedidos sob medida/recorrentes.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa Construção Civil e lojas de piscina, ERP Bling, faturamento de R$1 a R$5 milhões/ano, loja virtual ativa, venda por WhatsApp/marketplace/site próprio, dor de perda de vendas pela demora no atendimento e autosserviço possível para peças padrão. A pesquisa pública confirmou fabricante/fornecedor real com domínio próprio e catálogo de produtos físicos técnicos para piscina, banheiro, obra e cozinha industrial. Há potencial claro para digitalizar catálogo, preço, disponibilidade e pedidos de peças padrão para lojas, obras e clientes profissionais.',
+   'insight':'lojas de piscina, obras e clientes profissionais consultarem medidas, preço e disponibilidade de ralos e tampas padrão para pedir sem depender de cada orçamento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 62 98123-8012. Facebook/Instagram oficiais publicam WhatsApp corporativo alternativo +55 34 99293-8012.',
+   'whatsapp_publico':'Usar primeiro o celular válido do HubSpot/formulário: +55 62 98123-8012; WhatsApp público corporativo alternativo localizado no Facebook/Instagram: +55 34 99293-8012.',
+ },
+ 'com1@vanyluz.com': {
+   'slug':'vanyluz-carlos-sodelli', 'mql': True,
+   'empresa_real':'Vanyluz / Vany Luz Soluções em Iluminação — importadora e distribuidora nacional de produtos de iluminação LED localizada em São Paulo, com site próprio, catálogo de produtos, chamada para representantes comerciais e atendimento por WhatsApp.',
+   'dominio_site':'vanyluz.com — site oficial ativo com catálogo de lâmpadas, painéis, refletores, spots, highbay industrial, downlight e outras soluções LED para indústria, comércio, residências e eventos. A página pública oferece download de catálogo, pedido/cotação, cadastro e contato com representantes comerciais.',
+   'redes':'Pesquisa pública real neste ciclo: buscas por Vanyluz, Vanyluz material elétrico, com1@vanyluz.com e site vanyluz.com; WebExtract do site oficial https://www.vanyluz.com/en; resultado do LinkedIn descreve a empresa como importadora e distribuidora nacional de produtos de iluminação LED em São Paulo; Instagram/snippets mencionam materiais elétricos e iluminação LED. O site oficial publica WhatsApp de atendimento +55 11 96412-7505 e catálogo de produtos.',
+   'segmento':'Importadora/distribuidora nacional de iluminação LED e materiais elétricos, com catálogo físico de SKUs, representantes comerciais, cotações e venda para empresas, indústrias, comércio e canais de material elétrico/iluminação. Há recorrência de reposição, orçamento por linha/projeto, preço e disponibilidade por produto.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa material elétrico, venda por representantes comerciais, faturamento de R$5 a R$10 milhões/ano, 21 a 100 pessoas, 6 a 20 vendedores internos, cliente compraria sozinho 24h, ERP Outro e sem loja virtual. A pesquisa pública confirmou empresa real com site oficial, catálogo de produtos LED, importação/distribuição nacional, representantes comerciais e atendimento por WhatsApp. Há potencial claro para digitalizar catálogo, preço, disponibilidade e pedidos/cotações recorrentes de materiais elétricos/iluminação para clientes B2B e canais comerciais.',
+   'insight':'clientes e representantes consultarem catálogo, preço e disponibilidade de lâmpadas e luminárias LED para montar pedidos e cotações sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 91088-3756. Site oficial publica WhatsApp corporativo alternativo +55 11 96412-7505.',
+   'whatsapp_publico':'Usar primeiro o celular válido do formulário/HubSpot: +55 11 91088-3756; WhatsApp público corporativo alternativo localizado no site oficial: +55 11 96412-7505.',
+ },
+ 'gabriella@ormifrio.com.br': {
+   'slug':'ormifrio-gabriella-capelao', 'mql': True,
+   'empresa_real':'Ormifrio / Ormifrio Refrigeração — indústria brasileira de refrigeração comercial em Sabará/MG, ligada à fabricação de máquinas e aparelhos de refrigeração e ventilação para uso industrial e comercial, com portfólio de balcões, expositores, geladeiras e equipamentos para bebidas, açougue, laticínios e food service.',
+   'dominio_site':'O domínio do e-mail é ormifrio.com.br. A pesquisa pública encontrou presença oficial principalmente em Instagram/Facebook Ormifrio/Ormifrio LTDA; os snippets públicos dizem que a Ormifrio é indústria de refrigeração comercial brasileira, desde 1960, com portfólio de equipamentos de refrigeração, exposição e armazenamento de mercadorias. Bases públicas como Econodata/Serasa/CNPJ.biz associam Ormifrio/Orminox Refrigeração a Sabará/MG e CNAE de fabricação de máquinas e aparelhos de refrigeração e ventilação para uso industrial e comercial.',
+   'redes':'Pesquisa pública real neste ciclo: buscas por Ormifrio, ormifrio.com.br, Ormifrio equipamentos, Ormifrio CNPJ Sabará refrigeração comercial, Gabriella Capelão Ormifrio e Ormifrio WhatsApp. Resultados úteis: Instagram @ormifrio em Sabará/MG com produtos de açougue e equipamentos de refrigeração; Facebook Ormifrio LTDA descrevendo “primeira indústria de refrigeração comercial brasileira”, desde 1960, e portfólio; LinkedIn/snippets de Gabriella Capelão como 3ª geração Ormifrio e empreendedora Food Service; anúncios de revendedores como Liquida Total, Varejão das Máquinas e outros vendendo balcões, expositores e geladeiras Ormifrio; Facebook/Instagram publicam contato/WhatsApp corporativo +55 31 99957-0853.',
+   'segmento':'Indústria/fabricante de equipamentos de refrigeração comercial e exposição para bares, restaurantes, mercados, açougues, laticínios, bebidas e food service, com venda por revendedores e distribuidores de equipamentos. Produto físico técnico, catálogo amplo, preço por modelo, disponibilidade e pedidos/orçamentos recorrentes para canais e clientes comerciais.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa atuação com revendedores e distribuidores de equipamentos, ERP Omie, faturamento de R$5 a R$10 milhões/ano, 11 a 25 pessoas, venda por telefone/WhatsApp/visitas, cliente compraria sozinho 24h e dor de vendedores gastando tempo só tirando pedido. A pesquisa pública confirmou empresa real de refrigeração comercial, indústria/fabricante com portfólio de equipamentos físicos e presença em revendedores de máquinas/equipamentos. Há potencial claro para digitalizar catálogo técnico, preço, disponibilidade e pedidos/orçamentos de revendedores, distribuidores e clientes food service sem depender de atendimento manual.',
+   'insight':'revendedores e distribuidores consultarem modelos, preço e disponibilidade dos equipamentos de refrigeração para orçar e repor pedidos sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone celular válido informado no HubSpot/formulário: +55 31 99626-769. A pesquisa pública também encontrou WhatsApp corporativo oficial da Ormifrio: +55 31 99957-0853.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no formulário/HubSpot: +55 31 99626-769; WhatsApp público corporativo alternativo localizado em Facebook/Instagram: +55 31 99957-0853.',
+ },
+ 'alain@yspresso.com.br': {
+   'slug':'yspressoshop-alain-vistocci', 'mql': False,
+   'empresa_real':'YSPRESSOSHOP / Yspresso Shop — operação de cafés, máquinas e itens relacionados a coffee/wine em Curitiba/PR, vinculada publicamente a Alain Vistocci e ao perfil @yspressoshop.',
+   'dominio_site':'yspresso.com.br informado no e-mail do lead; a pesquisa pública não localizou site institucional/e-commerce indexado confiável no domínio. A evidência pública mais forte encontrada foi Instagram @yspressoshop em Curitiba/PR, com descrição de há 8 anos como especialista em máquinas e cafés, conectando clientes a cafés do mundo e atendendo todo o Brasil.',
+   'redes':'Pesquisa pública real neste ciclo: buscas por YSPRESSOSHOP, Yspresso Shop, yspresso.com.br, @yspressoshop, Alain Vistocci e Alain Vistocci Yspresso. Resultados úteis encontrados: Instagram @yspressoshop com cerca de 4,8 mil seguidores e descrição “Há 08 anos Yspressialista em Máquinas e Cafés”, “Coffee & Wine & muito mais” e atendimento Brasil; Instagram pessoal de Alain Vistocci citando @yspressoshop, @bonubox, “Vendedor Platinum Mercado Livre” e “Coffeelover”. Não encontrei evidência pública clara de indústria, importador, distribuidor ou atacado vendendo para revendas/lojistas com tabela/catálogo B2B recorrente.',
+   'segmento':'Comércio/e-commerce/marketplace de cafés, máquinas e produtos relacionados, com possível venda para cafeterias, restaurantes, padarias e confeitarias conforme formulário, mas sem comprovação pública de operação T1 de atacado/distribuição/importação/indústria ou canal recorrente para abastecimento de estoque de revendas/lojistas.',
+   'motivo':'Reprovado no crivo MQL acirrado/fail-closed: o formulário informa atuação em padarias, cafeterias, restaurantes e confeitarias, venda principal por marketplace, loja virtual, autosserviço possível, ERP Outro e faturamento de R$1 milhão a R$5 milhões/ano; porém a pesquisa pública confirmou principalmente marca/perfil social e venda via marketplace de cafés/máquinas, sem evidência clara de atacado, indústria, importação ou distribuição para revendas/lojistas/clientes recorrentes de abastecimento de estoque. Como há dúvida relevante sobre ICP T1, não recebe diagnóstico externo automático.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 41 99722-6753; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não localizei WhatsApp público corporativo mais seguro que o telefone informado no formulário; contato externo bloqueado por não-MQL.',
+ },
+ 'wzetta@wzetta.com.br': {
+   'slug':'wzetta-informatica-weslley', 'mql': False,
+   'empresa_real':'WZetta Informática Tecnologia Ltda — e-commerce/loja de PCs, eletrônicos, áudio, vídeo, periféricos, notebooks, hardware, celulares/tablets e acessórios em Fortaleza/CE, CNPJ 21.241.390/0001-61, com domínio próprio wzetta.com.br.',
+   'dominio_site':'wzetta.com.br — loja virtual ativa com categorias PC Gamer, Gamer, PC Office, Monitor, Notebook, Hardware, Periféricos, Acessórios, Celular/Tablet e Promoções. Página de contato publica e-mail wzetta@wzetta.com.br, endereço Rua NS 05, 216 Granja Lisboa e WhatsApp +55 85 99659-6138.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por WZETTA INFORMATICA TECNOLOGIA LTDA, wzetta.com.br e WZetta Informática; WebFetch/WebExtract do site oficial e página de contato; resultados públicos de Econodata/Casa dos Dados/Informe Cadastral; Instagram @wzetta descrito como PC Gamer/Notebook com WhatsApp +55 85 99659-6138. As fontes confirmam empresa real, loja online e varejo/e-commerce de informática, mas não confirmam atacado/distribuição, indústria, importação, venda para revendas/lojistas com tabela B2B, ou operação clara de abastecimento recorrente de estoque.',
+   'segmento':'Varejo/e-commerce de informática, computadores e eletrônicos. O formulário declara Lojas de Informática, Técnicos de Informática e Empresas como público, mas a evidência pública encontrada mostra principalmente loja/e-commerce B2C/B2B leve, sem prova clara de canal atacadista/distribuidor para revendas ou recompra recorrente de estoque.',
+   'motivo':'Reprovado no crivo MQL acirrado/fail-closed: apesar de empresa real, faturamento de R$1 a R$5 milhões, loja virtual e público informado com lojas/técnicos/empresas, a pesquisa pública não confirmou indústria, distribuidor, importador ou atacado vendendo para revendas/lojistas em modelo recorrente de abastecimento de estoque. Como a operação pública parece varejo/e-commerce de eletrônicos e há dúvida relevante sobre ICP T1, não recebe diagnóstico externo automático.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 85 98899-1705. Página de contato/site oficial publica WhatsApp corporativo alternativo +55 85 99659-6138; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'WhatsApp público corporativo localizado no site oficial: +55 85 99659-6138; contato externo bloqueado por não-MQL.',
+ },
+ 'lc@routechemicals.com.br': {
+   'slug':'route-chemicals-luiz-claudio', 'mql': True,
+   'empresa_real':'Route Chemicals / Route AgroSciences — indústria química/agroindustrial voltada a adjuvantes, nutrição foliar, biológicos, fertilizantes e proteção de cultivos, com domínio routechemicals.com.br e presença pública como Route Chemicals Agroindustrial.',
+   'dominio_site':'routechemicals.com.br — site oficial Route AgroSciences com portfólio de adjuvantes, biológicos, defensivos/proteção de cultivos e fertilizantes, estudos de validação, assistência técnica e chamada para produtores/empresários agrícolas. O site publica WhatsApp de atendimento +55 44 98859-0265.',
+   'redes':'Pesquisa pública real neste ciclo: WebSearch por Route Chemicals, routechemicals.com.br e Luiz Claudio Oliveira; WebExtract do site oficial; LinkedIn Route Chemicals Group descreve indústria química voltada à industrialização para linha agrícola, tecnologia de aplicação, nutrição foliar e proteção de cultivos; Casa dos Dados indica Route Chemicals Agroindustrial, telefone/WhatsApp +55 41 99683-0653 e CNAE de fabricação de fertilizantes; Instagram/Facebook públicos mencionam Route Chemicals Agroindustrial e vagas comerciais/distribuição.',
+   'segmento':'Indústria química/agroindustrial de insumos agrícolas e tecnologias de aplicação, com produtos físicos recorrentes para produtores, cooperativas, canais de distribuição agrícola e clientes do agro que recompõem estoque/insumos por safra. Distribuidor/agro é ICP válido quando há venda B2B recorrente e catálogo de produto técnico.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa ERP Bling, faturamento de R$1 milhão a R$5 milhões/ano, 11 a 25 pessoas, 2 a 5 vendedores, loja virtual, dor de dependência de poucos clientes grandes e venda física; a pesquisa pública confirmou indústria química/agroindustrial real com portfólio técnico de adjuvantes, fertilizantes, biológicos e proteção de cultivos, atuação B2B no agro, produtos físicos recorrentes e potencial claro para digitalizar catálogo técnico, preço, disponibilidade e pedidos de reposição por produtores/canais agrícolas.',
+   'insight':'produtores e canais agrícolas consultarem catálogo, preço e disponibilidade dos insumos de nutrição e proteção de cultivos para repor produtos sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário e em base pública: +55 41 99683-0653. Site oficial publica WhatsApp corporativo alternativo +55 44 98859-0265.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no formulário/HubSpot: +55 41 99683-0653; WhatsApp público alternativo do site oficial: +55 44 98859-0265.',
+ },
+ 'sac@brasihy.com.br': {
+   'slug':'brasihy-luciana-ferreira', 'mql': False,
+   'empresa_real':'BrasiHy / Luciana Ferzaso. Pesquisa pública localizou perfil Instagram @brasihy descrito como BrasiHy E-commerce em São José dos Campos/SP, com presença muito inicial (poucos posts/seguidores) e sem site corporativo, CNPJ, catálogo B2B ou canal atacadista confirmado.',
+   'dominio_site':'E-mail usa brasihy.com.br, mas as buscas por brasihy.com.br e pelo domínio não retornaram site institucional/e-commerce público confiável. A evidência pública mais próxima foi Instagram @brasihy.',
+   'redes':'Pesquisa web real neste ciclo: buscas por "Brasihy", "brasihy.com.br", "Luciana Ferzaso" e "Brasihy academia estética nutricionista". Resultados encontrados: Instagram @brasihy com descrição "BrasiHy E-commerce" e perfil pessoal/empreendedora Luciana Ferzaso; snippets associam a marca a saúde, estética, longevidade e Mounjax, mas não confirmam indústria, distribuição, importação ou atacado. Não encontrei evidência de revendas/lojistas/clientes recorrentes de abastecimento de estoque.',
+   'segmento':'E-commerce/projeto comercial inicial voltado a academias, centros de estética e nutricionistas, conforme formulário, sem faturamento declarado e sem prova pública de operação T1 de indústria, distribuidor, importador ou atacado.',
+   'motivo':'Reprovado no crivo MQL acirrado/fail-closed: formulário informa que ainda não faturam, ERP Outro, equipe pequena, venda por WhatsApp/Instagram e público de academias/estética/nutricionistas. A pesquisa pública encontrou presença social muito inicial e não confirmou canal B2B recorrente de estoque, catálogo atacadista, revenda/lojistas ou operação industrial/distribuidora. Como há dúvida relevante e ausência de evidência clara de ICP T1, não deve receber diagnóstico externo.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 12 98152-0141; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não pesquisado para disparo externo adicional; telefone do formulário é celular válido, mas contato externo bloqueado por regra de não-MQL.',
+ },
+ 'elaine.oliveira@sankhya.com.br': {
+   'slug':'sankhya-elaine-oliveira', 'mql': False,
+   'empresa_real':'Sankhya Gestão de Negócios — empresa brasileira de tecnologia/software de gestão empresarial (ERP), com domínio corporativo sankhya.com.br; o lead veio como "trabalho na Sankhya" e e-mail elaine.oliveira@sankhya.com.br.',
+   'dominio_site':'sankhya.com.br — site institucional da Sankhya, desenvolvedora e fornecedora de software/ERP, fundada em Uberlândia/MG e com atuação nacional em soluções de gestão empresarial.',
+   'redes':'Pesquisa pública real neste ciclo via Claude Code/WebSearch/WebFetch: site institucional sankhya.com.br, página Empresa da Sankhya e LinkedIn corporativo Sankhya Gestão de Negócios. Busca por Elaine Oliveira + Sankhya não confirmou com segurança o perfil individual da pessoa; resultados de homônimas foram descartados. Não foi encontrado telefone/WhatsApp pessoal público seguro da Elaine ligado à Sankhya.',
+   'segmento':'TI/software/ERP. A Sankhya é fornecedora de tecnologia e gestão empresarial; não há evidência de indústria, distribuidor, importador ou atacado vendendo produto físico recorrente para revendas/lojistas ou abastecimento de estoque.',
+   'motivo':'Reprovado no crivo MQL acirrado/fail-closed: a empresa identificada pelo domínio é uma fornecedora de software/ERP, não uma operação T1 de indústria, distribuição, importação ou atacado com catálogo, preço, estoque e pedidos recorrentes. O contato veio por Conversations, já está em etapa comercial posterior no HubSpot, sem formulário de diagnóstico, sem ERP/faturamento/dor e sem telefone válido. Não há vínculo operacional B2B de estoque para abordagem automática externa.',
+   'insight':'',
+   'telefone_publico':'Não encontrado telefone/WhatsApp público seguro da Elaine Oliveira ligado à Sankhya. Telefones institucionais gerais da Sankhya não foram usados porque não correspondem ao lead.',
+   'whatsapp_publico':'Não encontrado WhatsApp público seguro do contato; contato externo bloqueado por não-MQL e telefone ausente.',
+ },
+ 'movesbrazil@moves.com': {
+   'slug':'moves-brazil-mauro-pessanha', 'mql': False,
+   'empresa_real':'Moves Brazil / domínio moves.com informado no e-mail. A pesquisa pública encontrou o site moves.com como House of Moves, um estúdio norte-americano de performance capture/virtual production para games, filmes, TV e comerciais; não encontrei evidência pública segura de uma operação brasileira de atacado, distribuição, indústria ou importação chamada Moves Brazil ligada a vendas B2B recorrentes de estoque.',
+   'dominio_site':'moves.com — site ativo de House of Moves, estúdio de serviços de performance capture, virtual production, animation pipeline e stage design/build, com clientes de entretenimento e tecnologia. O domínio não comprova operação de catálogo/estoque/atacado no Brasil.',
+   'redes':'Pesquisa web real neste ciclo: buscas por "Moves Brazil" + "moves.com" + "Mauro Pessanha", busca pelo e-mail movesbrazil@moves.com e site:moves.com Brazil Moves não retornaram evidência pública do lead/empresa no ICP; WebFetch/WebExtract de moves.com apontou House of Moves, prestadora de serviços criativos/produção, não atacado/distribuição.',
+   'segmento':'Sem confirmação de ICP T1. A evidência pública disponível aponta para serviço/produção criativa/estúdio, enquanto o formulário informa "Aprendendo", ainda sem faturamento, ERP Outro, 1 a 10 pessoas, sem loja virtual e sem declaração clara de venda para revendas/lojistas/clientes de abastecimento recorrente.',
+   'motivo':'Fail-closed pelo crivo MQL acirrado: formulário indica operação inicial/aprendizado, ainda sem faturamento e sem loja virtual; a web não confirmou indústria, distribuidor, importador ou atacado vendendo para revendas/lojistas/clientes recorrentes com catálogo, preço, disponibilidade e reposição de estoque. Como há dúvida relevante e ausência de vínculo operacional B2B claro, fica não-MQL e não recebe diagnóstico externo.',
+   'insight':'',
+   'telefone_publico':'Telefone válido recebido no HubSpot/formulário: +55 61 99800-1411; não usado para contato externo porque o lead foi reprovado no crivo MQL.',
+   'whatsapp_publico':'Não pesquisado para disparo externo, pois o lead foi classificado como não-MQL; telefone do formulário é celular válido mas bloqueado para abordagem por regra de não-MQL.',
+ },
+ 'marketing@morenabakana.com.br': {
+   'slug':'morena-bakana-maurina-silveira', 'mql': True,
+   'empresa_real':'Morena Bakana / MBK — marca de moda praia de Ilhota/SC, com loja online própria, loja física, CNPJ 44.917.195/0001-04 e presença pública vendendo no varejo e no atacado.',
+   'dominio_site':'morenabakana.com.br — loja online oficial ativa de moda praia, lingerie e peças relacionadas, com CNPJ 44.917.195/0001-04 e endereço em Ilhota/SC publicados no rodapé/página de segurança e privacidade.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial morenabakana.com.br, Facebook Morena Bakana Ilhota/SC com contato +55 47 98846-5851 e e-mail marketing@morenabakana.com.br, Instagram @morenabakanaoficial e snippets públicos indicando atacado e varejo, venda direta de fábrica, “Somos fabricantes e Distribuidores”, “3 peças já sai valor de Atacado”, “Revenda Morena Bakana” e envio para todo o Brasil.',
+   'segmento':'Marca/fabricante e distribuidora de moda praia com venda B2C e B2B/atacado para revendedoras, lojistas e clientes que compram mix de peças para revenda; produto físico sazonal e de alto giro, com catálogo, grades, preço, disponibilidade e reposição de estoque.',
+   'motivo':'O formulário declara atuação B&B e B&C, ERP Omie, faturamento de R$1 milhão a R$5 milhões/ano, 21 a 100 pessoas, 2 a 5 vendedores, loja virtual ativa e dor de perda de vendas pela demora no atendimento. A pesquisa pública confirmou empresa real com domínio próprio, loja online, telefone/e-mail corporativos, operação de moda praia e comunicação explícita de atacado, revenda, direto de fábrica, fabricantes e distribuidores. Passa no crivo MQL acirrado por fabricante/distribuidora de produto físico com canal de revenda/atacado e potencial claro de digitalizar catálogo, tabela de preço, disponibilidade de grades e pedidos recorrentes de lojistas/revendedoras.',
+   'insight':'lojistas e revendedoras consultarem catálogo, grades, preço e disponibilidade de moda praia para repor peças sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 47 98408-1443. Facebook oficial também publica contato corporativo +55 47 98846-5851.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no HubSpot: +55 47 98408-1443; contato corporativo público alternativo localizado no Facebook: +55 47 98846-5851.',
+ },
+ 'marcos.maciel@grupojacare.com': {
+   'slug':'jacare-home-center-marcos-maciel', 'mql': True,
+   'empresa_real':'Jacaré Home Center / Home Center Jacaré Material de Construções e Madeiras — rede maranhense de home center e materiais de construção, com e-commerce ativo, lojas físicas, marcenarias, atacarejo da construção e centro de distribuição.',
+   'dominio_site':'jacarehomecenter.com.br — site oficial/e-commerce ativo com categorias de pisos e revestimentos, banheiros e cozinha, tintas, elétrica, hidráulica, material básico, portas e janelas, marcenaria, ferragens, gesso/drywall, ferramentas e EPIs. O site usa e-mails contato@grupojacare.com e sac@grupojacare.com, confirmando o domínio do lead.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial jacarehomecenter.com.br, página Contato, página Nossas Lojas, Instagram @jacarehomecenter e Facebook Jacaré Home Center. As fontes confirmam operação física e digital, 13 unidades/listagens entre home centers, marcenarias, atacarejo da construção e centro de distribuição no Maranhão, atendimento em São Luís, Santa Inês, Codó, Imperatriz e Barreirinhas, além de comunicação pública de opção de compra no atacarejo e atendimento a serralheiros/profissionais da construção.',
+   'segmento':'Rede de materiais de construção/home center e atacarejo da construção, com venda recorrente de produtos físicos para construtoras, serralheiros, vidraceiros, marceneiros, profissionais de obra e clientes comerciais que compram por catálogo, disponibilidade, preço e reposição de estoque/obra.',
+   'motivo':'O formulário declara atuação B2B com serralheiros e construtoras, ERP Sankhya, faturamento de R$5 a R$10 milhões/ano, loja virtual ativa, 11 a 25 pessoas, 2 a 5 vendedores e dor de perda de vendas pela demora no atendimento. A pesquisa pública confirmou empresa real com domínio próprio, e-commerce, rede de lojas, atacarejo da construção, centro de distribuição e categorias de materiais/ferragens/ferramentas de recompra. Passa no crivo MQL acirrado por operação de atacarejo/distribuição de materiais de construção para clientes profissionais recorrentes, com potencial claro de digitalizar catálogo, tabela de preço, disponibilidade e pedidos B2B.',
+   'insight':'serralheiros, construtoras e profissionais de obra consultarem catálogo, preço e disponibilidade de materiais para repor itens sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone válido informado no formulário/HubSpot: +55 98 98115-7200. Site oficial divulga central de atendimento +55 98 93248-9999 e várias lojas com telefones locais.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no formulário/HubSpot: +55 98 98115-7200; telefone público corporativo alternativo do site: +55 98 93248-9999.',
+ },
+ 'marco@cerealista.com.br': {
+   'slug':'cerealista-milani-marco-milani', 'mql': True,
+   'empresa_real':'Cerealista Milani de Bariri Ltda / Arroz Milani — cerealista e indústria de beneficiamento e empacotamento de arroz, milho e derivados, fundada em 1980 em Bariri/SP.',
+   'dominio_site':'cerealistamilani.com.br — site oficial ativo com história da empresa, produtos Arroz Milani, página de contato e atuação regional. O e-mail do lead usa cerealista.com.br, mas a pesquisa pública aponta cerealistamilani.com.br como domínio institucional oficial da empresa.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial cerealistamilani.com.br, página Quem Somos, página Contato, Instagram @arrozmilani, Facebook Cerealista Milani, LinkedIn Cerealista Milani de Bariri e base pública Econodata/CNPJ 43.677.111/0001-40. As fontes confirmam operação de beneficiamento/empacotamento de arroz e derivados, marca própria Arroz Milani, fundação em 1980 e atendimento a supermercados, mercearias e restaurantes com frota própria no interior paulista.',
+   'segmento':'Indústria/cerealista de alimentos e atacado regional de arroz e cereais para supermercados, mercearias, restaurantes e clientes comerciais de abastecimento recorrente; produto físico de alto giro com catálogo, tabela de preço, disponibilidade e recompra de estoque.',
+   'motivo':'O formulário declara atuação em supermercados e restaurantes, faturamento de R$5 a R$10 milhões/ano, venda através de vendedores, 11 a 25 pessoas, sem loja virtual e dor de integração. A pesquisa pública confirmou empresa real, indústria/cerealista com marca própria Arroz Milani, operação desde 1980, produtos de alto giro e distribuição regional para varejo alimentar e food service. Passa no crivo MQL acirrado por indústria/atacado de alimento recorrente para revendas/lojistas e restaurantes, com potencial claro de digitalizar catálogo, preço, disponibilidade e pedidos de reposição.',
+   'insight':'supermercados, mercearias e restaurantes consultarem catálogo, preço e disponibilidade dos arrozes para repor estoque sem depender de cada pedido manual ao vendedor',
+   'telefone_publico':'Telefone público localizado no site oficial: +55 14 3662-2155. Telefone celular válido informado no formulário/HubSpot: +55 14 98141-0085.',
+   'whatsapp_publico':'WhatsApp público não encontrado no site/redes; para o ciclo usar o celular válido informado no formulário/HubSpot: +55 14 98141-0085.',
+ },
+ 'sameila@dvzconsultoria.com.br': {
+   'slug':'moto-cred-dvz-consultoria-sam-arruda', 'mql': False,
+   'empresa_real':'DVZ Consultoria — consultoria especializada em desenvolvimento empresarial, gestão e negócios; o nome do formulário veio como Moto cred, mas o domínio do e-mail e a pesquisa pública apontam para DVZ Consultoria.',
+   'dominio_site':'dvzconsultoria.com.br — site oficial ativo descreve a DVZ como consultoria em desenvolvimento empresarial, gestão, negócios e capital humano. Página de contato publica WhatsApp (19) 97406-0008 e e-mail contato@dvzconsultoria.com.br.',
+   'redes':'Pesquisa pública real neste ciclo: busca por “Moto cred Sam Arruda” e “Moto cred dvz consultoria” não encontrou operação comercial própria; busca pelo domínio dvzconsultoria.com.br encontrou site oficial da DVZ Consultoria, página de contato, página de Gestão do Capital Humano e Facebook público da DVZ com serviços de contratação, redução de custos e escolha de talentos.',
+   'segmento':'Consultoria/serviços de gestão empresarial e capital humano. Não há evidência de indústria, distribuidor, importador ou atacado com venda recorrente de catálogo/produto físico para revendas, lojistas ou abastecimento de estoque.',
+   'motivo':'O formulário informa atuação em Pessoas, ERP Outro, ainda sem faturamento, equipe de 1 a 10 pessoas, 1 vendedor, venda por WhatsApp e sem loja virtual. A pesquisa pública confirmou uma consultoria de desenvolvimento empresarial/capital humano, e não uma operação T1 de indústria, distribuição, importação ou atacado com catálogo, preço, estoque e pedidos recorrentes. Pelo crivo MQL acirrado/fail-closed, serviço/consultoria e ausência de canal B2B de estoque ficam não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone/WhatsApp público no site da DVZ Consultoria e coincidente com o número completo do HubSpot: +55 19 97406-0008; não usado para contato externo porque o lead foi reprovado no crivo MQL.',
+   'whatsapp_publico':'WhatsApp público localizado na página de contato da DVZ Consultoria: +55 19 97406-0008; contato externo bloqueado por não-MQL.',
+ },
+ 'lucas.galiza@bellaphytus.com.br': {
+   'slug':'bellaphytus-lucas-galiza', 'mql': True,
+   'empresa_real':'BellaPhytus / Bellaphytus Indústria de Cosméticos Ltda — indústria brasileira de dermocosméticos, óleos naturais, cremes e desodorantes veganos, com fabricação própria, produtos registrados e loja oficial ativa.',
+   'dominio_site':'bellaphytus.com.br — loja oficial ativa informa “Há 14 anos, unimos ciência e natureza”, fabricação própria, produtos registrados na Anvisa, linhas de óleos e cremes naturais, mamães e baby, hidrata/regenera e catálogo de dermocosméticos com envio para todo o Brasil.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial bellaphytus.com.br, Instagram @bellaphytus com descrição de dermocosméticos desenvolvidos pela própria marca, bases públicas Serasa/Econodata/CNPJ confirmando Bellaphytus Indústria de Cosméticos Ltda, e resultados públicos de distribuição/revenda como Flora Saúde Distribuidora vendendo produtos Bellaphytus e snippets com chamadas “Leve para sua loja”, “atacado”, “revenda”, “lojas de produtos naturais, distribuidora, farmácia”.',
+   'segmento':'Indústria/fabricante de cosméticos, dermocosméticos e produtos naturais de cuidado pessoal, com produto físico consumível de recompra e evidência pública de canal para farmácias, lojas de produtos naturais, distribuidoras e revenda; catálogo de SKUs com preço, estoque e reposição recorrente.',
+   'motivo':'O formulário declara atuação em farmácia, ERP Olist/Tiny, faturamento de R$1 a R$5 milhões/ano, loja virtual ativa, venda por Olist e dor de vendedores gastando tempo tirando pedido. A pesquisa pública confirmou indústria própria de cosméticos com domínio/loja oficial, CNPJ industrial, presença social e evidências de revenda/atacado para lojas, distribuidoras e farmácias. Passa no crivo MQL acirrado por indústria de produto consumível com canal B2B/revenda e potencial claro de digitalizar catálogo, preço, disponibilidade e pedidos recorrentes para pontos de venda.',
+   'insight':'farmácias, lojas de produtos naturais e distribuidores consultarem catálogo, preço e disponibilidade dos dermocosméticos para repor estoque sem depender de cada pedido manual',
+   'telefone_publico':'Telefone válido informado no formulário/HubSpot: +55 48 99624-3399. Site oficial também exibe WhatsApp de atendimento +55 48 6136-0010.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no formulário/HubSpot: +55 48 99624-3399; WhatsApp corporativo público alternativo localizado no site oficial: +55 48 6136-0010.',
+ },
+ 'alessandra@metaissilva.com.br': {
+   'slug':'metais-silva-alessandra-azevedo', 'mql': True,
+   'empresa_real':'Metais Silva Conexões — fabricante brasileira de conexões metálicas/latão para hidráulica, gás, válvulas e acessórios de solda, vinculada a Alessandra Azevedo, com telefone corporativo +55 11 98390-3525 e endereço público em São Paulo/SP.',
+   'dominio_site':'metaissilva.com.br — domínio oficial identificado publicamente, mas o site retornou página de acesso restrito/código 991 no momento da pesquisa. ZoomInfo confirma o domínio oficial, indústria Industrial Machinery & Equipment/Manufacturing, 11 a 50 funcionários, receita abaixo de US$5M, sede em São Paulo e telefone +55 11 98390-3525.',
+   'redes':'Pesquisa pública real neste ciclo: ZoomInfo Metais Silva; Facebook público “Metais Silva Conexões” com contato +55 11 98390-3525 e e-mail metaissilva@metaissilva.com.br; Instagram @metaissilva0502 com posts de conexões e chamada para WhatsApp (11) 98390-3525; LinkedIn de Alessandra Azevedo/Fabricantes de Conexões descrevendo “somos fabricantes de toda linha em conexões em metal” e busca por representantes.',
+   'segmento':'Fabricante/fornecedora B2B de conexões metálicas, peças de latão, hidráulica, gás, válvulas e acessórios técnicos para distribuidores, representantes, negócios e clientes industriais/residenciais; catálogo de produto físico técnico com orçamento, recompra e abastecimento recorrente.',
+   'motivo':'Mesmo sem campos completos do formulário, a pesquisa pública confirmou empresa real com domínio corporativo, presença social, telefone corporativo, atuação como fabricante de toda linha de conexões em metal e busca por representantes/distribuidores. Passa no crivo acirrado por indústria/fabricante B2B de conexões metálicas com catálogo técnico, venda por orçamento/representantes e potencial claro de digitalizar catálogo, preço, disponibilidade e pedidos recorrentes para distribuidores e clientes profissionais.',
+   'insight':'representantes e clientes profissionais consultarem catálogo, preços e disponibilidade de conexões metálicas para repor peças sem depender de cada orçamento manual',
+   'telefone_publico':'Telefone/WhatsApp público confirmado em ZoomInfo, Facebook, Instagram e LinkedIn: +55 11 98390-3525; coincide com o número informado no gate/HubSpot.',
+   'whatsapp_publico':'Usar o WhatsApp corporativo publicamente associado à Metais Silva: +55 11 98390-3525.',
+ },
+ 'diretoria@conectpumps.com.br': {
+   'slug':'conect-pumps-roberto-martins', 'mql': True,
+   'empresa_real':'Conect Pumps Importação e Comércio de Bombas Ltda — ME, empresa ativa de São Paulo/SP com CNPJ 09.349.991/0001-97, em operação desde 2007, ligada a bombas, pressurização, filtragem, aquecimento e equipamentos para piscinas/água.',
+   'dominio_site':'conectpumps.com.br — site próprio ativo em implantação com loja/e-commerce, banners e categorias de bombas de incêndio, pressurizadores de água, bombas submersas, tratamento de água de piscina, trocadores de calor, marcas como Jacuzzi, KSB, Nautilus, Rowa, Schneider, Sodramar, Sulzer e chamada de loja física/retirada. O site redireciona produtos para lojasecobbombas.com.br/Secob Bombas, indicando catálogo comercial real.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial conectpumps.com.br, resultado público do Instagram @conectpumps/Conect Axen Pumps descrevendo soluções em bombas e pressurização para piscinas, pressurizadores, filtragem e aquecimento com WhatsApp 11 93758-3300, e Serasa Experian/CNPJ confirmando Conect Pumps Importação e Comércio de Bombas Ltda ME, ativa desde 2007, com atividades secundárias de comércio atacadista de máquinas/equipamentos industriais, bombas e compressores, ferragens/ferramentas e material de construção.',
+   'segmento':'Importadora/comércio atacadista e varejo técnico de bombas, pressurizadores, compressores, equipamentos de piscina, peças e acessórios para construtoras, condomínios, administradoras, piscineiros, arquitetos, engenheiros, academias, clubes aquáticos, resorts e hotelaria; produto físico técnico com cotação, disponibilidade, marcas, reposição e recompra para clientes profissionais.',
+   'motivo':'O formulário declara faturamento de R$5 a R$10 milhões/ano, ERP Bling, loja virtual ativa, venda por marketplace, 2 a 5 vendedores e dor de perda de vendas pela demora no atendimento. A pesquisa pública confirmou empresa real com domínio/loja, operação de bombas/pressurização/piscina e CNPJ com atividades atacadistas de bombas, compressores, máquinas/equipamentos, ferragens e materiais de construção. Passa no crivo MQL acirrado por comércio/importação/atacado técnico B2B com clientes profissionais recorrentes e potencial claro de digitalizar catálogo, tabela, disponibilidade e pedidos de reposição.',
+   'insight':'clientes profissionais consultarem catálogo, preço e disponibilidade de bombas e pressurizadores para repor equipamentos sem depender de cada atendimento manual',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 11 94089-3425. Pesquisa pública encontrou WhatsApp corporativo alternativo no Instagram @conectpumps: +55 11 93758-3300.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no HubSpot/formulário: +55 11 94089-3425; WhatsApp público alternativo da marca localizado em snippet do Instagram: +55 11 93758-3300.',
+ },
+ 'marcio.soares@morefix.com.br': {
+   'slug':'morefix-marcio-soares', 'mql': True,
+   'empresa_real':'Morefix Comércio e Importação Ltda — EPP, CNPJ 32.268.865/0001-20, importadora e distribuidora/atacadista de fixadores e ferragens, com matriz em Braço do Trombudo/SC e filiais/CDs em SP e MG.',
+   'dominio_site':'morefix.com.br — site oficial com catálogo de produtos; loja também referenciada em morefix.online. Bases públicas confirmam CNAE de comércio atacadista de ferragens e ferramentas.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial morefix.com.br e catálogo /produtos, Instagram público @morefixoficial, Serasa Experian, CNPJ.biz, Econodata, AECweb e Reclame Aqui. A pesquisa confirma razão social Morefix Comércio e Importação Ltda, sócio-administrador Marcio Alexandre Soares, fundação em 2018, atuação como importador/distribuidor B2B de fixadores para indústria moveleira, construção civil e industrial, com logística nacional e 3 CDs/filiais.',
+   'segmento':'Importador, distribuidor e atacadista de fixadores, ferragens e consumíveis como parafusos, porcas, buchas, arruelas, inox e solda WeldPro; itens físicos de alto giro e recompra recorrente para indústria, construção, moveleiro, lojas e clientes comerciais de abastecimento de estoque.',
+   'motivo':'A pesquisa pública confirmou empresa real com razão social de comércio e importação, atividade atacadista de ferragens/ferramentas e posicionamento como importador/distribuidor B2B de fixadores. O formulário reforça faturamento de R$10 a R$50 milhões/ano, ERP Omie e interesse em vender online B2B. Passa no crivo MQL acirrado por importação/distribuição atacadista de itens de alto giro, baixo valor unitário e recompra recorrente, com potencial claro de digitalizar catálogo, tabela de preço e pedidos repetidos por cliente.',
+   'insight':'clientes industriais e lojas consultarem catálogo, preços e disponibilidade de fixadores para repetir pedidos recorrentes sem depender de cada orçamento manual',
+   'telefone_publico':'Telefone/WhatsApp público oficial localizado no site/snippets: +55 19 99820-5450; telefone válido informado no formulário/HubSpot: +55 19 99104-3105.',
+   'whatsapp_publico':'WhatsApp público oficial wa.me/5519998205450; para este ciclo usar primeiro o celular válido informado no formulário/HubSpot +55 19 99104-3105.',
+ },
+ 'doces_freewilly@hotmail.com.com': {
+   'slug':'doces-free-willy-wilian-cruz', 'mql': True,
+   'empresa_real':'Doces Free Willy / Comércio de Doces Bonifácio Ltda — empresa atacadista de alimentos/doces na região de Pato Branco, com atuação em chocolates, balas, pirulitos e produtos similares.',
+   'dominio_site':'Empresa real validada publicamente em oportunidade do Core-PR para representação comercial; não foi localizado site institucional próprio, mas a presença pública do Instagram @doces_freewilly mostra operação ativa desde 2000 e linha de doces/alimentos.',
+   'redes':'Pesquisa pública real neste ciclo: Core-PR lista Comércio de Doces Bonifácio Ltda / Doces Free Willy em oportunidade de representação comercial na região de Pato Branco e descreve como empresa atacadista de alimentos com ênfase em doces, chocolates, balas, pirulitos e afins. Instagram público @doces_freewilly aparece com telefone (49) 92003-8326, marca Doces Free Willy, publicações recentes de produtos de doces e menções a compras no atacado.',
+   'segmento':'Distribuidora atacadista de alimentos/doces para varejo, representantes e clientes comerciais, com mix de produtos físicos de alto giro como chocolates, balas, pirulitos e afins, exigindo catálogo, preço, disponibilidade e reposição recorrente de estoque.',
+   'motivo':'A pesquisa pública confirmou operação aderente ao crivo MQL: empresa atacadista de alimentos/doces buscando representante comercial na região de Pato Branco, com produto físico de alto giro e provável venda recorrente para varejo/clientes comerciais. Mesmo sem campos completos de formulário e sem site próprio, a evidência pública do Core-PR + presença social ativa sustenta ICP T1 de atacado/distribuição de estoque. O contato tem telefone celular válido no HubSpot.',
+   'insight':'clientes comerciais e representantes consultarem catálogo, preços e disponibilidade de doces de alto giro para repor estoque sem depender de cada pedido manual',
+   'telefone_publico':'Telefone válido no HubSpot/formulário: +55 49 99173-2426. Instagram público @doces_freewilly também exibe telefone (49) 92003-8326 como contato da marca.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no HubSpot: +55 49 99173-2426; contato público alternativo localizado no Instagram: +55 49 92003-8326.',
+ },
+ 'contato@jetparts.com.br': {
+   'slug':'jetparts-eduardo-tondato', 'mql': False,
+   'empresa_real':'Jetparts LTDA — microempresa de São Paulo/SP ligada a Jose Eduardo Tondato, com CNPJ 52.464.090/0001-75 e CNAE principal de comércio varejista de peças e acessórios novos para veículos automotores.',
+   'dominio_site':'jetparts.com.br — domínio informado no e-mail; WebFetch do site oficial retornou página Bitfuel/conexão de conta, sem catálogo público, loja B2B, página institucional, canal de revenda ou evidência de distribuição/atacado.',
+   'redes':'Pesquisa pública real neste ciclo: site jetparts.com.br, CNPJá, Casa dos Dados, Jusbrasil/CNPJ Biz e buscas por Jetparts + autopeças/Mercado Livre/Eduardo Tondato. As bases públicas confirmam empresa ativa desde 07/10/2023, Simples Nacional/microempresa, telefone/e-mail do lead e sócios Jose Eduardo Tondato e Augusto Eduardo Torres. Não foram encontrados catálogo B2B, venda para revendas/oficinas como abastecimento recorrente, atacado/distribuição, importação ou indústria; o formulário informa venda principalmente via Mercado Livre.',
+   'segmento':'Varejo/e-commerce de autopeças e acessórios automotivos, sem evidência clara de atacado, distribuidora, importadora ou indústria vendendo para revendas/lojistas/clientes recorrentes de estoque.',
+   'motivo':'Apesar de empresa real, ERP Olist/Tiny, loja virtual e dor de escalar sem contratar mais gente, a pesquisa pública só confirmou microempresa de varejo de autopeças com operação aparentemente ligada a marketplace. O próprio formulário cita Mercado Livre como principal canal e não há declaração/evidência pública de venda B2B recorrente para revendas, oficinas ou lojistas em modelo de abastecimento de estoque. O nome preenchido como Renault Group conflita com o domínio/CNPJ Jetparts e aumenta a incerteza. Pelo crivo MQL acirrado/fail-closed, varejo/marketplace pequeno sem canal B2B/atacado claro fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone/WhatsApp público em bases cadastrais e coincidente com o número calculado no HubSpot: +55 11 95636-0469; não usado para contato externo porque o lead foi reprovado no crivo MQL.',
+   'whatsapp_publico':'Casa dos Dados exibe link de WhatsApp para +55 11 5636-0469/+55 11 95636-0469, mas não usado porque o lead foi reprovado no crivo MQL.',
+ },
+ 'vendas1@multicorte.com.br': {
+   'slug':'multicorte-ferramentas-ronie-cruanes', 'mql': True,
+   'empresa_real':'Multicorte Ferramentas — distribuidor/revendedor de ferramentas industriais em Limeira/SP, ligado a Ronie Cruañes, com loja virtual própria e atendimento a compradores industriais.',
+   'dominio_site':'multicorte.com.br — site oficial/loja própria ativo; pesquisa pública também encontrou CNPJ 54.874.938/0001-60 em bases como CNPJ.biz, LinkedIn da empresa, Instagram @multicorteferramentas e dados públicos de empresa.',
+   'redes':'Pesquisa pública real via Claude Code/WebSearch/WebFetch neste ciclo: site oficial multicorte.com.br, CNPJ.biz, LinkedIn Multicorte Ferramentas, Instagram @multicorteferramentas e ZoomInfo. O site/loja divulga catálogo de ferramentas de corte, insertos/pastilhas, ferramentas manuais e de aperto, instrumentos de medição, abrasivos e EPIs. A base pública indica empresa de Limeira/SP, fundada em 1985, CNAE comércio varejista de ferragens e ferramentas, com Ronie Cruañes como sócio-administrador.',
+   'segmento':'Distribuidor/revendedor de ferramentas, consumíveis e suprimentos industriais para metalúrgicas, usinagens e compradores de indústria; produto físico técnico com recompra recorrente para reposição de estoque, manutenção e produção.',
+   'motivo':'O formulário declara indústria metalúrgica, atendimento a compradores de indústrias, faturamento de R$1 a R$5 milhões/ano, 2 a 5 vendedores, autosserviço 24h possível e dor de carteira parada. A pesquisa pública corrigiu/refinou a operação: é distribuidor/revendedor B2B de ferramentas e consumíveis industriais, com domínio/loja ativa, catálogo técnico e itens de recompra como pastilhas, abrasivos e EPIs. Passa no crivo MQL acirrado por distribuição B2B recorrente para clientes industriais e potencial claro de digitalizar catálogo, preço, disponibilidade e reposição.',
+   'insight':'compradores de indústrias consultarem catálogo, preço e disponibilidade de pastilhas, abrasivos e EPIs para repor estoque sem depender de cada ligação do vendedor',
+   'telefone_publico':'Site oficial divulga fixo corporativo +55 19 3451-5411 e WhatsApp corporativo +55 19 98948-1937. O telefone do formulário/HubSpot é celular válido: +55 19 99231-1775.',
+   'whatsapp_publico':'WhatsApp corporativo público localizado no site: +55 19 98948-1937; para este ciclo usar primeiro o celular válido informado no formulário/HubSpot: +55 19 99231-1775.',
+ },
+ 'info@54wines.com.br': {
+   'slug':'54wines-mauro-boschetti', 'mql': True,
+   'empresa_real':'54wines — importadora e distribuidora de vinhos e espumantes em Balneário Camboriú/SC, CNPJ 34.964.667/0001-26, com venda B2B para lojas, distribuidoras e restaurantes.',
+   'dominio_site':'54wines.com.br — site oficial ativo informa venda exclusiva para lojas, distribuidoras e restaurantes com CNPJ para comercialização de bebidas e alimentos, mais de 20 anos de experiência como importadora, catálogo B2B, estoque permanente, transportadoras especializadas, faturamento/envio imediato e contato (47) 99668-5400 / (47) 3050-3758 / info@54wines.com.br.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial 54wines.com.br; resultado público do Instagram @54wines descreve “Importadora e distribuidora de vinhos e espumantes exclusivos” e oferta de vinhos premium para bistrôs, sushi e B2B; Facebook público identifica 54wines em Balneário Camboriú/SC como importadora de vinhos.',
+   'segmento':'Importadora/distribuidora de vinhos e espumantes exclusivos, com venda B2B para lojas, distribuidoras, restaurantes, bistrôs, winebars e comércios de bebidas/alimentos; produto físico de giro e reposição recorrente para abastecimento de estoque e carta de vinhos.',
+   'motivo':'O formulário declara atuação em restaurantes, supermercados e lojas especializadas de vinhos, venda por representante comercial, loja virtual ativa, ERP Olist/Tiny, 2 a 5 vendedores e compra 24h após rotina. A pesquisa pública confirmou empresa real com domínio próprio, catálogo B2B, venda exclusiva para CNPJ, estoque permanente e canal explícito para lojas, distribuidoras e restaurantes. Passa no crivo MQL acirrado por importação/distribuição B2B de produto físico recorrente com potencial claro de digitalizar catálogo, preço, disponibilidade, condições e pedidos de reposição.',
+   'insight':'lojas, distribuidoras e restaurantes consultarem catálogo, preços e disponibilidade de vinhos exclusivos para repor estoque e carta sem depender de cada pedido manual ao representante',
+   'telefone_publico':'Telefone/WhatsApp público no site oficial e coincidente com HubSpot/formulário: +55 47 99668-5400; telefone fixo corporativo alternativo: +55 47 3050-3758.',
+   'whatsapp_publico':'WhatsApp público oficial no site: +55 47 99668-5400; usar o celular válido informado no formulário/HubSpot.',
+ },
+ 'comercial@fibratto.com.br': {
+   'slug':'fibratto-biscoitos-leonardo-muller', 'mql': True,
+   'empresa_real':'Fibratto Biscoitos — marca brasileira de biscoitos artesanais/naturais, ligada a Leonardo Müller, com operação em Blumenau/SC e venda para pontos de varejo alimentar especializado.',
+   'dominio_site':'lojafibratto.com.br — e-commerce/site oficial ativo informa Fibratto Biscoitos, telefone (47) 3037-2027, WhatsApp (47) 3285-6445 e e-mail comunicacao@fibratto.com.br; resultado público do Facebook também cita o site institucional www.fibratto.com.br.',
+   'redes':'Pesquisa pública real neste ciclo: Instagram @fibratto descreve biscoitos feitos com ingredientes genuínos e direciona a oferta para lojas de produtos naturais, empórios, delicatessens e espaços gourmet; posts/snippets públicos citam “Quer revender Fibratto?”, “opções para lojistas”, “Ideal para empórios, lojas de produtos naturais e delicatessens” e exposição a granel para loja. LinkedIn público da Fibratto lista Leonardo Müller como Diretor Geral. Facebook público identifica “Fibratto - Biscoito Integral | Blumenau SC” e descreve produto natural, sem corantes nem conservantes.',
+   'segmento':'Indústria/marca de alimentos e biscoitos naturais/artesanais com venda B2B para lojas de produtos naturais, padarias, empórios, delicatessens e MEIs/revendedores; produto consumível de giro e reposição recorrente para abastecimento de prateleira.',
+   'motivo':'O formulário declara atuação em lojas de produtos naturais, padarias, empórios e MEIs, venda por WhatsApp e Instagram, loja virtual ativa, faturamento de R$500 mil a R$1 milhão/ano e dor de já ter tentado digitalizar sem sucesso. A pesquisa pública confirmou empresa real com domínio/loja oficial, presença social, produto físico consumível e comunicação explícita para lojistas/revendedores/empórios. Passa no crivo MQL acirrado por indústria/marca de alimentos com canal B2B recorrente e necessidade clara de catálogo, preço, mix e reposição para pontos de venda.',
+   'insight':'lojas de produtos naturais, padarias e empórios consultarem mix, preço e disponibilidade dos biscoitos para repor prateleira sem depender de cada pedido manual pelo WhatsApp',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 47 98494-8495; site oficial/loja divulga telefone (47) 3037-2027 e WhatsApp corporativo (47) 3285-6445.',
+   'whatsapp_publico':'Usar primeiro o celular válido informado no formulário/HubSpot: +55 47 98494-8495; WhatsApp corporativo público alternativo no site oficial: +55 47 3285-6445.',
+ },
+ 'marcio@wa70.com.br': {
+   'slug':'wa70-embalagens-fernandes-marcio-gomes', 'mql': True,
+   'empresa_real':'Embalagens Fernandes / WA70 Consultoria e Representações informado no formulário; Rafael confirmou em 28/06 que, no fim das contas, deve ser tratado como MQL se o HubSpot/Marketing está em MQL.',
+   'dominio_site':'wa70.com.br — site oficial ativo com título WA70 Consultoria e Representações; formulário informa Embalagens Fernandes, ERP Omie, loja virtual ativa, venda por atendimento direto e faturamento de R$1 a R$5 milhões.',
+   'redes':'Pesquisa pública anterior encontrou atuação de Marcio Wagner Moura Gomes como representante comercial ligado a embalagens flexíveis/e-commerce. Apesar da ambiguidade pública do domínio WA70, Rafael corrigiu a decisão: não rebaixar wa70.com.br quando HubSpot estiver como MQL.',
+   'segmento':'Representação/comercialização de embalagens com potencial B2B; tratar como MQL por validação HubSpot/Rafael, não como Não-MQL por falta de evidência pública completa.',
+   'motivo':'HubSpot está com lifecyclestage=marketingqualifiedlead e Rafael confirmou que Embalagens Fernandes/wa70.com.br deve ser MQL; não sobrescrever para Não-MQL. Seguir diagnóstico normalmente se voltar à fila sem diagnóstico já enviado.',
+   'insight':'clientes B2B consultarem catálogo, preço e disponibilidade de embalagens para reposição sem depender de cada pedido manual pelo atendimento',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 99624-8767.',
+   'whatsapp_publico':'Usar o celular válido informado no formulário/HubSpot: +55 11 99624-8767.',
+ },
+ 'vendas@seglineshop.com.br': {
+   'slug':'segline-ppa-braganca-paulista', 'mql': True,
+   'empresa_real':'Segline / PPA Bragança Paulista — distribuidor/loja especializada em segurança eletrônica e automação em Bragança Paulista/SP, atendendo instaladores e revendedores.',
+   'dominio_site':'seglineshop.com.br — site oficial ativo informa endereço Rua Felício Helito, 601, Bragança Paulista/SP, telefone (11) 4603-1693 e e-mail vendas@seglineshop.com.br; página inicial diz explicitamente: “É instalador ou revendedor? Na Segline, você tem acesso às melhores marcas, preços especiais e suporte técnico especializado”.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial seglineshop.com.br e página Produtos listam PPA, Intelbras, Control iD, HDL, AGL e Multi Giga; Instagram público @seglinedistribuidor aparece como “Segline PPA Distribuidor Bragança”, com cerca de 2,2 mil seguidores, “Toda a linha de produtos para Segurança Eletrônica” e “Há mais de 10 anos atendendo”; Facebook público também identifica “Segline PPA Distribuidor Bragança” em Bragança Paulista.',
+   'segmento':'Distribuidor/loja B2B de segurança eletrônica e automação, com catálogo de automatizadores PPA, câmeras, alarmes, controle de acesso e marcas técnicas para instaladores, integradores, serralherias, vidraçarias e revendedores; venda recorrente de equipamentos e reposição para projetos de clientes profissionais.',
+   'motivo':'O formulário declara atuação em integradores de segurança eletrônica, serralherias, vidraçarias, monitoramento de câmeras e alarmes, faturamento de R$1 a R$5 milhões, 11 a 25 pessoas, 2 a 5 vendedores, venda pelo WhatsApp e clientes que comprariam sozinhos 24h. A pesquisa pública confirmou empresa real com domínio, loja física, catálogo de marcas técnicas e posicionamento explícito para instaladores e revendedores. Passa no crivo acirrado por distribuição B2B de produtos físicos de segurança/automação para revenda, instalação e reposição recorrente.',
+   'insight':'instaladores e revendedores consultarem catálogo, preço e disponibilidade de automatizadores, câmeras e controles de acesso para repor equipamentos sem depender de cada pedido manual pelo WhatsApp',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 11 98899-7573. Site oficial também divulga telefone fixo corporativo (11) 4603-1693; Instagram público antigo/snippet cita celular (11) 98835-0216.',
+   'whatsapp_publico':'Usar telefone celular válido informado no formulário/HubSpot: +55 11 98899-7573; contato público alternativo localizado em snippet do Instagram: +55 11 98835-0216.',
+ },
+ 'joelcastro@viperacessorios.com.br': {
+   'slug':'viper-acessorios', 'mql': True,
+   'empresa_real':'Viper Acessórios, Importação e Comércio Ltda — marca/comércio de acessórios para card games e colecionáveis em Bauru/SP',
+   'dominio_site':'viperacessorios.com.br — site oficial/e-commerce ativo; página de contato informa VIPER ACESSORIOS em Bauru/SP; CNPJ público 32.199.303/0001-71; domínio e e-mail corporativo conferem com o lead',
+   'redes':'Pesquisa pública real neste ciclo: site oficial viperacessorios.com.br, Instagram @viperacessorios com cerca de 9,5 mil seguidores e descrição “A sua marca de acessórios”; TikTok @viperacessorios; resultados de marketplaces/ligas de card games exibem produtos Viper e avaliações de loja; parcerias públicas com lojas de acessórios/card games foram encontradas em redes sociais.',
+   'segmento':'Importação/comércio e marca de acessórios para TCG/card games, com venda por e-commerce próprio, distribuidores/lojas e clientes finais; produto físico de giro e reposição para lojistas e comunidades de jogos.',
+   'motivo':'Pesquisa pública confirmou empresa real com domínio próprio, e-commerce ativo, CNPJ, endereço em Bauru/SP, presença social e produtos vendidos em canais especializados. O formulário reforça ICP: o próprio lead declarou venda para distribuidores/lojas e clientes finais, pré-venda com maiores clientes, site próprio, ERP Bling, loja virtual ativa, compra 24h e faturamento de R$1 a R$5 milhões. Passa no crivo acirrado por importação/comércio com canal B2B para lojas/distribuidores, catálogo de produto físico e recompra/abastecimento recorrente.',
+   'insight':'lojas e distribuidores acessarem catálogo, preço e disponibilidade de acessórios para repor estoque sem depender de cada pré-venda manual',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 14 99798-5155; cadastro público/Jusbrasil também vincula Joel Castro ao telefone +55 14 9979-8515.',
+ },
+ 'joao.domingos@redeimpact.com.br': {
+   'slug':'rede-impact-educacao-corporativa', 'mql': False,
+   'empresa_real':'Rede Impact Educação Corporativa — plataforma/empresa de educação corporativa ligada a João Luiz de Valgas Domingos',
+   'dominio_site':'redeimpact.com.br — domínio corporativo do e-mail; presença pública mais forte localizada em LinkedIn/Instagram da Rede Impact Educação Corporativa, sem loja/catálogo B2B de produto físico identificado',
+   'redes':'Pesquisa pública real neste ciclo: LinkedIn “Rede Impact Educação Corporativa” descreve plataforma de integração entre profissionais e instituições para gerar resultados em educação corporativa e mostra João Luiz de Valgas Domingos como cofundador; Instagram @rede.impact fala em formação estratégica, parcerias e conexões.',
+   'segmento':'Educação corporativa/serviços e formação profissional; não é indústria, distribuidor, importador ou atacado com venda recorrente de catálogo/produto físico para revendas/lojistas/estoque.',
+   'motivo':'Apesar de empresa real e domínio corporativo, o formulário informa varejo, ERP “Outro”, faturamento de R$250 mil a R$500 mil, venda por indicação, sem loja virtual e sem autosserviço 24h. A pesquisa pública aponta educação corporativa/serviços, não operação ICP T1 de atacado, distribuição, importação ou indústria com alto giro e abastecimento recorrente. Pelo crivo MQL acirrado/fail-closed, serviço/educação corporativa fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 48 99815-1000; não foi usado para contato externo porque o lead foi reprovado no crivo MQL.',
+ },
+ 'brunomartins136@hotmail.com': {
+   'slug':'bm-vendas-bruno-martins', 'mql': False,
+   'empresa_real':'BM Vendas — lead sem identificação operacional suficiente; nome/contato não preenchidos, e-mail pessoal Hotmail e origem Conversations/Linktree, sem formulário de diagnóstico, telefone, ERP, faturamento ou dor operacional.',
+   'dominio_site':'Sem domínio corporativo próprio localizado para BM Vendas. A origem do contato no HubSpot aponta linktr.ee/linktr.ee, mas não há site, CNPJ, catálogo, loja ou operação B2B vinculada com segurança ao e-mail brunomartins136@hotmail.com.',
+   'redes':'Pesquisa web real neste ciclo: busca por “BM Vendas”, “brunomartins136@hotmail.com”, “brunomartins136”, “BM Vendas Bruno Martins” e Linktree não encontrou presença pública empresarial confiável; o único resultado relevante foi um comentário de Instagram do usuário brunomartins136 em post de seguradora, sem comprovar empresa, segmento, canal de venda ou operação de atacado/distribuição/indústria.',
+   'segmento':'Não identificado. Não há evidência pública de indústria, distribuidor, importador ou atacado vendendo para revendas/lojistas/clientes recorrentes de abastecimento de estoque.',
+   'motivo':'Lead sem vínculo operacional claro: e-mail pessoal, empresa genérica “BM Vendas”, sem nome, telefone, formulário, ERP, faturamento, dor, site, CNPJ, catálogo ou presença pública que comprove ICP T1. Pelo crivo MQL acirrado/fail-closed, não há evidência suficiente para qualificar nem para contato externo; além disso o telefone está ausente.',
+   'insight':'',
+   'telefone_publico':'Não localizado com segurança em busca pública; HubSpot não trouxe telefone válido.',
+   'whatsapp_publico':'Não localizado com segurança; contato ao lead bloqueado por não-MQL e ausência de WhatsApp válido.',
+ },
+ 'bruno@lanuitenergy.com.br': {
+   'slug':'la-nuit-energy-drink-bruno-barbey', 'mql': True,
+   'empresa_real':'La Nuit Energy Drink (La Nuit Indústria de Bebidas Ltda) — indústria brasileira de bebida energética em Balneário Camboriú/SC, CNPJ 25.042.137/0001-30, ativa desde 2016, com Bruno Leonardo Barbey como sócio-administrador.',
+   'dominio_site':'lanuitenergy.com.br — domínio corporativo informado no e-mail e divulgado publicamente nas redes; extração do site oficial retornou timeout neste ciclo. Econodata confirma razão social La Nuit Indústria de Bebidas Ltda, CNAE de fabricação de bebidas não alcoólicas, porte EPP e endereço em Balneário Camboriú/SC.',
+   'redes':'Pesquisa web real neste ciclo: Econodata confirmou La Nuit Indústria de Bebidas Ltda ativa desde 2016, CNAE C-1122-4/99 fabricação de bebidas não alcoólicas e Bruno Leonardo Barbey como administrador; resultados públicos do Instagram @lanuitenergydrink e de Bruno Barbey citam La Nuit Energy Drink, lançamento de linha de energéticos, visitas a parceiros, presença de fundador/CEO e telefone 47 99767-0148/contato@lanuitenergy; Facebook público menciona contratação e apresentação da linha de energéticos.',
+   'segmento':'Indústria de bebidas/energético com produto físico de alto giro, potencial de distribuição para pontos de venda, bares, mercados, conveniências e parceiros recorrentes; operação aderente ao ICP industrial quando validada pelo porte e faturamento declarados.',
+   'motivo':'O formulário declara “Somos indústria do energético La Nuit”, faturamento de R$5 a R$10 milhões/ano, loja virtual ativa, 2 a 5 vendedores e dor de escalar sem contratar mais gente. A pesquisa pública confirmou empresa real ativa, indústria de bebida energética, responsável Bruno Barbey e presença de marca/produto no mercado. Pelo crivo MQL acirrado, a fabricação de bebida de alto giro com faturamento compatível sustenta potencial claro de digitalização de catálogo, preço, pedido e reposição para canais B2B/pontos de venda, mesmo sem ERP nativo informado.',
+   'insight':'pontos de venda e parceiros consultarem catálogo, preços e disponibilidade dos energéticos para recomprar sem depender de cada pedido manual pelo WhatsApp',
+   'telefone_publico':'Telefone do formulário/HubSpot é celular válido: +55 47 99767-0148; snippet público do Instagram também cita LA NUIT ENERGY DRINK 47 99767-0148 e contato@lanuitenergy.',
+   'whatsapp_publico':'Telefone válido e publicamente associado à La Nuit Energy Drink em snippet de rede social: +55 47 99767-0148; usar o número do formulário/HubSpot.',
+ },
+ 'comercial@adbsupply.com.br': {
+   'slug':'adb-supply-adriana-aguera', 'mql': True,
+   'empresa_real':'ADB Supply Comércio Importação e Exportação — operação brasileira de e-commerce/fornecedor de insumos para automação comercial e impressão, com estoque, entrega nacional e atendimento a empresas de vários portes',
+   'dominio_site':'adbsupply.com.br — site oficial ativo confirma especialização em insumos para automação e impressão, compra online, orçamento personalizado, estoque garantido, entrega em todo o Brasil e contato corporativo (11) 96601-6651; página de contato informa endereço na Rua Latif Fakhouri, 299, Vila Santa Catarina',
+   'redes':'Pesquisa pública real neste ciclo: site oficial adbsupply.com.br, páginas Contato, Bobinas, Política de Frete e Orçamentos Personalizados; Instagram público @adb_supply com posts citando compra desde 1 unidade até grandes quantidades, abastecimento comercial, e-commerce adbsupply.com.br, comercial@adbsupply.com.br e telefone (11) 96601-6651; LinkedIn público de Adriana Aguera a vincula a Adb Supply Comércio Importação e Exportação.',
+   'segmento':'Fornecedor/distribuidora B2B de insumos para automação comercial e impressão, incluindo bobinas e suprimentos de PDV, com catálogo de produto físico, compra recorrente por empresas, reposição de estoque e orçamento para grandes quantidades.',
+   'motivo':'Pesquisa pública confirmou empresa real com domínio próprio, e-commerce, catálogo de insumos para automação/impressão, compra em quantidade e atendimento a empresas com continuidade de abastecimento. O formulário reforça fit com ERP Bling, loja virtual ativa, venda por marketplace, compra 24h e dor de escalar sem contratar mais gente. Apesar do porte declarado baixo (até R$250 mil/ano e 1 a 10 pessoas), passa no crivo acirrado por fornecimento/distribuição B2B de suprimentos recorrentes de PDV/impressão e potencial claro de digitalizar catálogo, preço e reposição para clientes empresariais.',
+   'insight':'clientes empresariais consultarem catálogo, preço e disponibilidade de bobinas e insumos de automação para repor estoque sem depender de cada orçamento manual',
+   'telefone_publico':'Telefone/WhatsApp público no site oficial e Instagram: +55 11 96601-6651; telefone válido informado no formulário/HubSpot: +55 11 97326-0945.',
+   'whatsapp_publico':'Contato público corporativo encontrado no site: +55 11 96601-6651; para o lead, usar primeiro o celular válido informado no formulário/HubSpot: +55 11 97326-0945.',
+ },
+ 'ruilima@infonet.com.br': {
+   'slug':'mdc-empreendimentos-ruidnalvo-lima', 'mql': False,
+   'empresa_real':'MDC Empreendimentos e Negócios — não foi possível confirmar operação empresarial ativa vinculada ao contato Ruidnalvo Evangelista Lima; resultados públicos para MDC Empreendimentos apontam empresas homônimas sem relação comprovada.',
+   'dominio_site':'Sem domínio/site corporativo identificado. O e-mail ruilima@infonet.com.br usa o provedor/portal Infonet, não um domínio próprio da empresa.',
+   'redes':'Pesquisa pública real via Claude Code/WebSearch/WebFetch neste ciclo: buscas por MDC Empreendimentos e Negócios, Ruidnalvo Evangelista Lima, ruilima@infonet.com.br, telefone 557991914220 e Infonet; perfil público do contato no LinkedIn com conteúdo religioso, registro judicial trabalhista antigo e ausência de site, CNPJ, catálogo, operação comercial ou vínculo público do telefone com empresa.',
+   'segmento':'Projeto pré-operacional/indefinido buscando parceiros para participar de um modelo de negócio; sem evidência de indústria, distribuidor, importador ou atacado com venda recorrente para revendas/lojistas/clientes de abastecimento de estoque.',
+   'motivo':'O formulário informa que ainda não há faturamento, ERP Outro, sem loja virtual, equipe pequena e que a proposta é “vender para todos”, além de dizer que o projeto está pronto e precisa de parceiros que queiram participar do modelo de negócio. A pesquisa pública não confirmou empresa real ativa, domínio próprio, catálogo, operação atacadista/distribuidora/industrial ou canal B2B recorrente. Pelo crivo MQL acirrado/fail-closed, pré-operação buscando parceiros e sem evidência clara de ICP T1 fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Nenhum telefone público corporativo seguro localizado; o único número disponível é o celular informado no HubSpot/formulário: +55 79 99191-4220, sem vínculo público comprovado com a empresa.',
+   'whatsapp_publico':'Não localizado publicamente com segurança; contato externo bloqueado por não-MQL.',
+ },
+ 'alexandre@agem.com.br': {
+   'slug':'agem-tecnologia-alexandre-melo', 'mql': False,
+   'empresa_real':'AGEM Tecnologia — fabricante/distribuidora de equipamentos de áudio e vídeo, headsets, webcams, microfones, audioconferência e telecom/TI, fundada em 2007, com foco declarado em setor público, governo e estatais por licitações',
+   'dominio_site':'agem.com.br e loja agemtecnologia.com.br — sites públicos confirmam catálogo/e-commerce de equipamentos de áudio/vídeo e telecom/TI, softwares Agem Center/Agem Tracking e foco institucional em governo/setor público',
+   'redes':'Pesquisa pública real via Claude Code/WebSearch/WebFetch neste ciclo: site agem.com.br, loja agemtecnologia.com.br, página institucional AGEM e LinkedIn público de Alexandre Melo. O formulário também declarou venda hoje como gov.',
+   'segmento':'Fabricante/distribuidor de áudio-vídeo e telecom/TI com foco de venda em governo/setor público via licitação, não canal de revenda/lojistas com reposição recorrente de estoque.',
+   'motivo':'Embora a empresa tangencie indústria/distribuição e tenha ERP Omie e faturamento declarado de R$10 a R$50 milhões, o próprio formulário informa venda hoje para governo e a pesquisa pública confirmou foco em setor público/estatais/licitações. Esse modelo é por edital/projeto, não abastecimento recorrente de revendas/lojistas/clientes B2B de estoque com alto giro. Pelo crivo MQL acirrado/fail-closed, governo/licitação não substitui ICP T1 de canal recorrente; fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 11 97647-0557; a pesquisa pública não confirmou esse número como linha corporativa publicada no site.',
+   'whatsapp_publico':'Não usado neste ciclo; contato externo bloqueado por não-MQL.',
+ },
+ 'contato@revesteacabamentos.com.br': {
+   'slug':'reveste-acabamentos-moises-teixeira-junior', 'mql': False,
+   'empresa_real':'Reveste Acabamentos — projeto informado por Moisés Teixeira Junior para revestimentos de paredes, ainda em implantação e sem faturamento declarado',
+   'dominio_site':'revesteacabamentos.com.br — WebFetch real neste ciclo retornou página 403/Acesso negado com conteúdo genérico de hospedagem/suporte, sem catálogo, loja, CNPJ, operação atacadista, indústria, distribuição, importação ou canal B2B público comprovado',
+   'redes':'Pesquisa pública real neste ciclo: buscas por “Reveste Acabamentos”, “revesteacabamentos.com.br”, “Moisés Teixeira Junior” e pelo e-mail contato@revesteacabamentos.com.br não retornaram evidências comerciais úteis. O domínio existe, mas a página pública acessível trouxe erro 403 genérico, sem prova operacional.',
+   'segmento':'Projeto inicial de revestimentos/acabamentos com foco declarado em empresas de revestimentos de paredes e consumidor final; sem evidência clara de indústria, distribuidor, importador ou atacado vendendo catálogo de produto físico para revendas/lojistas/clientes recorrentes de abastecimento de estoque.',
+   'motivo':'O formulário informa que a empresa ainda não vende e está tirando o projeto do papel, sem faturamento, ERP “Outro”, sem loja virtual, equipe de 1 a 10 pessoas e apenas 1 vendedor. A pesquisa pública não confirmou operação ativa, canal de revenda, atacado/distribuição ou indústria com alto giro e reposição recorrente. Pelo crivo MQL acirrado/fail-closed, potencial futuro e intenção de autosserviço não substituem evidência atual de ICP T1.',
+   'insight':'',
+   'telefone_publico':'Não pesquisado para envio porque o lead foi reprovado no crivo MQL acirrado; telefone válido informado no HubSpot/formulário: +55 45 99920-7675.',
+   'whatsapp_publico':'Não usado neste ciclo; contato externo bloqueado por não-MQL.',
+ },
+ 'vinicius@mvconsultoria.com.br': {
+   'slug':'mv-consultoria-vinicius-oliveira', 'mql': False,
+   'empresa_real':'MV Consultoria — lead assinado como Vinicius Oliveira, consultor de imagem e posicionamento; domínio corporativo mvconsultoria.com.br ativo apenas com página em construção',
+   'dominio_site':'mvconsultoria.com.br — página pública retorna “Retorne em alguns dias / Página em construção”, sem catálogo, operação de distribuição, indústria, atacado, importação ou venda B2B recorrente comprovada',
+   'redes':'Pesquisa pública real neste ciclo: buscas por “MV Consultoria” + “Vinicius Oliveira” + “Consultor de imagem e Posicionamento”, pelo e-mail vinicius@mvconsultoria.com.br e por site:mvconsultoria.com.br não retornaram evidências comerciais úteis; WebFetch do domínio oficial mostrou apenas página em construção.',
+   'segmento':'Serviço/consultoria de imagem e posicionamento sem evidência pública de indústria, distribuidor, importador ou atacado vendendo produto físico de catálogo para revendas/lojistas/clientes recorrentes de abastecimento de estoque.',
+   'motivo':'Embora o formulário mencione bares, restaurantes, adegas, distribuidoras e supermercados, Bling, loja virtual e dor de pedidos desorganizados, a identificação do contato é de consultor de imagem/posicionamento e a pesquisa pública não confirmou empresa operacional aderente ao ICP T1. O domínio está em construção e não há prova de atacado/distribuição/indústria com catálogo e recompra recorrente. Pelo crivo MQL acirrado/fail-closed, ERP nativo e e-commerce não substituem ICP; fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Não pesquisado para envio porque o lead foi reprovado no crivo MQL acirrado; telefone válido informado no HubSpot/formulário: +55 67 99251-4615.',
+   'whatsapp_publico':'Não usado neste ciclo; contato externo bloqueado por não-MQL.',
+ },
+ 'maxcordioli@schutzmann.com.br': {
+   'slug':'schutzmann-maximilian-cordioli', 'mql': False,
+   'empresa_real':'Schutzmann Consultoria e Treinamento Ltda — empresa de São Paulo/SP de serviços financeiros/consultoria, com atuação pública em câmbio BTG, mercado livre de energia, precatórios e investimentos',
+   'dominio_site':'schutzmann.com.br — site oficial descreve serviços financeiros e estruturação de negócios; página de contato divulga telefone +55 11 98183-9853, e-mail contato@schutzmann.com.br e endereço em São Paulo. Jusbrasil/CNPJ público confirma CNAE 7020-4/00, atividades de consultoria em gestão empresarial, e CNPJ 17.933.313/0001-03.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial schutzmann.com.br, páginas Câmbio BTG, Operações de Câmbio, Precatórios, Mercado Livre de Energia e Contato; LinkedIn público classifica Schutzmann como Financial Services, 2-10 funcionários em São Paulo; RocketReach descreve serviços financeiros, mercado aberto de energia, precatórios, câmbio e antecipação de cartões; Jusbrasil/CNPJ mostra consultoria empresarial e contato administrativo.',
+   'segmento':'Serviços financeiros/consultoria em câmbio, energia, precatórios e investimentos; não é indústria, distribuidor, importador ou atacado de produto físico com revenda/lojistas e reposição recorrente de estoque.',
+   'motivo':'A pesquisa pública confirmou empresa real e telefone válido, mas o modelo operacional é serviço financeiro/consultoria. O formulário informa restaurantes, Bling, venda por vendedores e loja virtual, porém não há evidência pública clara de operação de restaurante/atacado/distribuição nem venda recorrente de produtos físicos para revendas/lojistas/clientes de abastecimento de estoque. Pelo crivo MQL acirrado/fail-closed, ERP nativo e e-commerce não substituem ICP; serviço/consultoria financeira fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone público no site oficial e coincidente com o HubSpot/formulário: +55 11 98183-9853. Cadastros públicos também mostram fixos administrativos +55 11 3283-4520 e +55 11 3284-0794.',
+   'whatsapp_publico':'Telefone celular público +55 11 98183-9853 consta na página de contato do site oficial, mas não usado porque o lead foi reprovado no crivo MQL acirrado.',
+ },
+ 'kellysouza@sofixacao.com.br': {
+   'slug':'sofixacao-kelly-souza', 'mql': True,
+   'empresa_real':'SóFixação Comércio e Serviços Ltda — empresa de Recife/PE especializada em soluções de fixação para construção civil, com produtos, locação, treinamentos e assistência técnica',
+   'dominio_site':'sofixacao.com.br — site oficial confirma CNPJ 04.406.969/0001-18, endereço em Recife, e-mail contato@sofixacao.com.br, telefone 81 3073-2100 e WhatsApp público 81 99819-2318/wa.me/5581998192318',
+   'redes':'Pesquisa pública real neste ciclo: site oficial sofixacao.com.br, páginas Produtos, Apresentação, Treinamentos, Assistência Técnica e Contato. Resultados públicos descrevem a empresa como especialista em todos os sistemas e meios de fixação para construção civil há mais de uma década, com variedade de produtos, locação de equipamentos, treinamento de fixação à pólvora/gás e assistência técnica.',
+   'segmento':'Comércio/distribuidora especializada em produtos e sistemas de fixação para construção civil, atendendo construtoras e clientes profissionais com catálogo de itens técnicos, reposição recorrente e atendimento por WhatsApp.',
+   'motivo':'Pesquisa pública confirmou empresa real com site próprio, CNPJ, WhatsApp corporativo e operação aderente ao ICP: fornecedora especializada de produtos físicos de fixação para construção civil, vendendo para construtoras/clientes profissionais que precisam de catálogo, preço e reposição técnica. O formulário reforça fit com área Construtoras, faturamento de R$1 a R$5 milhões, 2 a 5 vendedores, venda hoje pelo WhatsApp e dor de pedidos desorganizados. Mesmo com ERP “Outro” e sem loja virtual, passa no crivo por comércio/distribuição B2B de produto técnico recorrente para abastecimento de obra/estoque.',
+   'insight':'construtoras consultarem catálogo, preço e disponibilidade de fixadores e equipamentos sozinhas, reduzindo pedidos soltos no WhatsApp e acelerando reposições de obra',
+   'telefone_publico':'WhatsApp público corporativo no site oficial: +55 81 99819-2318; telefone do formulário/HubSpot é celular válido: +55 81 99973-1964.',
+   'whatsapp_publico':'WhatsApp público oficial encontrado no site com link https://wa.me/5581998192318; para o lead, usar primeiro o celular válido informado no formulário/HubSpot: +55 81 99973-1964.',
+ },
+ 'administracao@carmecsolucoes.com.br': {
+   'slug':'carmec-solucoes-industriais-evandro', 'mql': False,
+   'empresa_real':'Carmec Soluções Industriais — empresa de São Carlos/SP especializada em fabricação sob medida de máquinas industriais, dispositivos especiais, automação, projetos mecânicos, usinagem, montagem e manutenção industrial',
+   'dominio_site':'carmecsolucoes.com.br — site oficial confirma fabricação de máquinas industriais sob medida, dispositivos especiais, automação industrial, engenharia/prototipagem, usinagem, montagem/testes e manutenção completa; página de contato divulga comercial@carmecsolucoes.com.br e WhatsApp +55 16 99797-9349',
+   'redes':'Pesquisa pública real neste ciclo: site oficial carmecsolucoes.com.br, páginas Home/Projetos/Contato, busca pelo domínio e cadastro público CNPJ Biz. O site lista projetos personalizados como modelos para fundição, máquinas e projetos especiais, linhas de transformação de média/alta tensão, clientes como Engemasa, EESC USP, Embraer, Gunther, Dcalfer, Premen, Fipai, Imart Marra e Iti Transformadores. CNPJ Biz indica empresa fundada em 20/03/2025 e Evandro Luis do Carmo como sócio-administrador.',
+   'segmento':'Serviços/projetos industriais sob medida e fabricação de máquinas/dispositivos personalizados para indústrias; operação B2B real, mas orientada a engenharia sob encomenda, manutenção e projetos técnicos, não atacado/distribuição/importação/indústria de produto de catálogo com reposição recorrente para revendas/lojistas.',
+   'motivo':'Pesquisa pública confirmou empresa real e B2B industrial, porém o modelo é projeto sob medida, manutenção, usinagem e fabricação de máquinas/dispositivos especiais para clientes industriais. O formulário reforça porte inicial (até R$250 mil/ano, 1 a 10 pessoas, 1 vendedor), venda por boca a boca/indicação e ERP “Outro”. Não há evidência clara de ICP T1 de alto giro: indústria/distribuidor/importador/atacado vendendo produto físico de catálogo para revendas/lojistas/clientes recorrentes de abastecimento de estoque. Pelo crivo MQL acirrado/fail-closed, fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone/WhatsApp público oficial no site e no formulário/HubSpot: +55 16 99797-9349.',
+   'whatsapp_publico':'WhatsApp público oficial encontrado no site (web.whatsapp.com/api.whatsapp.com) com phone=5516997979349; não usado porque o lead foi reprovado no crivo MQL acirrado.',
+ },
+ 'vendas@orangeboxminiaturas.com.br': {
+   'slug':'orangebox-miniaturas-jose-ricardo', 'mql': True,
+   'empresa_real':'Orangebox Miniaturas — loja especializada em miniaturas colecionáveis e operação B2B Orangebox criada para atender lojistas e revendedores no atacado',
+   'dominio_site':'orangeboxminiaturas.com.br — e-commerce oficial de miniaturas colecionáveis; b2b-orangebox.com.br — e-commerce atacadista especializado em miniaturas para lojistas e revendedores',
+   'redes':'Pesquisa pública real neste ciclo: busca web encontrou o e-commerce Orangebox Miniaturas com categorias de miniaturas colecionáveis, Instagram @orangeboxminiaturas com foco em miniaturas de motos/carros e o site b2b-orangebox.com.br descrito publicamente como “Atacado de Miniaturas”, criado para atender lojistas e revendedores. Crunchbase público lista vendas@orangeboxminiaturas.com.br e telefone +55 43 3357-2740.',
+   'segmento':'Atacado/e-commerce B2B de miniaturas colecionáveis para lojistas e revendedores, com catálogo de produtos físicos, mix de marcas/modelos e reposição de estoque para revenda.',
+   'motivo':'Pesquisa pública confirmou ICP T1 pelo canal B2B explícito: além da loja Orangebox Miniaturas, há site dedicado “Atacado de Miniaturas” para lojistas e revendedores. O formulário reforça fit com ERP Bling, loja virtual ativa, equipe pequena e faturamento inicial; o porte é menor, mas o canal de revenda e catálogo atacadista de produto físico sustentam a qualificação pelo potencial de digitalizar catálogo, preço e pedidos recorrentes para lojistas.',
+   'insight':'lojistas e revendedores acessarem catálogo, preço e disponibilidade de miniaturas em atacado para repor estoque sem depender de pedido manual pelo WhatsApp',
+   'telefone_publico':'Telefone do formulário/HubSpot é celular válido: +55 43 99149-9897; Crunchbase público também lista telefone corporativo +55 43 3357-2740.',
+   'whatsapp_publico':'Usar telefone celular válido informado no formulário/HubSpot: +55 43 99149-9897; pesquisa pública encontrou telefone corporativo alternativo +55 43 3357-2740.',
+ },
+ 'cicero@grupoelo.net.br': {
+   'slug':'quality-representacoes-grupo-elo-jose-cicero', 'mql': True,
+   'empresa_real':'Quality Representações / Grupo Elo — broker e representação comercial com mais de 25 anos de atuação no Norte/Nordeste, estrutura de vendedores e promotores, logística e trade marketing para marcas de limpeza, alimentício, bazar, utilidades, lazer/piscina e nutracêuticos',
+   'dominio_site':'qualityrepresentacoes.com.br — site oficial confirma atuação 360º, estrutura logística, representação comercial de alta performance, trade marketing estratégico e loja virtual B2B em grupoelo.meuspedidos.com.br para pedidos online com condições especiais para o negócio',
+   'redes':'Pesquisa pública real neste ciclo: site oficial qualityrepresentacoes.com.br, página Sobre Nós com clientes atacadistas, distribuidores, redes de supermercados, varejistas, materiais de construção, casas de piscinas e canais especializados; página Contato com SAC (91) 4042-2044 e (91) 98298-0074; LinkedIn público indica Quality Representações com 11-50 funcionários em Benevides/PA; Instagram/Facebook citam Grupo Elo Quality Representações, broker e trade marketing.',
+   'segmento':'Representação comercial, broker e distribuição multicategoria para supermercados, atacadistas, distribuidores, varejo, material de construção, casas de piscina, agropecuárias e outros canais de revenda, com catálogo de marcas e pedidos recorrentes de reposição para pontos de venda.',
+   'motivo':'Pesquisa pública confirmou ICP T1: operação de representação/broker com venda B2B recorrente para atacadistas, distribuidores, redes de supermercados, varejistas e canais especializados, além de loja virtual B2B em Meus Pedidos. O formulário reforça fit com faturamento de R$1 a R$5 milhões, 11 a 25 pessoas, venda presencial por time de vendas, dor de escalar sem contratar mais gente, clientes que comprariam sozinhos 24h e atuação em supermercados, atacarejos, mercadinhos, panificadoras, utilidades, construção, piscinas, agropecuárias, distribuidores e atacadistas. Qualifica pelo canal de abastecimento recorrente e potencial claro de digitalizar catálogo, tabela, condição e pedido.',
+   'insight':'supermercados, atacadistas e lojas de vários segmentos fazerem reposição pelo catálogo online com tabela e condição certas, reduzindo pedidos manuais do time de vendas presencial',
+   'telefone_publico':'Telefone do formulário/HubSpot é celular válido: +55 91 98151-4948; o site oficial também divulga SAC (91) 4042-2044 e celular (91) 98298-0074.',
+   'whatsapp_publico':'WhatsApp público oficial encontrado no site com link wa.me/5591981514948, coincidente com o telefone do formulário/HubSpot; contato alternativo público no site: +55 91 98298-0074.',
+ },
+ 'comercial2@atenaegide.com.br': {
+   'slug':'atena-egide-vitor', 'mql': True,
+   'empresa_real':'Atena Égide — marca/atacado de acessórios premium de proteção para iPhone, com venda exclusiva para lojistas/CNPJ e base declarada de mais de 500 PDVs no Brasil',
+   'dominio_site':'atenaegide.com.br — site oficial com loja/catálogo de acessórios premium para iPhone; o Instagram público @atenaegide declara “Venda exclusiva para lojistas (CNPJ)” e “+500 PDVs em todo Brasil”',
+   'redes':'Pesquisa pública real neste ciclo: site oficial atenaegide.com.br, Instagram @atenaegide com venda exclusiva para lojistas/CNPJ e +500 PDVs, LinkedIn Atena Egide classificado como Wholesale, Facebook Atena Égide com contato público e notícias sobre presença da marca na feira CBM São Paulo para lojas de celular.',
+   'segmento':'Atacado/wholesale de acessórios premium para iPhone, vendendo para lojistas e lojas de celular que recompõem estoque de capas, películas e acessórios de alto giro.',
+   'motivo':'Pesquisa pública confirmou ICP T1: operação atacadista/wholesale de produto físico de alto giro para lojistas/CNPJ, com venda para lojas de celular, catálogo e reposição recorrente de estoque. O formulário reforça fit: área “Lojas de celular”, venda por loja virtual para rede credenciada, ERP Olist/Tiny, faturamento de R$5 a R$10 milhões, loja virtual ativa e compra 24h. Qualifica pelo canal B2B recorrente e potencial claro de digitalizar catálogo, preço e pedido para lojistas.',
+   'insight':'lojistas de celular consultarem catálogo, preços e disponibilidade de acessórios para iPhone sozinhos, agilizando reposição de estoque sem depender de cada pedido manual pelo WhatsApp',
+   'telefone_publico':'Telefone do formulário/HubSpot é celular válido: +55 27 99762-2516; Facebook público também exibe contato +55 27 99312-2044 vinculado à Atena Égide.',
+   'whatsapp_publico':'Telefone do formulário/HubSpot é celular válido e será usado para envio: +55 27 99762-2516. Contato público alternativo localizado no Facebook: +55 27 99312-2044.',
+ },
+ 'c73f594afd5aa04ffa01327b1b94c685@pcm.com.br': {
+   'slug':'nao-registrado-pcm-20260626', 'mql': False,
+   'empresa_real':'Lead não identificável — e-mail anonimizado/hash no domínio pcm.com.br, sem empresa, sem telefone e sem respostas de formulário',
+   'dominio_site':'pcm.com.br; pesquisa pública por pcm.com.br retornou referências genéricas/PCM Imobiliária e cadastros como M&R Apoio Administrativo, sem comprovar que este contato pertence a uma operação B2B aderente',
+   'redes':'Pesquisa web real neste ciclo: busca pelo e-mail exato não retornou resultados; busca por pcm.com.br retornou domínio genérico/possível imobiliária e cadastros públicos com contato@pcm.com.br, sem vínculo operacional com o lead hash “nao registrado”. Pesquisa local encontrou histórico anterior de lead parecido f4b303...@pcm.com.br já tratado como não-MQL por falta de identificação.',
+   'segmento':'Não identificado; sem evidência de indústria, distribuidor, importador ou atacado com venda recorrente para revendas/lojistas/clientes de estoque',
+   'motivo':'Lead sem identificação operacional: nome “nao registrado”, empresa vazia, e-mail anonimizado/hash, sem telefone, sem formulário/ERP/faturamento/dor e sem presença pública que comprove ICP T1. Pelo crivo MQL acirrado/fail-closed, não há evidência clara de indústria/distribuidor/importador/atacado vendendo para revendas ou abastecimento recorrente de estoque.',
+   'insight':'',
+   'telefone_publico':'Não localizado com segurança; o HubSpot não trouxe telefone e a pesquisa pública não comprovou WhatsApp corporativo vinculado a este lead.',
+   'whatsapp_publico':'Não localizado com segurança; contato ao lead bloqueado por não-MQL e ausência de WhatsApp válido.',
+ },
+ 'administrador@joaoemariaeditora.com.br': {
+   'slug':'joao-e-maria-editora', 'mql': False,
+   'empresa_real':'Editora João e Maria Ltda — editora de literatura infantil e material didático em São José dos Campos/SP; lead Vitor Manzini Cutlak aparece ligado à administração da empresa',
+   'dominio_site':'joaoemariaeditora.com.br e clube.joaoemariaeditora.com.br — site/loja própria e clube de assinatura; catálogo também aparece em marketplace como Amazon',
+   'redes':'Pesquisa via Claude Code/WebSearch/WebFetch neste ciclo: site oficial, página Sobre Nós, clube de assinatura, Instagram @joaoemariaeditora, catálogo em Amazon e base pública Econodata/CNPJ. Presença pública indica loja e assinatura D2C para famílias/crianças.',
+   'segmento':'Editora infantil com loja virtual e clube de assinatura D2C; pode atender escolas como cliente final/institucional, mas não há evidência pública clara de atacado/distribuição recorrente para revendas/lojistas com reposição de estoque.',
+   'motivo':'Pesquisa pública real encontrou operação de editora infantil estruturada, porém o canal dominante é venda direta ao consumidor final e assinatura para famílias. O formulário informa área escolas, Bling, loja virtual e dor de pedidos desorganizados, mas escolas são clientes finais/institucionais, não rede de revenda/lojistas recorrentes para abastecimento de estoque. Há divergência entre porte autodeclarado alto e presença pública de empresa recente/nicho. Pelo crivo MQL acirrado/fail-closed, sem evidência clara de indústria/distribuidor/importador/atacado vendendo para revendas/lojistas/clientes B2B com estoque recorrente, fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefone válido no HubSpot/formulário: +55 11 96576-1133; não usado porque o lead foi reprovado no crivo MQL acirrado',
+   'whatsapp_publico':'Não usado neste ciclo; contato ao lead bloqueado por não-MQL',
+ },
  'contato@ceramicaanaclaudia.com.br': {
    'slug':'ceramica-ana-claudia', 'mql': True,
    'empresa_real':'Cerâmica Ana Cláudia (Ceramica Ana Claudia Ltda) — fabricante de cerâmica decorativa de Porto Ferreira-SP, com produção própria para linhas Home, Cozinha, Festa e Garden',
@@ -1026,12 +1713,13 @@ RESEARCH = {
  },
  'joelcastro@viperacessorios.com.br': {
    'slug':'viper-acessorios', 'mql': True,
-   'empresa_real':'Viper Acessórios, Importação e Comércio Ltda — Bauru/SP, loja especializada em acessórios para card games/TCG',
-   'dominio_site':'viperacessorios.com.br; site próprio ativo com loja virtual, páginas Quem Somos e Contato',
-   'redes':'Instagram @viperacessorios; presença pública vinculada ao domínio oficial',
-   'segmento':'E-commerce especializado em acessórios para card games/TCG, com sleeves, deckboxes, playmats, pastas, dados e top loaders; venda direta pelo site e pré-venda para clientes maiores',
-   'motivo':'Pesquisa via Claude Code/WebSearch/WebFetch: empresa real e ativa em Bauru/SP, com domínio próprio viperacessorios.com.br, loja virtual operante, páginas institucionais e Instagram @viperacessorios. O formulário confirma ERP Bling, faturamento de R$1 milhão a R$5 milhões/ano, 1 a 10 pessoas, loja virtual ativa e venda por pré-venda para clientes maiores mais site. Apesar de ser um nicho especializado, há operação digital própria, recorrência em lançamentos e clientes maiores, tornando o lead MQL para diagnóstico Zydon.',
-   'insight':'organizar as pré-vendas dos clientes maiores e os pedidos do site em um fluxo único, sem deixar pedido escapar nos lançamentos de cartas',
+   'empresa_real':'Viper Acessórios, Importação e Comércio Ltda — marca/comércio de acessórios para card games e colecionáveis em Bauru/SP',
+   'dominio_site':'viperacessorios.com.br — site oficial/e-commerce ativo; página de contato informa VIPER ACESSORIOS em Bauru/SP; CNPJ público 32.199.303/0001-71; domínio e e-mail corporativo conferem com o lead',
+   'redes':'Pesquisa pública real neste ciclo: site oficial viperacessorios.com.br, Instagram @viperacessorios com cerca de 9,5 mil seguidores e descrição “A sua marca de acessórios”; TikTok @viperacessorios; resultados de marketplaces/ligas de card games exibem produtos Viper e avaliações de loja; parcerias públicas com lojas de acessórios/card games foram encontradas em redes sociais.',
+   'segmento':'Importação/comércio e marca de acessórios para TCG/card games, com venda por e-commerce próprio, distribuidores/lojas e clientes finais; produto físico de giro e reposição para lojistas e comunidades de jogos.',
+   'motivo':'Pesquisa pública confirmou empresa real com domínio próprio, e-commerce ativo, CNPJ, endereço em Bauru/SP, presença social e produtos vendidos em canais especializados. O formulário reforça ICP: o próprio lead declarou venda para distribuidores/lojas e clientes finais, pré-venda com maiores clientes, site próprio, ERP Bling, loja virtual ativa, compra 24h e faturamento de R$1 a R$5 milhões. Passa no crivo acirrado por importação/comércio com canal B2B para lojas/distribuidores, catálogo de produto físico e recompra/abastecimento recorrente.',
+   'insight':'lojas e distribuidores acessarem catálogo, preço e disponibilidade de acessórios para repor estoque sem depender de cada pré-venda manual',
+   'telefone_publico':'Telefone válido informado no HubSpot/formulário: +55 14 99798-5155; cadastro público/Jusbrasil também vincula Joel Castro ao telefone +55 14 9979-8515.',
  },
  'diretoria2@grupomaranno.com.br': {
    'slug':'grupo-maranno', 'mql': True,
@@ -1322,6 +2010,50 @@ RESEARCH = {
    'telefone_publico':'PABX no site: +55 11 2628-2320; WhatsApp Business público seguro na loja virtual: +55 11 95415-1000',
    'whatsapp_publico':'WhatsApp público oficial +55 11 95415-1000 encontrado na loja virtual lojadastalhas.com; substitui o telefone do HubSpot, que veio como fixo/PABX +55 11 2628-2320',
  },
+ 'rafael@comercialss.com.br': {
+   'slug':'comercial-ss-youdog-rafael', 'mql': True,
+   'empresa_real':'Comercial SS / YouDog / DoCampo Premium — empresa de Araraquara-SP ativa desde 1993, distribuidora e fabricante de alimentos pet, com marcas próprias e carteira regional ampla',
+   'dominio_site':'comercialss.com.br — site oficial informa sede em Araraquara, início em 1993, missão de distribuir e produzir produtos de qualidade, frota própria, equipe comercial/entrega, área atendida com mais de 5 milhões de habitantes e mais de 800 clientes ativos; youdog.com.br confirma canal para Lojista e Distribuidor, e-mail contato@comercialss.com.br e WhatsApp público',
+   'redes':'Pesquisa pública via web neste ciclo: site oficial comercialss.com.br; página YouDog contato com seleção Consumidor Final/Lojista/Distribuidor e link wa.me/5516992263122; Facebook @docampo.premium descreve “Distribuidor e fabricante de alimentos pet para Araraquara e região”; LinkedIn Comercial SS indica setor fabricação de alimentos para animais e 11-50 funcionários; lista pública MAPA/Sipeagro cita Comercial S.S. Araraquara Ltda em alimentação animal.',
+   'segmento':'Distribuidor e fabricante de alimentos pet, rações e itens para pet shop, com venda B2B recorrente para lojistas, distribuidores e clientes regionais que precisam repor estoque de produtos de alto giro.',
+   'motivo':'Pesquisa pública real confirmou ICP T1: operação de fabricação/distribuição de alimentos pet desde 1993, com frota própria, equipe comercial, marcas próprias, mais de 800 clientes ativos e canais explicitamente voltados a lojistas/distribuidores. O formulário reforça fit com segmento Pet shop, venda por representante externo, 21 a 100 pessoas e faturamento de R$10 a R$50 milhões. Mesmo com ERP “Outro” e sem loja virtual, passa no crivo acirrado por produto físico de alto giro, catálogo, preço e reposição recorrente para lojistas/revendas.',
+   'insight':'pet shops e distribuidores recomprarem rações e linhas YouDog/DoCampo por catálogo digital com preço e disponibilidade atualizados, sem depender de cada pedido via representante ou WhatsApp',
+   'telefone_publico':'WhatsApp público no site YouDog: +55 16 99226-3122; SAC/telefone comercial: +55 16 3324-3100; telefone do formulário/HubSpot é celular válido: +55 16 99609-7191',
+   'whatsapp_publico':'WhatsApp público oficial +55 16 99226-3122 localizado em https://youdog.com.br/contato/; para lead, usar celular válido informado no formulário/HubSpot: +55 16 99609-7191',
+ },
+ 'marcelo@allkit.com.br': {
+   'slug':'allkit-marcelo-stack', 'mql': False,
+   'empresa_real':'Allkit / QIT Equipamentos e Mobiliários Profissionais Ltda — fabricante de balcões buffet, vitrines aquecidas/refrigeradas, mesas quentes/frias, expositores de hortifruti e mobiliário profissional para foodservice e varejo alimentar, sediada em Valinhos/SP; Marcelo Stack aparece publicamente como CEO/diretor executivo.',
+   'dominio_site':'allkit.com.br — site oficial confirma fabricante de balcões buffet para restaurantes e expositores para supermercados, linhas para supermercados, mercados de bairro, hortifrutis, redes de supermercados, restaurantes, bares, padarias e cafeterias; página de contato divulga WhatsApp de vendas (19) 99617-3944 e assistência técnica (19) 99908-2269.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial Allkit, páginas Foodservice/Balcões, Expositores para Supermercados e Guias Marcelo Stack; LinkedIn da empresa e LinkedIn Marcelo Stack; Instagram Allkit com conteúdo para restaurantes, padarias e supermercados; Casa dos Dados/CNPJ para QIT Equipamentos e Mobiliários Profissionais Ltda.',
+   'segmento':'Indústria/fabricante B2B de equipamentos e mobiliário profissional para exposição/distribuição de alimentos em restaurantes, padarias, cafeterias e supermercados; venda consultiva de bens duráveis/projetos para estabelecimentos finais, não atacado/distribuição de produto de alto giro para revenda ou reposição recorrente de estoque.',
+   'motivo':'A pesquisa pública confirmou empresa real, industrial e B2B, mas o produto principal é bem de capital durável e consultivo — balcões, vitrines, expositores e projetos de ambiente gastronômico — vendido para o estabelecimento final. Não há evidência clara de canal de revenda/lojistas ou pedidos recorrentes de abastecimento de estoque/catálogo de alto giro, que é o crivo MQL acirrado da Zydon. O formulário informa faturamento de R$10 a R$50 milhões, equipe e dor de vendedores tirando pedido, mas isso não substitui ICP T1 de recorrência; pelo fail-closed, fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'WhatsApp público de vendas no site oficial: +55 19 99617-3944; assistência técnica: +55 19 99908-2269; telefone do formulário/HubSpot é celular válido: +55 19 99905-9795.',
+   'whatsapp_publico':'WhatsApp público de vendas +55 19 99617-3944 encontrado no site oficial allkit.com.br; não usado porque o lead foi reprovado no crivo MQL acirrado.',
+ },
+ 'atendimento02@cntambiental.com.br': {
+   'slug':'cnt-ambiental-thomas-moreira-resende', 'mql': False,
+   'empresa_real':'CNT Ambiental — empresa de Belo Horizonte/MG fundada em 1999, especializada em consultoria ambiental, tratamento de água e efluentes, análises, implantação/monitoramento/manutenção de sistemas e venda complementar de produtos químicos/filtrantes para tratamento de água.',
+   'dominio_site':'cntambiental.com.br — site oficial ativo informa 25 anos de atuação, mais de 15 mil clientes, mais de 50 produtos e serviços, consultoria ambiental, tratamento de água/efluentes, análise de água, produtos como pastilhas de cloro, carvão ativado e zeólito, endereço em Belo Horizonte e contatos corporativos.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial cntambiental.com.br, páginas Quem Somos, Contato, Homepage e produto Pastilhas de Cloro; Instagram @cntambiental e Facebook CNT Ambiental. O site divulga WhatsApps públicos +55 31 98400-3471 para tratamento de água e +55 31 97139-3922 para engenharia ambiental; redes citam atuação com empresas, indústrias, mineração, condomínios e poços artesianos.',
+   'segmento':'Serviços ambientais e tratamento de água/efluentes, com venda complementar de produtos de tratamento. Atende empresas, indústrias, mineração, condomínios e pessoas físicas, mas a evidência pública principal é prestação de serviço/projeto técnico, laudos, consultoria, monitoramento e manutenção, não atacado/distribuição/indústria de catálogo recorrente para revendas/lojistas.',
+   'motivo':'Empresa real e estruturada, porém o crivo acirrado da Zydon exige indústria, distribuidor, importador ou atacado vendendo produto físico recorrente para revendas/lojistas/clientes de abastecimento de estoque. O formulário informa faturamento até R$250 mil, ERP Outro, sem loja virtual e venda por marketplace/indicações/WhatsApp; a pesquisa pública mostra operação majoritariamente de serviços ambientais, análise, consultoria, implantação e manutenção de sistemas. A venda de produtos de tratamento existe, mas não há evidência clara de canal atacadista/distribuidor ou reposição recorrente de catálogo para revendas/lojistas. Pelo fail-closed, fica não-MQL.',
+   'insight':'',
+   'telefone_publico':'Telefones/WhatsApps públicos no site oficial: +55 31 98400-3471 (tratamento de água) e +55 31 97139-3922 (engenharia ambiental); telefone do formulário/HubSpot é celular válido: +55 31 99160-3399.',
+   'whatsapp_publico':'WhatsApps públicos oficiais encontrados no site: +55 31 98400-3471 e +55 31 97139-3922; não usados porque o lead foi reprovado no crivo MQL acirrado.',
+ },
+ 'desenvolvimento@intechmachine.com.br': {
+   'slug':'intech-machine-semar-import-geancarlo-leomil', 'mql': True,
+   'empresa_real':'Semar Import Atacadista Ltda / Intech Machine — importadora e atacadista brasileira de máquinas, ferramentas e equipamentos para construção, ferragistas, jardinagem, oficina, solda, limpeza, bombas e elevação, CNPJ 07.075.388/0001-39.',
+   'dominio_site':'intechmachine.com.br — site oficial ativo da Intech Machine com categorias de produtos como bombas d’água, solda, jardim, limpeza, pulverizadores, oficina, pintura e elevação; a home destaca “Seja um revendedor”, “Onde Comprar” e rede credenciada, confirmando canal B2B/revenda.',
+   'redes':'Pesquisa pública real neste ciclo: site oficial intechmachine.com.br; consultas públicas do Inmetro para Semar Import Atacadista Ltda/Intech Machine com CNPJ 07.075.388/0001-39, e-mails @intechmachine.com.br e registros ativos de cabos de aço e compressores de ar; snippets públicos de importação também vinculam Semar Import Atacadista Ltda ao domínio intechmachine.com.br.',
+   'segmento':'Importador/atacadista de máquinas, ferramentas, bombas, compressores, solda, jardim, limpeza, pulverizadores, oficina, pintura e elevação para lojas de material de construção, ferragistas, revendedores e assistência técnica; produto físico técnico com catálogo, preço, disponibilidade e reposição recorrente.',
+   'motivo':'O formulário declara atuação em lojas de material de construção e ferragistas, ERP Sankhya, faturamento de R$10 a R$50 milhões/ano, 21 a 100 pessoas, 2 a 5 vendedores, loja virtual ativa, venda online e dor de falta de controle/visão clara dos pedidos. A pesquisa pública confirmou empresa real com domínio próprio, marca Intech Machine, Semar Import Atacadista Ltda, CNPJ ativo, registros Inmetro para cabos de aço e compressor de ar, catálogo amplo de máquinas/ferramentas e chamada explícita para revendedores. Passa no crivo MQL acirrado por importação/atacado de produto físico recorrente para revendas/lojistas/ferragistas, com potencial claro de digitalizar catálogo, tabela, disponibilidade e pedidos B2B.',
+   'insight':'lojistas de material de construção e ferragistas consultarem catálogo, preço e disponibilidade de máquinas e ferramentas para repor estoque sem depender de cada pedido manual',
+   'telefone_publico':'Telefone celular válido informado no HubSpot/formulário e confirmado em registro público Inmetro 000181/2026: +55 11 98545-1415. Registro Inmetro 000815/2022 também publica fixo corporativo +55 11 4634-8855.',
+   'whatsapp_publico':'Usar o celular válido informado no HubSpot/formulário: +55 11 98545-1415; fonte pública coincidente: Registro Inmetro 000181/2026.',
+ },
 }
 
 
@@ -1367,6 +2099,26 @@ def parse_hs_dt(value):
     return None
 
 
+def is_form_reentry_event(props):
+    """Só trata `recent_conversion_date` como reentrada se for novo formulário.
+
+    Eventos como `Meetings Link: ...` atualizam a conversão recente no HubSpot,
+    mas não devem furar dedup nem reenviar diagnóstico para lead já tratado.
+    """
+    props = props or {}
+    event = (props.get('recent_conversion_event_name') or '').strip()
+    if not event:
+        return False
+    import unicodedata
+    norm = ''.join(c for c in unicodedata.normalize('NFKD', event.lower()) if not unicodedata.combining(c))
+    non_form_tokens = (
+        'meetings link', 'meeting link', 'meeting', 'reuniao', 'reunioes',
+        'agenda', 'calendly', 'conversations', 'conversation', 'whatsapp',
+        'whats app', 'chat', 'inbox',
+    )
+    return not any(tok in norm for tok in non_form_tokens)
+
+
 def load_processed():
     if not PROCESSED.exists(): return {}
     out = {}
@@ -1403,6 +2155,216 @@ def load_wpp():
     if not WPP.exists(): return []
     d = json.loads(WPP.read_text() or '[]')
     return d.get('envios',[]) if isinstance(d, dict) else (d if isinstance(d,list) else [])
+
+
+CONFLICT_NON_MQL_STATUSES = {
+    'nao_mql_grupo',
+    'enviado_nao_mql_legitimo',
+    'nao_mql_legitimo_tratativa',
+}
+CONFLICT_MQL_STATUSES = {
+    'enviado_lead',
+    'enviado_mql',
+    'mql_diagnostico_em_andamento',
+    'mql_diagnostico_rafael_texto',
+    'mql_diagnostico_rafael_pdf',
+    'mql_agenda_sdr_apos_diagnostico',
+}
+
+RECENT_OPERATIONAL_DIAGNOSIS_STATUSES = {
+    'no_show_pontual',
+    'no_show_pontual_all_pending_20260628',
+    'no_show_reactivation',
+    'no_show_complemento_portal',
+}
+
+
+def prior_classification_conflict(envios, email, target_status, manual_hubspot_mql=False):
+    """Bloqueia virada automática MQL↔Não-MQL já anunciada no grupo/lead.
+
+    Causa raiz do incidente Vetfarm/Agem: um fluxo avisou Não-MQL e outro fluxo,
+    minutos depois, qualificou/enviou diagnóstico para o mesmo e-mail, parecendo
+    intervenção manual do Rafael. Reclassificação só pode ocorrer com override
+    explícito/auditável, não por decisão autônoma no mesmo trilho.
+    """
+    email = (email or '').lower().strip()
+    if not email:
+        return None
+    target_status = str(target_status or '').lower()
+    if target_status == 'mql' and manual_hubspot_mql:
+        # Rafael 28/06: se Marketing marcou lifecyclestage=MQL no HubSpot,
+        # houve análise prévia humana. Esse MQL manual vence Não-MQL anterior
+        # do crivo automático e deve seguir para diagnóstico normalmente.
+        return None
+    allow = os.environ.get('ZYDON_ALLOW_AUTO_RECLASSIFY_EMAILS', '')
+    allow_set = {x.strip().lower() for x in re.split(r'[,;\s]+', allow) if x.strip()}
+    if email in allow_set:
+        return None
+    for e in reversed([x for x in envios if isinstance(x, dict)]):
+        if str(e.get('email') or '').lower().strip() != email:
+            continue
+        st = str(e.get('status') or e.get('msg_type') or '').lower().strip()
+        if target_status == 'mql' and st in CONFLICT_NON_MQL_STATUSES:
+            return f"bloqueado: já havia anúncio/ação Não-MQL para {email} ({st})"
+        if target_status == 'nao_mql' and st in CONFLICT_MQL_STATUSES:
+            return f"bloqueado: já havia anúncio/envio MQL para {email} ({st})"
+    return None
+
+
+def existing_mql_outreach(envios, email='', phone='', jid='', contact_id=''):
+    """Idempotência dura para diagnóstico MQL antes de texto/PDF.
+
+    Bloqueia reentrada/duplicata mesmo quando o primeiro ciclo ainda está na
+    cadência e ainda não gravou `enviado_lead` no final. O marcador
+    `mql_diagnostico_em_andamento` é persistido antes do primeiro /send.
+    """
+    email = (email or '').lower().strip()
+    contact_id = str(contact_id or '').strip()
+    phone_keys = {normalize_br_phone(phone or ''), only_digits(phone or ''), normalize_br_phone(jid or ''), only_digits(jid or '')}
+    phone_keys.discard('')
+    for e in reversed([x for x in envios if isinstance(x, dict)]):
+        st = str(e.get('status') or e.get('msg_type') or '').lower().strip()
+        if st not in CONFLICT_MQL_STATUSES:
+            continue
+        if email and str(e.get('email') or '').lower().strip() == email:
+            return True, f'já existe diagnóstico MQL para email ({st})'
+        if contact_id and str(e.get('contact_id') or '').strip() == contact_id:
+            return True, f'já existe diagnóstico MQL para contato ({st})'
+        for field in ('phone', 'telefone', 'to', 'jid', 'lead_jid'):
+            val = str(e.get(field) or '')
+            vals = {normalize_br_phone(val), only_digits(val)}
+            vals.discard('')
+            if phone_keys & vals:
+                return True, f'já existe diagnóstico MQL para telefone ({st})'
+    return False, ''
+
+
+def recent_prior_operational_diagnosis(envios, email='', phone='', jid='', contact_id='', hours=24, now=None):
+    """Bloqueia diagnóstico/PDF automático quando já houve abordagem recente.
+
+    Incidente AmericaSul/Roberto (28/06): saiu reativação de No Show às 11:27
+    falando em retomar diagnóstico; o mesmo contato preencheu/entrou no trilho MQL
+    à noite e recebeu novo diagnóstico/PDF. Para o lead isso fica repetido e
+    desnecessário. Reentrada recente deve virar handoff/task, não novo PDF.
+    """
+    email = (email or '').lower().strip()
+    contact_id = str(contact_id or '').strip()
+    phone_keys = {normalize_br_phone(phone or ''), only_digits(phone or ''), normalize_br_phone(jid or ''), only_digits(jid or '')}
+    phone_keys.discard('')
+    now = now or datetime.now(ZoneInfo('America/Sao_Paulo'))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo('America/Sao_Paulo'))
+    else:
+        now = now.astimezone(ZoneInfo('America/Sao_Paulo'))
+
+    for e in reversed([x for x in envios if isinstance(x, dict)]):
+        to = str(e.get('to') or e.get('jid') or e.get('lead_jid') or '')
+        if to.endswith('@g.us'):
+            continue
+        matched = False
+        if email and str(e.get('email') or '').lower().strip() == email:
+            matched = True
+        if contact_id and str(e.get('contact_id') or '').strip() == contact_id:
+            matched = True
+        for field in ('phone', 'telefone', 'to', 'jid', 'lead_jid'):
+            val = str(e.get(field) or '')
+            vals = {normalize_br_phone(val), only_digits(val)}
+            vals.discard('')
+            if phone_keys & vals:
+                matched = True
+                break
+        if not matched:
+            continue
+
+        dt = envio_datetime_brt(e)
+        if not dt:
+            continue
+        delta = (now - dt).total_seconds()
+        if delta < 0 or delta > hours * 3600:
+            continue
+
+        st = str(e.get('status') or '').lower().strip()
+        msg_type = str(e.get('msg_type') or '').lower().strip()
+        campaign = str(e.get('campaign') or '').lower().strip()
+        text = str(e.get('text') or e.get('agenda_text') or '').lower()
+        marker = st or msg_type or campaign or 'envio'
+        if st in CONFLICT_MQL_STATUSES or msg_type in CONFLICT_MQL_STATUSES:
+            return True, f'já houve diagnóstico MQL recente ({marker})'
+        if st in RECENT_OPERATIONAL_DIAGNOSIS_STATUSES or msg_type in RECENT_OPERATIONAL_DIAGNOSIS_STATUSES or campaign in RECENT_OPERATIONAL_DIAGNOSIS_STATUSES:
+            return True, f'já houve abordagem operacional recente com diagnóstico ({marker})'
+        if 'diagnóstico' in text or 'diagnostico' in text:
+            return True, f'já houve abordagem recente mencionando diagnóstico ({marker})'
+    return False, ''
+
+
+def append_mql_inflight(envios, email, slug, jid, port, owner, phone, company, contact_id=''):
+    row = {
+        'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'),
+        'date_tz': datetime.now(ZoneInfo('America/Sao_Paulo')).isoformat(),
+        'email': email,
+        'contact_id': str(contact_id or ''),
+        'slug': slug,
+        'status': 'mql_diagnostico_em_andamento',
+        'to': jid,
+        'bridge_port': port,
+        'owner_id': owner,
+        'phone': phone,
+        'empresa': company,
+        'note': 'Marcador idempotente gravado antes do primeiro WhatsApp; não renderizar como envio final.',
+    }
+    envios.append(row)
+    save_wpp(envios)
+    return row
+
+
+GROUP_NOTIFY_STATUSES = {
+    'grupo_notificacao_em_andamento',
+    'nao_mql_grupo',
+    'mql_telefone_invalido_grupo',
+    'mql_bloqueado_sem_sdr_dono',
+    'enviado_lead',
+}
+
+
+def existing_group_notification(envios, email='', contact_id='', slug=''):
+    """Evita mandar duas vezes no grupo interno para o mesmo lead/evento.
+
+    O grupo não pode receber espelho do lead nem duplicata. Usamos marcador
+    próprio antes do `/send` para cobrir corrida entre crons e reentradas.
+    """
+    email = (email or '').lower().strip()
+    contact_id = str(contact_id or '').strip()
+    slug = str(slug or '').strip()
+    for e in reversed([x for x in envios if isinstance(x, dict)]):
+        st = str(e.get('status') or e.get('msg_type') or '').lower().strip()
+        if st not in GROUP_NOTIFY_STATUSES:
+            continue
+        # Para enviado_lead, só conta como grupo notificado se havia tentativa de resumo.
+        if st == 'enviado_lead' and not (e.get('group_summary') or e.get('group_summary_response') or e.get('group_bridge_port')):
+            continue
+        if email and str(e.get('email') or '').lower().strip() == email:
+            return True, f'grupo já notificado para email ({st})'
+        if contact_id and str(e.get('contact_id') or '').strip() == contact_id:
+            return True, f'grupo já notificado para contato ({st})'
+        if slug and str(e.get('slug') or '').strip() == slug:
+            return True, f'grupo já notificado para slug ({st})'
+    return False, ''
+
+
+def append_group_inflight(envios, email, slug, contact_id='', group_status='grupo_notificacao_em_andamento'):
+    row = {
+        'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'),
+        'date_tz': datetime.now(ZoneInfo('America/Sao_Paulo')).isoformat(),
+        'email': email,
+        'contact_id': str(contact_id or ''),
+        'slug': slug,
+        'status': group_status,
+        'to': GROUP,
+        'note': 'Marcador idempotente gravado antes do aviso no grupo interno; não renderizar como envio final.',
+    }
+    envios.append(row)
+    save_wpp(envios)
+    return row
 
 def envio_datetime_brt(e):
     raw_tz = str((e or {}).get('date_tz') or '').strip()
@@ -1481,10 +2443,14 @@ def phone_variants_with_optional_9(raw):
         n = normalize_br_phone(n)
         if n and n not in variants:
             variants.append(n)
-    add(d)
-    if len(d) == 10:
+    if len(d) == 10 and local.startswith('9'):
         add(ddd + '9' + local)
-    elif len(d) == 11 and local.startswith('9'):
+        add(d)
+    else:
+        add(d)
+        if len(d) == 10:
+            add(ddd + '9' + local)
+    if len(d) == 11 and local.startswith('9'):
         add(ddd + local[1:])
     return variants
 
@@ -1715,6 +2681,59 @@ def traffic_creative_line(props):
     return ' | '.join(pieces) if pieces else 'não informado'
 
 
+# Termos de criativo/origem de ALTA CONSCIÊNCIA. Lead de Papel Rasgar / Comparativo /
+# Adibão chega comparando a Zydon com Tray/Shopify/Nuvemshop/marketplace e já fala a
+# língua do B2B (login e senha, tabela comercial, liberação, carteira de cliente).
+# Não precisa ser educado do zero — precisa do argumento de fundação B2B vs B2C.
+HIGH_AWARENESS_TERMS = (
+    'papel rasgar', 'papel rasgando', 'rasga papel', 'rasgar papel',
+    'comparativo', 'comparacao', 'comparação', 'adibao', 'adibão', 'vsl',
+    'tray', 'shopify', 'nuvemshop', 'nuvem shop', 'mercado livre', 'mercadolivre',
+    'b2c adaptado', 'b2c adaptada', 'ecommerce adaptado', 'e-commerce adaptado',
+    'login e senha', 'login/senha', 'tabela comercial', 'liberacao de acesso',
+    'liberação de acesso', 'liberar acesso', 'carteira de cliente',
+    'solicitacao de acesso', 'solicitação de acesso', 'analise de cnpj',
+    'análise de cnpj', 'analise do cliente', 'análise do cliente', 'cadastro de acesso',
+)
+
+def detect_high_awareness_origin(props=None, research=None, raw=None, extra_text=''):
+    """Detecta lead de alta consciência (criativo Papel Rasgar / Comparativo /
+    Adibão/VSL) cruzando origem/criativo do HubSpot, pesquisa e respostas do
+    formulário com HIGH_AWARENESS_TERMS. Retorna (bool, lista de termos casados).
+
+    Olha onde o criativo costuma aparecer (utm/source_data e evento de conversão),
+    a pesquisa do segmento e as respostas livres do lead — se ele já fala em login e
+    senha, tabela comercial, liberação ou cita Tray/Shopify, é comparação ativa."""
+    props = props or {}
+    research = research or {}
+    raw = raw or {}
+    pieces = [
+        traffic_creative_line(props),
+        props.get('hs_analytics_source_data_1') or '', props.get('hs_analytics_source_data_2') or '',
+        props.get('hs_latest_source_data_1') or '', props.get('hs_latest_source_data_2') or '',
+        props.get('recent_conversion_event_name') or '', props.get('first_conversion_event_name') or '',
+        props.get('hs_latest_source') or '', props.get('hs_analytics_source') or '',
+    ]
+    for k in ('segmento', 'motivo', 'redes', 'empresa_real'):
+        pieces.append(str(research.get(k, '') or ''))
+    for k in ('resposta', 'dor', 'cargo_area', 'vende_para'):
+        pieces.append(str(raw.get(k, '') or ''))
+    pieces.append(str(extra_text or ''))
+    blob = ' '.join(pieces).lower()
+    matched = [t for t in HIGH_AWARENESS_TERMS if t in blob]
+    return bool(matched), matched
+
+
+def sdr_opening_question(high_awareness):
+    """Pergunta fixa de abertura do diagnóstico.
+
+    Rafael corrigiu em 28/06: mesmo para lead de alta consciência/Papel Rasgar,
+    a primeira mensagem precisa terminar perguntando como a pessoa imagina que a
+    Zydon pode ajudar. Não usar pergunta alternativa de curiosidade no diagnóstico.
+    """
+    return 'Como você imagina que a Zydon poderia te apoiar?'
+
+
 def group_erp_line(props):
     """Linha opcional de ERP somente para a mensagem interna do grupo."""
     props = props or {}
@@ -1742,6 +2761,99 @@ def timing_first_person():
         return 'Eu te chamo na segunda-feira'
     return 'Eu te chamo amanhã'
 
+def timing_token_brt():
+    now=datetime.now(ZoneInfo('America/Sao_Paulo'))
+    if is_work_hours_brt():
+        return 'jaja'
+    if now.weekday() == 5:
+        return 'na segunda-feira'
+    return 'amanhã'
+
+def agenda_followup_for_lead(consultant_fallback, owner_id):
+    """Mensagem separada de agenda, enviada depois do texto e do PDF.
+
+    Rafael pediu a cadência natural:
+    1) texto curto do diagnóstico, sem pergunta/agenda;
+    2) esperar 1 minuto e mandar o PDF;
+    3) 30 segundos depois do PDF mandar a pergunta oficial;
+    4) esperar 20 minutos e só então mandar agenda/continuidade do SDR.
+
+    Se o diagnóstico saiu pelo próprio SDR dono, fala em primeira pessoa. Se saiu por
+    comunicador institucional/fallback, nomeia o SDR dono em terceira pessoa.
+    """
+    timing = timing_token_brt()
+    info = OWNER_MAP.get(owner_id or '')
+    agenda = info.get('agenda') if info else ''
+    if consultant_fallback:
+        if info:
+            nome = info['nome']
+            genero = 'A' if nome == 'Sarah' else 'O'
+            papel = 'consultora' if nome in {'Sarah'} else 'consultor'
+            line = f"{genero} {nome}, {papel} da Zydon, te chama {timing} para seguir com um diagnóstico mais completo."
+        else:
+            line = f"O consultor responsável da Zydon te chama {timing} para seguir com um diagnóstico mais completo."
+    else:
+        line = f"Eu te chamo {timing} para seguir com um diagnóstico mais completo."
+    if agenda:
+        line = f"Se quiser garantir o melhor horário para um diagnóstico completo, pode marcar direto aqui: {agenda}"
+    return line
+
+
+def lead_replied_after(port, jid, after_dt):
+    """Verifica se o lead respondeu no histórico real antes da próxima mensagem programada.
+
+    Rafael 27/06: se o lead responder durante o respiro de 8min, NÃO enviar a
+    mensagem automática de agenda por cima. A conversa deve continuar pelo
+    contexto da resposta.
+    """
+    try:
+        hist = Path(f'/root/.hermes/whatsapp-extra/channel_data/history_{int(port)}.json')
+        rows = json.loads(hist.read_text(encoding='utf-8')) if hist.exists() else []
+    except Exception:
+        return False, []
+    targets = {str(jid), str(jid).replace('@c.us', '@s.whatsapp.net'), str(jid).replace('@s.whatsapp.net', '@c.us')}
+    replies = []
+    for m in rows if isinstance(rows, list) else []:
+        if not isinstance(m, dict) or m.get('fromMe') is True:
+            continue
+        chat = str(m.get('chat') or m.get('remoteJid') or m.get('jid') or (m.get('rawKey') or {}).get('remoteJid') or '')
+        if chat not in targets:
+            continue
+        raw_ts = m.get('timestamp') or 0
+        try:
+            ts = float(raw_ts)
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            dt = datetime.fromtimestamp(ts, timezone.utc)
+        except Exception:
+            continue
+        if dt <= after_dt:
+            continue
+        txt = ''
+        for k in ('text', 'body', 'caption', 'content'):
+            v = m.get(k)
+            if isinstance(v, str) and v.strip():
+                txt = re.sub(r'\s+', ' ', v).strip()
+                break
+        replies.append({'dt': dt.isoformat(), 'text': txt[:500]})
+    return bool(replies), replies
+
+
+def concise_diag_insight(text, max_len=95):
+    """Deixa o insight do WhatsApp curto sem terminar em frase quebrada."""
+    s = re.sub(r'\s+', ' ', str(text or '')).strip()
+    s = re.sub(r'^(d[áa] pra|é possível|para)\s+', '', s, flags=re.I)
+    if len(s) <= max_len:
+        return s.rstrip(' .;:')
+    cut = s[:max_len].rsplit(' ', 1)[0].rstrip(' ,.;:')
+    # Evita sair algo como "dos equipamentos de." quando o corte cai em preposição.
+    tail_bad = {'de', 'do', 'da', 'dos', 'das', 'para', 'por', 'com', 'sem', 'em', 'e'}
+    words = cut.split()
+    while words and words[-1].lower() in tail_bad:
+        words.pop()
+    cut = ' '.join(words).rstrip(' ,.;:') or s[:max_len].rstrip(' ,.;:')
+    return cut
+
 def bridge_me(port):
     try:
         out = subprocess.check_output(['curl','-s',f'http://127.0.0.1:{port}/me'], timeout=15, text=True)
@@ -1754,20 +2866,28 @@ def bridge_me(port):
         return False, str(e)
 
 def pick_online_port(owner_info, envios):
-    """Escolhe a porta online menos usada para o SDR.
+    """Escolhe porta online menos usada, respeitando limite externo por chip.
 
-    Para Breno, usa somente 4605. Para os demais, mantém a porta única.
+    Para Breno, usa somente 4605. Para rotação institucional, tenta o próximo
+    comunicador se a porta online menos usada já bateu o limite de aquecimento.
     """
     ports = owner_info.get('portas') or [owner_info['porta']]
     def used_count(port):
         return sum(1 for e in envios if isinstance(e, dict) and e.get('bridge_port') == port)
     offline = []
+    over_limit = []
     for port in sorted(ports, key=lambda p: (used_count(p), p)):
         ok, me = bridge_me(port)
-        if ok:
-            return port, True, me, ''
-        offline.append(f'porta {port}: {me}')
-    return ports[0], False, offline[-1] if offline else 'sem portas configuradas', '; '.join(offline)
+        if not ok:
+            offline.append(f'porta {port}: {me}')
+            continue
+        limit_ok, limit_reason = port_within_external_limits(envios, port)
+        if not limit_ok:
+            over_limit.append(limit_reason)
+            continue
+        return port, True, me, ''
+    detail = '; '.join(over_limit + offline)
+    return ports[0], False, detail or 'sem portas disponíveis dentro do limite', detail
 
 
 def post_group_with_rotation(text, envios):
@@ -1792,22 +2912,7 @@ def post_group_with_rotation(text, envios):
 
 
 def post_bridge(port, path, payload):
-    req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'}, method='POST')
-    try:
-        with urllib.request.urlopen(req, timeout=90) as r:
-            txt = r.read().decode()
-            try: return json.loads(txt)
-            except Exception: return {'raw': txt}
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors='replace')
-        try:
-            data = json.loads(body)
-        except Exception:
-            data = {'raw': body}
-        data['http_error'] = e.code
-        return data
-    except Exception as e:
-        return {'error': str(e)}
+    return safe_post_bridge(port, path, payload, uid='process_gate_once', timeout=90)
 
 def message_ok(resp):
     txt=json.dumps(resp, ensure_ascii=False)
@@ -1943,6 +3048,16 @@ def resolve_business_owner(cid, deal_ids, contact_owner=''):
     return contact_owner or '', notes or ['sem negócio associado']
 
 
+def has_known_sdr_owner(owner_id):
+    """Retorna True só para SDRs comerciais que podem assumir diagnóstico.
+
+    Diagnóstico MQL externo nunca pode sair sem Sarah/Breno/Lucas Batista como
+    dono comercial resolvido. Comunicadores institucionais só podem ser remetente
+    de fallback, não substituem o SDR dono.
+    """
+    return bool(owner_id and owner_id in OWNER_MAP)
+
+
 def wait_for_business_owner(cid, initial_owner='', timeout_sec=300, interval_sec=15):
     """Espera a automação do HubSpot criar/atribuir o negócio após MQL.
 
@@ -2073,13 +3188,23 @@ def strict_icp_check(props, research):
     if any(b in text for b in blockers):
         return False, 'bloqueio ICP: consultoria/site pessoal/serviço ou situação sensível; não é oportunidade T1 clara de abastecimento B2B'
     business_terms = ['distribuidor', 'distribuidora', 'distribuição', 'distribuicao', 'indústria', 'industria', 'fabricante', 'fabricação', 'fabricacao', 'importador', 'importadora', 'atacado', 'atacadista', 'wholesale']
-    replenishment_terms = ['revenda', 'revendas', 'revendedor', 'revendedores', 'lojista', 'lojistas', 'lojas', 'varejo', 'canal de distribuidor', 'canal distribuidor', 'representante', 'representantes', 'integrador', 'integradores', 'abastecimento de estoque', 'reposição de estoque', 'reposicao de estoque', 'reposição técnica', 'reposicao tecnica', 'reposições', 'reposicoes', 'cotações recorrentes', 'cotacoes recorrentes', 'compradores industriais', 'catálogo para lojistas', 'catalogo para lojistas', 'pedido recorrente de revenda', 'pedidos recorrentes de revenda']
+    replenishment_terms = ['revenda', 'revendas', 'revendedor', 'revendedores', 'lojista', 'lojistas', 'lojas', 'varejo', 'canal de distribuidor', 'canal distribuidor', 'representante', 'representantes', 'integrador', 'integradores', 'abastecimento de estoque', 'reposição de estoque', 'reposicao de estoque', 'reposição técnica', 'reposicao tecnica', 'reposições', 'reposicoes', 'cotações recorrentes', 'cotacoes recorrentes', 'compradores industriais', 'catálogo para lojistas', 'catalogo para lojistas', 'pedido recorrente de revenda', 'pedidos recorrentes de revenda', 'autopeças', 'autopecas', 'motopeças', 'motopecas', 'postos de combustível', 'postos de combustivel', 'oficinas', 'frotas', 'transportadoras', 'máquinas agrícolas', 'maquinas agricolas']
     industrial_b2b_terms = ['máquinas pesadas', 'maquinas pesadas', 'automação industrial', 'automacao industrial', 'controle e posicionamento', 'joystick', 'controladores industriais', 'encoders', 'radares', 'sensores', 'segurança industrial', 'seguranca industrial', 'siderurgia', 'mineração', 'mineracao', 'portos', 'ferrovias', 'manufatura', 'cotação', 'cotacao', 'catálogo de produtos', 'catalogo de produtos', 'clientes industriais']
     enterprise_client_terms = ['gerdau', 'siemens', 'ternium', 'vale', 'weg', 'arcelormittal', 'usiminas', 'votorantim', 'anglo american', 'thyssen', 'rumo']
     has_business = any(t in text for t in business_terms)
     has_replenishment = any(t in text for t in replenishment_terms)
     has_industrial_b2b = any(t in text for t in industrial_b2b_terms) and any(t in text for t in ['indústria', 'industria', 'fabricante', 'fabricação', 'fabricacao', 'fornecedora', 'b2b'])
     has_enterprise_clients = any(t in text for t in enterprise_client_terms)
+    public_distributor_signal = any(t in text for t in ['distribuidora atacadista', 'distribuidor atacadista', 'importadora e distribuidora', 'fabricante e distribuidora', 'fabricante e distribuidor', 'distribuidor/fabricante', 'operação atacadista', 'operacao atacadista', 'entrega nacional', 'clientes b2b recorrentes', 'venda b2b recorrente', 'tubos e acessórios industriais', 'tubos e acessorios industriais', 'suprimentos para indústria', 'suprimentos para industria', 'distribuidora desde', 'distribuidor desde', 'distribuição autorizada', 'distribuicao autorizada', 'distribuidora autorizada', 'distribuidor autorizado', 'fornecedora/distribuidora', 'fornecedor/distribuidor'])
+    public_validation = any(t in text for t in ['domínio próprio', 'dominio proprio', 'domínio oficial', 'dominio oficial', 'site oficial', 'cnpj', 'empresa real', 'linkedin', 'anos de mercado', 'desde 1997', 'desde 1998', 'desde 1999', 'mais de 10 anos', 'mais de 20 anos', 'mais de 25 anos'])
+    recurring_product_signal = any(t in text for t in [
+        'produtos médicos', 'produtos medicos', 'hospitalares', 'material laboratorial', 'materiais laboratoriais', 'saneantes', 'instrumentais', 'casas cirúrgicas', 'casas cirurgicas',
+        'máquinas e equipamentos', 'maquinas e equipamentos', 'equipamentos industriais', 'máquinas industriais', 'maquinas industriais', 'peças', 'pecas', 'suprimentos',
+        'lubrificantes', 'aditivos', 'pneus', 'autopeças', 'autopecas', 'motopeças', 'motopecas', 'postos de combustível', 'postos de combustivel', 'frotas',
+        'catálogo amplo', 'catalogo amplo', 'lista de produtos', 'mais de 1.000 itens', 'tabela', 'estoque', 'disponibilidade', 'orçamento recorrente', 'orcamento recorrente',
+    ])
+    if has_business and public_validation and recurring_product_signal:
+        return True, 'distribuidora/fornecedora B2B validada com site histórico e produto físico recorrente; qualifica como MQL para ouvir diagnóstico'
     agro_multiunit_signal = all(t in text for t in ['agro', 'multiunidade']) and any(t in text for t in ['fazendas', 'produtor rural', 'produtores rurais', 'prestadores de serviço', 'clientes b2b recorrentes']) and any(t in text for t in ['medicamentos veterinários', 'medicamentos veterinarios', 'rações', 'racoes', 'sementes', 'equipamentos', 'insumos rurais'])
     if agro_multiunit_signal and any(t in text for t in ['domínio corporativo', 'dominio corporativo', 'site oficial', 'múltiplas lojas', 'multiplas lojas', 'várias unidades', 'varias unidades']):
         return True, 'rede agro/vet multiunidade com clientes rurais recorrentes, mix amplo e reposição; qualifica por porte e recorrência B2B rural'
@@ -2104,8 +3229,7 @@ def strict_icp_check(props, research):
         return True, 'indústria/fabricante B2B técnico com catálogo/cotação e clientes industriais grandes; não depende de palavra revenda/lojista'
     if not has_replenishment:
         return False, 'não evidenciou venda para revendas/lojistas/integradores ou abastecimento recorrente de estoque'
-    public_distributor_signal = any(t in text for t in ['distribuidora atacadista', 'distribuidor atacadista', 'importadora e distribuidora', 'fabricante e distribuidora', 'fabricante e distribuidor', 'distribuidor/fabricante', 'operação atacadista', 'operacao atacadista', 'entrega nacional', 'clientes b2b recorrentes', 'venda b2b recorrente', 'tubos e acessórios industriais', 'tubos e acessorios industriais', 'suprimentos para indústria', 'suprimentos para industria'])
-    if public_distributor_signal and any(t in text for t in ['domínio próprio', 'dominio proprio', 'site oficial', 'cnpj', 'empresa real', 'linkedin']):
+    if public_distributor_signal and public_validation:
         return True, 'distribuidora/importadora B2B validada publicamente; formulário incompleto não bloqueia MQL'
     if not (native_erp or ecommerce or size_signal or (has_industrial_b2b and has_enterprise_clients)):
         return False, 'ICP aderente, mas sem sinal suficiente de ERP nativo, e-commerce, porte T1 ou clientes industriais relevantes'
@@ -2139,6 +3263,39 @@ def business_clean(text, limit=220):
     return cut.rstrip('.,;:') + '...'
 
 
+def simple_non_mql_reason(research):
+    """Motivo Não-MQL simples para Rafael/time comercial.
+
+    Não expõe jargão interno como crivo, fail-closed, ICP ou texto de pesquisa
+    truncado. O grupo precisa entender em 10 segundos: o que faltou para virar MQL.
+    """
+    research = research or {}
+    blob = ' '.join(str(research.get(k, '') or '') for k in ('segmento', 'motivo', 'dominio_site', 'redes')).lower()
+    bullets = []
+
+    if any(t in blob for t in ['ainda não fatura', 'ainda nao fatura', 'sem faturamento', 'não faturam', 'nao faturam', 'pré-receita', 'pre-receita']):
+        bullets.append('• Ainda não mostrou operação comercial madura/faturando para priorizar agora.')
+    if any(t in blob for t in ['marketplace', 'varejo', 'b2c', 'instagram']) and not any(t in blob for t in ['atacado', 'distribuidor', 'distribuidora', 'indústria', 'industria', 'fabricante']):
+        bullets.append('• Parece mais varejo/marketplace do que venda B2B recorrente para clientes com tabela e recompra.')
+    service_signal = re.search(r'(?<!autos)servi[çc]o|consultoria|manuten[çc][ãa]o|inform[áa]tica|software|tecnologia', blob)
+    if service_signal and not any(t in blob for t in ['distribuidora atacadista', 'atacado', 'indústria', 'industria', 'fabricante']):
+        bullets.append('• Parece serviço/tecnologia/venda técnica, não indústria/distribuição/atacado com pedido recorrente.')
+    if any(t in blob for t in ['não localizou site', 'nao localizou site', 'não retornaram site', 'nao retornaram site', 'não confirmou', 'nao confirmou', 'sem evidência pública', 'sem evidencia publica', 'não comprovou', 'nao comprovou']):
+        bullets.append('• Não encontrei prova pública segura de operação B2B estruturada.')
+    if any(t in blob for t in ['não evidenciou venda para revendas', 'nao evidenciou venda para revendas', 'lojistas', 'abastecimento recorrente']) and not bullets:
+        bullets.append('• Não ficou claro que vende para revendas/lojistas com recompra de estoque.')
+
+    if not bullets:
+        segmento = business_clean(research.get('segmento'), 140)
+        if segmento:
+            bullets.append(f'• Perfil não bateu com o alvo principal da Zydon: {segmento}')
+        else:
+            bullets.append('• Faltou evidência de indústria, distribuição ou atacado com pedidos recorrentes.')
+
+    bullets.append('• Para virar MQL: confirmar atacado/distribuição/indústria + catálogo/preço + recompra B2B.')
+    return bullets[:3]
+
+
 def group_reason_bullets(research, mql=True):
     """Resumo objetivo para pessoas de negócio no grupo, com quebra de linha."""
     bullets = []
@@ -2146,7 +3303,7 @@ def group_reason_bullets(research, mql=True):
     dominio = business_clean(research.get('dominio_site'), 130)
     redes = business_clean(research.get('redes'), 110)
     insight = business_clean(research.get('insight'), 130)
-    motivo = business_clean(research.get('motivo'), 220)
+    motivo = business_clean(research.get('motivo'), 180)
 
     if mql:
         if segmento:
@@ -2160,12 +3317,7 @@ def group_reason_bullets(research, mql=True):
         if not bullets and motivo:
             bullets.append(f'• {motivo}')
     else:
-        if motivo:
-            bullets.append(f'• {motivo}')
-        elif segmento:
-            bullets.append(f'• Fora do perfil ideal: {segmento}')
-        if dominio and len(bullets) < 3:
-            bullets.append(f'• Evidência pública: {dominio}')
+        bullets.extend(simple_non_mql_reason(research))
     return '\n'.join(bullets[:3])
 
 
@@ -2226,6 +3378,232 @@ def upload_pdf_to_hubspot(pdf_path, slug):
         return None, 'HubSpot PAT sem scope files/files.ui_hidden.write para anexar PDF'
     return None, 'HubSpot Files upload sem id: '+json.dumps(data, ensure_ascii=False)[:500]
 
+def normalize_form_range(value):
+    """Normaliza enums de faixa do formulário para texto legível nos cards do PDF.
+
+    O HubSpot entrega faixas como enum interno ('1_a_10', '11_a_25', '21_a_100_').
+    O código antigo fazia raw.replace('_', ' a '), que transformava '1_a_10' em
+    '1 a a a 10' (bug do card TIME TOTAL da Policrom). Aqui trocamos '_' por espaço,
+    colapsamos espaços e qualquer 'a a' redundante, garantindo '1 a 10' e nunca
+    '1 a a a 10'. Valores já legíveis ('10 a 20 pessoas', '+151') passam intactos.
+    """
+    txt = str(value or '').strip()
+    if not txt:
+        return ''
+    txt = txt.replace('_', ' ')
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    # Colapsa 'a a a' -> 'a' caso algum enum venha com separadores extras.
+    txt = re.sub(r'\b[Aa](?:\s+[Aa]\b)+', 'a', txt)
+    return txt
+
+def map_segmento_mapeado(research, raw=None):
+    """Classifica o lead numa linha/canal consultivo (o 'segmento mapeado' do PDF).
+
+    Combina research['segmento'] com sinais do formulário (área, para quem vende,
+    como vende, dor). Só emite uma sigla de linha (CPET/CVET/CS/Food Service)
+    quando há palavra-chave clara; senão devolve 'Segmento B2B mapeado' com a
+    descrição da pesquisa, sem inventar sigla. Retorna (rotulo, descricao)."""
+    seg = (research.get('segmento') or '').strip()
+    extra = ''
+    if raw:
+        extra = ' '.join(str(raw.get(k, '') or '') for k in ('cargo_area', 'vende_para', 'resposta', 'dor'))
+    blob = f'{seg} {extra}'.lower()
+    def has(*words):
+        return any(w in blob for w in words)
+    def has_word(*words):
+        # Limite de palavra para tokens curtos/ambíguos: evita 'ração' casar
+        # dentro de 'operação', 'exportação' etc.
+        return any(re.search(r'(?<![0-9a-zà-ÿ])' + re.escape(w) + r'(?![0-9a-zà-ÿ])', blob)
+                   for w in words)
+
+    # Canais mais específicos têm prioridade sobre Food Service (uma marca de
+    # 'alimento para pets' é CPET, não Food Service).
+    if has('veterinár', 'veterinar', 'clínica animal', 'clinica animal', 'agropecuár', 'agropecuar'):
+        linha = 'CVET (canal veterinário)'
+    elif has_word('pet', 'pets', 'petshop', 'ração', 'rações', 'agropet') or has('pet shop'):
+        linha = 'CPET (canal pet)'
+    elif has('cosmétic', 'cosmetic', 'beleza', 'salão de beleza', 'salao de beleza', 'estétic',
+             'estetic', 'perfumaria', 'capilar', 'dermo', 'maquiagem', 'skincare'):
+        linha = 'CS (cosméticos, saúde & beleza)'
+    elif has('food service', 'restaurante', 'bares', 'hotel', 'hotelaria', 'padaria',
+             'cafeteria', 'lanchonete', 'buffet', 'cozinha industrial', 'bebida',
+             'alimento', 'snack', 'laticínio', 'laticinio', 'panificação', 'panificacao') \
+            or has_word('doce', 'doces'):
+        linha = 'Food Service'
+    else:
+        linha = None
+
+    canais = []
+    if has('importador', 'importação', 'importacao'):
+        canais.append('importação')
+    if has('indústria', 'industria', 'fabricante', 'fábrica', 'fabrica',
+           'produção própria', 'producao propria', 'confecção', 'confeccao'):
+        canais.append('indústria')
+    if has('atacad'):
+        canais.append('atacado')
+    if has('distribu'):
+        canais.append('distribuição')
+    canal = ' / '.join(dict.fromkeys(canais))
+
+    descricao = business_clean(seg, 200) or 'Operação B2B com venda recorrente para clientes empresariais.'
+    if linha and canal:
+        rotulo = f'{linha} · {canal}'
+    elif linha:
+        rotulo = linha
+    elif canal:
+        rotulo = f'Segmento B2B mapeado · {canal}'
+    else:
+        rotulo = 'Segmento B2B mapeado'
+    return rotulo, descricao
+
+def extract_historia(research):
+    """'História e contexto' enxuta para o PDF. Só cita ano/fundação ou tempo de
+    mercado quando aparece nas fontes da pesquisa (empresa_real/dominio_site/
+    redes/motivo); nunca inventa. Devolve string (vazia quando nada confiável)."""
+    fontes = ' '.join(str(research.get(k, '') or '')
+                      for k in ('empresa_real', 'dominio_site', 'redes', 'motivo'))
+    partes = []
+    m = re.search(r'(?:fundad[ao]s?\s+em|ativ[ao]s?\s+desde|criad[ao]s?\s+em|desde|'
+                  r'opera[çc][ãa]o\s+brasileira\s+desde)\s+(?:\d{1,2}/\d{1,2}/)?((?:18|19|20)\d{2})',
+                  fontes, re.IGNORECASE)
+    if m:
+        partes.append(f'Em atividade desde {m.group(1)}')
+    else:
+        m2 = re.search(r'(mais de \d+|\d+\+?)\s+anos', fontes, re.IGNORECASE)
+        if m2:
+            partes.append(f'{m2.group(0).strip()} de mercado')
+    loc = re.search(r'\b(?:em|de|sede em)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ\.\']+(?:\s+[A-Za-zÀ-ÿ\.\']+){0,3})'
+                    r'\s*[/\-]\s*([A-Z]{2})\b', fontes)
+    if loc:
+        partes.append(f'{loc.group(1).strip()}/{loc.group(2)}')
+    return ', '.join(partes)
+
+def build_referencias(research):
+    """Referências enxutas do PDF: site, fontes públicas e formulário. Sem URLs
+    longas nem textão — só o domínio raiz e os canais públicos citados."""
+    refs = []
+    dominio = (research.get('dominio_site') or '').strip()
+    m = re.search(r'([a-z0-9][a-z0-9\-]*\.(?:com\.br|com|net\.br|net|ind\.br|rep\.br|'
+                  r'org\.br|org|io|legal|group|shop|digital|br))', dominio, re.IGNORECASE)
+    if m:
+        refs.append(('Site', m.group(1).rstrip('.,;')))
+    fontes = []
+    blob = f"{research.get('redes', '')} {dominio} {research.get('motivo', '')}".lower()
+    for token in ('Instagram', 'Facebook', 'LinkedIn', 'Mercado Livre', 'Amazon',
+                  'Google Play', 'B2Brazil', 'Econodata', 'CNPJ', 'Loja Integrada', 'marketplace'):
+        if token.lower() in blob:
+            fontes.append('marketplace público' if token == 'marketplace' else token)
+    fontes = list(dict.fromkeys(fontes))[:3]
+    refs.append(('Fontes públicas', ', '.join(fontes) if fontes else 'Pesquisa web do segmento'))
+    refs.append(('Formulário', 'Diagnóstico comercial HubSpot'))
+    return refs
+
+def clientes_da_empresa(research, raw=None):
+    """Quem compra da empresa (clientes B2B). Usa 'vende_para' do formulário quando
+    é específico; senão deduz os tipos de cliente da pesquisa (segmento/insight/
+    motivo). Prudente: sem evidência, devolve descrição genérica sem inventar nicho."""
+    vp = str((raw or {}).get('vende_para') or '').strip()
+    generico = (not vp) or vp.lower().startswith('clientes b2b') or vp.lower().startswith('estimativa')
+    blob = ' '.join(str((research or {}).get(k, '') or '') for k in ('segmento', 'insight', 'motivo'))
+    if raw:
+        blob += ' ' + ' '.join(str(raw.get(k, '') or '') for k in ('vende_para', 'cargo_area', 'resposta'))
+    bl = blob.lower()
+    mapping = [
+        (('revend',), 'revendas'),
+        (('lojista', 'multimarca', 'varejist'), 'lojistas e multimarcas'),
+        (('restaurante', 'bares', 'food service', 'lanchonete', 'padaria', 'cafeteria', 'buffet', 'hotel'), 'food service'),
+        (('petshop', 'pet shop', 'agropet'), 'petshops'),
+        (('clínica', 'clinica', 'consultório', 'consultorio'), 'clínicas e consultórios'),
+        (('oficina', 'autopeç', 'autopec'), 'oficinas e autopeças'),
+        (('supermercad', 'mercear', 'atacarejo'), 'supermercados e mercearias'),
+        (('construtor', 'engenharia', 'obra '), 'construtoras e obras'),
+        (('salão', 'salao', 'estética', 'estetica', 'perfumaria'), 'salões e profissionais de beleza'),
+        (('farmác', 'farmac', 'drogaria'), 'farmácias e drogarias'),
+        (('distribuidor', 'atacad'), 'distribuidores e atacadistas'),
+    ]
+    tipos = []
+    for keys, label in mapping:
+        if any(k in bl for k in keys):
+            tipos.append(label)
+    tipos = list(dict.fromkeys(tipos))[:3]
+    if not generico:
+        return business_clean(vp, 160)
+    if tipos:
+        return 'Clientes B2B: ' + ', '.join(tipos) + '.'
+    return 'Clientes B2B do segmento que compram para revenda ou uso recorrente.'
+
+def motor_de_compra(research, raw=None):
+    """Motor da compra para o PDF: por que e como o cliente compra, e se a venda é
+    EMPURRADA (depende de vendedor/representante/visita) ou PUXADA (recompra natural/
+    recorrente). Deduz de research (segmento/insight/motivo) e do formulário
+    (resposta/dor). Não inventa número. Retorna dict: quem/porque/como_hoje/estimulo/
+    pushpull."""
+    pub = ' '.join(str((research or {}).get(k, '') or '') for k in ('segmento', 'insight', 'motivo'))
+    form = ' '.join(str((raw or {}).get(k, '') or '') for k in ('resposta', 'dor', 'cargo_area')) if raw else ''
+    bl = (pub + ' ' + form).lower()
+
+    pull_kw = ('recompra', 'recorrente', 'recorrência', 'recorrencia', 'giro', 'reposição',
+               'reposicao', 'repor', 'sazonal', 'contrato', 'fidelidade', 'autoatend',
+               'auto-atend', '24h', '24/7', 'mix', 'grade')
+    push_kw = ('vendedor', 'representante', 'visita', 'orçamento', 'orcamento', 'negociaç',
+               'negociac', 'prospec', 'demora no atend', 'atendimento manual', 'manual',
+               'whatsapp', 'telefone', 'balcão', 'balcao', 'empurr')
+    pull = any(k in bl for k in pull_kw)
+    push = any(k in bl for k in push_kw)
+
+    if pull and push:
+        pushpull = ('Venda mista: a recompra é puxada (giro e reposição recorrente), mas hoje '
+                    'ainda é empurrada — depende de vendedor, representante e atendimento manual. '
+                    'No digital o estímulo vira automático: estoque e grade na tela, sazonalidade, '
+                    'ruptura, mix e pedido mínimo fazem o cliente pedir sozinho.')
+    elif pull:
+        pushpull = ('Venda puxada: a recompra é natural e recorrente (giro alto, reposição). O '
+                    'estímulo certo no digital sustenta o pedido sem vendedor — estoque e grade '
+                    'visíveis, sazonalidade, alerta de ruptura, mix sugerido e pedido mínimo.')
+    elif push:
+        pushpull = ('Venda empurrada: depende de vendedor, representante e visita para o pedido '
+                    'sair. Digitalizar muda o estímulo — catálogo com preço e disponibilidade, '
+                    'recompra recorrente, alerta de ruptura e mix sugerido fazem o cliente pedir '
+                    'sem esperar atendimento.')
+    else:
+        pushpull = ('Venda mista entre empurrada e puxada: parte depende de vendedor e parte é '
+                    'recompra recorrente. No digital o que estimula o pedido — estoque, '
+                    'sazonalidade, ruptura, mix e pedido mínimo — passa a trabalhar sozinho.')
+
+    porque = business_clean((research or {}).get('insight') or '', 170)
+    if not porque:
+        porque = 'Recompra recorrente de itens de giro: o cliente volta para repor estoque e mix.'
+    elif not porque.endswith('.'):
+        porque += '.'
+
+    como_form = str((raw or {}).get('resposta') or '').strip()
+    if como_form and not como_form.lower().startswith('estimativa'):
+        como_hoje = f'{como_form}; pedido por WhatsApp/telefone e atendimento manual.'
+    else:
+        como_hoje = 'Pedidos por WhatsApp, telefone e visita de representante.'
+
+    return {
+        'quem': clientes_da_empresa(research, raw),
+        'porque': porque,
+        'como_hoje': como_hoje,
+        'estimulo': 'Estoque e grade disponíveis, sazonalidade, ruptura, mix e pedido mínimo.',
+        'pushpull': pushpull,
+    }
+
+def assert_mql_confirmed_for_diagnostic(lead, research, context):
+    """Trava dura Rafael 2026-06-29: diagnóstico só nasce após MQL confirmado."""
+    if not context or context.get('classification_state') != 'mql_confirmed_ready_for_diagnostic':
+        raise RuntimeError('diagnóstico bloqueado: estado não é mql_confirmed_ready_for_diagnostic')
+    if not context.get('mql_confirmed'):
+        raise RuntimeError('diagnóstico bloqueado: MQL não confirmado')
+    if not context.get('classification_reasons'):
+        raise RuntimeError('diagnóstico bloqueado: justificativa MQL ausente')
+    if not (lead or {}).get('id') and not (lead or {}).get('email'):
+        raise RuntimeError('diagnóstico bloqueado: lead sem identificador')
+    if not (research or {}).get('mql'):
+        raise RuntimeError('diagnóstico bloqueado: research não confirma MQL')
+
+
 def generate_pdf(lead, research, sdr):
     sys.path.insert(0, str(MOTOR))
     from batch_prepare import build_lead_dict
@@ -2260,17 +3638,39 @@ def generate_pdf(lead, research, sdr):
     d['site']=research['dominio_site'].split()[0]
     d['sobre']=f"{research['empresa_real']} atua em {research['segmento']}. Pesquisa pública: {research['dominio_site']}; {research['redes']}. Pelo diagnóstico, opera com {raw['resposta']} e tem faixa de faturamento {raw['faturamento']}."
     d['sobre_fonte']='Pesquisa web + diagnóstico HubSpot'
-    d['vende_para']=raw['vende_para']
-    d['como_vende']=raw['resposta']
+    # Estudo da empresa: quem compra (clientes reais) e o motor da compra (por que/
+    # como compra, empurrada vs puxada, o que estimula). Tudo vindo de research/form.
+    motor = motor_de_compra(research, raw)
+    d['motor']=motor
+    d['vende_para']=motor['quem']
+    d['como_vende']=motor['como_hoje']
+    d['pushpull']=motor['pushpull']
     d['loja_virtual']=raw['loja']
-    d['time_total']=raw['pessoas'].replace('_',' a ')
+    d['time_total']=normalize_form_range(raw['pessoas'])
     d['compra_sozinho']=raw['autosservico']
+    seg_rotulo, seg_desc = map_segmento_mapeado(research, raw)
+    d['segmento_mapeado']=seg_rotulo
+    d['segmento_desc']=seg_desc
+    # Criativo/origem de alta consciência (Papel Rasgar/Comparativo/Adibão): liga a
+    # página de fundação B2B vs B2C adaptado no PDF.
+    high_aware, ha_terms = detect_high_awareness_origin(props=props, research=research, raw=raw)
+    d['alta_consciencia']=high_aware
+    d['alta_consciencia_termos']=ha_terms
+    d['historia']=extract_historia(research)
+    d['referencias']=build_referencias(research)
+    linha_curta=seg_rotulo.split('·')[0].strip()
     d['encontramos']=[
-      'Catálogo B2B para o cliente pedir sozinho entre uma visita e outra',
-      'Regras comerciais por cliente e região para reduzir retrabalho do representante',
-      'Canal digital próprio para transformar visitas presenciais em recompra recorrente'
+      f'{linha_curta}: um catálogo B2B próprio deixa o cliente pedir sozinho entre uma visita/contato e outro, sem ocupar o vendedor.',
+      f'Tabela por cliente, regra de preço por volume e o {d["erp"]} integrados num só lugar — o representante para de refazer pedido e conferir preço na mão.',
+      'A recompra recorrente da base vira fluxo automático 24/7, com o limite e a condição de cada cliente, transformando atendimento repetitivo em margem.'
     ]
-    d['significa']='A equipe comercial mantém o relacionamento, mas deixa de carregar pedidos manuais repetitivos. O cliente ganha autonomia e a operação escala sem depender de mais visitas presenciais.'
+    d['conta']=('Cada pedido que entra por WhatsApp, telefone ou e-mail consome de 30 a 45 minutos entre '
+                'digitar, conferir a tabela do cliente e lançar no ERP. Multiplicado pela recompra recorrente '
+                'da base, isso vira um custo administrativo que cresce junto com o faturamento — sem gerar margem '
+                'nova. É vendedor caro fazendo trabalho de digitador em vez de abrir conta e ampliar carteira.')
+    d['significa']=('Com um canal digital próprio, o time comercial mantém o relacionamento e a negociação, mas '
+                    'para de carregar pedido manual: a recompra recorrente passa a entrar sozinha, com a tabela e o '
+                    'limite de cada cliente direto do ERP, e a operação escala sem precisar contratar mais gente para o telefone.')
     d['detalhe']=research['motivo']
     html=gen_module.build_html(d).replace('A confirmar','Estimativa: não informado')
     html_path=MOTOR/f"{d['slug']}.html"; html_path.write_text(html, encoding='utf-8')
@@ -2330,6 +3730,7 @@ def save_research(email, lead, research):
     (PESQ/(research['slug']+'.md')).write_text('\n'.join([
       f"# {lead.get('company') or (lead.get('properties') or {}).get('company')}",
       f"Email: {email}", f"Empresa real: {research['empresa_real']}", f"Domínio/site: {research['dominio_site']}", f"Redes: {research['redes']}", f"Segmento: {research['segmento']}", f"MQL: {research['mql']}", f"Motivo: {research['motivo']}", f"Insight: {research['insight']}",
+      f"telefone_publico: {research.get('telefone_publico','')}", f"whatsapp_publico: {research.get('whatsapp_publico','')}",
     ]), encoding='utf-8')
     (PESQ/(research['slug']+'_hubspot.json')).write_text(json.dumps(lead, ensure_ascii=False, indent=2), encoding='utf-8')
 
@@ -2367,9 +3768,16 @@ def main():
         print('[SILENT]')
         return
     gate=json.loads(GATE.read_text())
-    reports=[]; envios=load_wpp(); processed=load_processed()
+    reports=[]; envios=load_wpp(); processed=load_processed(); cycle_seen_emails=set()
     for lead in gate.get('leads',[]):
         email=lead['email'].lower(); props=lead['properties']; cid=str(lead['id']); phone=lead.get('phone') or props.get('hs_searchable_calculated_phone_number') or props.get('phone')
+        if email in cycle_seen_emails:
+            reports.append(f'{email} | PULADO duplicado no mesmo gate')
+            continue
+        cycle_seen_emails.add(email)
+        # Override explícito/manual (Rafael/Marketing): precisa furar processed/Não-MQL
+        # anterior para gerar diagnóstico quando a classificação foi corrigida.
+        manual_hubspot_mql = lead.get('gate_trigger') == 'manual_hubspot_mql'
         r=RESEARCH.get(email)
         if not r:
             reports.append(f'{email} | ERRO sem pesquisa Claude')
@@ -2378,21 +3786,39 @@ def main():
         processed_at = processed.get(email)
         recent_at = parse_hs_dt(props.get('recent_conversion_date'))
         created_at = parse_hs_dt(props.get('createdate') or lead.get('createdate'))
-        is_reentry = bool(recent_at and created_at and (recent_at - created_at).total_seconds() > 300 and (processed_at is None or recent_at > processed_at))
+        is_reentry = manual_hubspot_mql or bool(recent_at and created_at and (recent_at - created_at).total_seconds() > 300 and (processed_at is None or recent_at > processed_at) and is_form_reentry_event(props))
         if email in processed and not is_reentry:
             continue
         # Crivo Rafael: pesquisa pode sugerir MQL, mas o script só marca MQL se passar
         # ICP T1 B2B de alto giro/abastecimento (indústria/distribuidor/importador/atacado
-        # vendendo para revendas/lojas/clientes recorrentes). Fail-closed.
-        strict_ok, strict_reason = strict_icp_check(props, r) if r.get('mql') else (False, 'pesquisa classificou como não-MQL')
-        if r.get('mql') and not strict_ok:
+        # vendendo para revendas/lojas/clientes recorrentes).
+        # Exceção Rafael 28/06: MQL manual/humano recente no HubSpot vence o crivo.
+        # MQL antigo/herdado de entrada NÃO vence sozinho: muitos contatos históricos
+        # já aparecem com lifecyclestage=MQL/sourceType=AUTOMATION_PLATFORM, mesmo sem
+        # existir automação ativa hoje ou aprovação manual recente de Rafael/Marketing.
+        hubspot_lifecycle_mql = (props.get('lifecyclestage') or '').strip().lower() == 'marketingqualifiedlead'
+        hubspot_mql_authority = manual_hubspot_mql
+        if hubspot_mql_authority:
             r = dict(r)
-            r['mql'] = False
-            r['motivo'] = (r.get('motivo') or '') + f' | Reprovado no crivo MQL acirrado: {strict_reason}'
-            r['insight'] = ''
+            r['mql'] = True
+            r['motivo'] = (r.get('motivo') or '') + ' | HubSpot MQL manual recente: análise prévia do time; seguir diagnóstico.'
+        strict_ok, strict_reason = (True, 'HubSpot MQL manual recente') if hubspot_mql_authority else (strict_icp_check(props, r) if r.get('mql') else (False, 'pesquisa classificou como não-MQL'))
+        if r.get('mql') and not strict_ok:
+            # Falha de segurança: se a pesquisa pública classificou como MQL mas o
+            # crivo determinístico não reconheceu o vocabulário, NÃO transformar em
+            # Não-MQL e avisar o grupo. Isso causou Evermax: distribuidora clara
+            # desde 1997, mas o crivo não entendia autopeças/postos/frotas como
+            # reposição B2B. Melhor ficar sem ação e pedir revisão do que anunciar
+            # Não-MQL incorreto para o time.
+            reports.append(f"{r.get('slug') or email} | DIVERGÊNCIA MQL vs crivo | pesquisa pública indica MQL, mas strict_icp_check bloqueou: {strict_reason} | não enviei lead nem avisei grupo; exige revisão/ajuste de vocabulário")
+            continue
         elif r.get('mql'):
             r = dict(r)
             r['motivo'] = (r.get('motivo') or '') + f' | Crivo MQL acirrado: {strict_reason}'
+        conflict = prior_classification_conflict(envios, email, 'mql' if r.get('mql') else 'nao_mql', manual_hubspot_mql=hubspot_mql_authority)
+        if conflict:
+            reports.append(f"{r.get('slug') or email} | CONFLITO CLASSIFICAÇÃO | {conflict} | não enviei nada; exige revisão manual explícita")
+            continue
         # Qualificação e lifecycle rápido
         lifecycle_before=(props.get('lifecyclestage') or '')
         lifecycle_mark='não'
@@ -2413,6 +3839,19 @@ def main():
         owner, business_owner_notes = resolve_business_owner(cid, deals, contact_owner)
         owner_actions += business_owner_notes
         company=(props.get('company') or lead.get('company') or r.get('empresa_real') or '').strip()
+        if r['mql']:
+            recent_blocked, recent_reason = recent_prior_operational_diagnosis(envios, email=email, phone=phone, contact_id=cid)
+            if recent_blocked:
+                note = (f"Lead voltou para análise MQL, mas já houve WhatsApp operacional recente para este contato/telefone.\n"
+                        f"Motivo do bloqueio: {recent_reason}.\n\n"
+                        "Não enviei novo diagnóstico/PDF para não repetir abordagem. Revisar histórico e seguir como handoff humano/Retorno Contato se fizer sentido.")
+                try:
+                    create_task(cid, deals, "Revisar reentrada MQL com diagnóstico recente", note, owner or None)
+                except Exception as e:
+                    owner_actions.append(f"não consegui criar task de revisão de diagnóstico recente: {str(e)[:160]}")
+                append_processed(email, r['slug'], 'mql_bloqueado_diagnostico_recente', phone, company)
+                reports.append(f"{r['slug']} | MQL sim | PULADO diagnóstico/PDF: {recent_reason}; criei/solicitei revisão humana; sem WhatsApp ao lead")
+                continue
         if not r['mql']:
             # Não-MQL: avisa o grupo SEMPRE pela Mariana/porta 4600, ignorando o hubspot_owner_id do lead.
             invalid_stage_actions = []
@@ -2428,6 +3867,9 @@ def main():
             if not ok:
                 reports.append(f"{r['slug']} | MQL não | lifecycle não alterado | owner sync: {'; '.join(owner_actions)} | ERRO bridge institucional offline para grupo ({offline_detail or me})")
                 continue
+            hubspot_context_line = ''
+            if hubspot_lifecycle_mql and not manual_hubspot_mql:
+                hubspot_context_line = 'HubSpot: MQL antigo/herdado da entrada; não foi marcação manual recente do time.\n'
             text=(f"❌ Lead não qualificado\n"
                   f"Empresa: {company}\n"
                   f"Contato: {props.get('firstname') or ''}\n"
@@ -2435,9 +3877,18 @@ def main():
                   f"{group_erp_line(props)}"
                   f"Entrada: {fmt_created_brt(props.get('recent_conversion_date') or props.get('createdate') or lead.get('createdate'))}\n"
                   f"Criativo/origem: {traffic_creative_line(props)}\n"
+                  f"{hubspot_context_line}"
                   f"{invalid_stage_line}\n"
                   f"Por que não qualificou:\n{group_reason_bullets(r, mql=False)}\n\n"
                   f"Responsável: sem responsável comercial")
+            latest_envios = load_wpp()
+            group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=r['slug'])
+            if group_blocked:
+                reports.append(f"{r['slug']} | MQL não | PULADO grupo/idempotência: {group_reason}; sem contato ao lead")
+                envios = latest_envios
+                continue
+            append_group_inflight(latest_envios, email, r['slug'], contact_id=cid)
+            envios = latest_envios
             resp=post_bridge(port,'/send', {'to':GROUP,'text':text})
             # Task de não-MQL NÃO é atribuída ao SDR (owner do lead); usa o owner de notificação (Mariana).
             task_body = text + (("\n\nHubSpot: " + '; '.join(invalid_stage_actions)) if invalid_stage_actions else '')
@@ -2506,19 +3957,58 @@ def main():
                                    f"Por que qualificou:\n{group_reason_bullets(r, mql=True)}\n\n"
                                    f"Responsável: {OWNER_MAP.get(owner, {}).get('nome') or 'consultor responsável'}\n"
                                    f"Diagnóstico: pendente até confirmar WhatsApp válido")
+                    latest_envios = load_wpp()
+                    group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=r['slug'])
+                    if group_blocked:
+                        reports.append(f"{r['slug']} | MQL sim | telefone inválido/fixo | PULADO grupo/idempotência: {group_reason}")
+                        envios = latest_envios
+                        continue
+                    append_group_inflight(latest_envios, email, r['slug'], contact_id=cid)
+                    envios = latest_envios
                     resp=post_bridge(port,'/send', {'to':GROUP,'text':group_summary})
                     tid=create_task(cid, deals, "Qualificação Zydon — MQL com telefone inválido/fixo", group_summary + "\n\nHubSpot: " + '; '.join(invalid_stage_actions), owner or None)
                     append_processed(email, r['slug'], 'mql_telefone_invalido_grupo', phone, company)
                     envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':r['slug'], 'status':'mql_telefone_invalido_grupo', 'to':GROUP, 'bridge_port':port, 'owner_id':owner, 'phone':phone, 'phone_invalid_reason':invalid_reason, 'hubspot_invalid_stage_actions':invalid_stage_actions, 'public_phone_lookup':'not_found', 'group_summary':group_summary, 'response':resp, 'task_id':tid})
                     reports.append(f"{r['slug']} | MQL sim | lifecycle {lifecycle_mark} | telefone inválido/fixo | busca pública sem achado seguro | Leads Inválidos: {'; '.join(invalid_stage_actions)} | só-grupo")
                     continue
-        # MQL: gerar o PDF antes de decidir remetente para dar tempo da automação do HubSpot
-        # propagar hubspot_owner_id após lifecyclestage=MQL. Depois do PDF, reler owner.
+        # MQL confirmado: só agora pode nascer HTML/PDF do diagnóstico.
+        # A trava abaixo impede diagnóstico pré-MQL ou por lifecycle solto/manual sem contexto.
+        assert_mql_confirmed_for_diagnostic(lead, r, {'classification_state':'mql_confirmed_ready_for_diagnostic','mql_confirmed': True,'classification_reasons':[r.get('motivo') or 'MQL confirmado pelo gate']})
         slug,pdf,pretty=generate_pdf(lead, r, 'Zydon')
         # PDF gera um buffer inicial, mas nem sempre basta: aguardar explicitamente
         # a criação/atribuição do negócio para capturar o DONO DO NEGÓCIO e agenda correta.
         owner, deals, wait_owner_notes = wait_for_business_owner(cid, owner, timeout_sec=300, interval_sec=15)
         owner_actions += wait_owner_notes
+        if not has_known_sdr_owner(owner):
+            # Regra Rafael 29/06: MQL precisa ter SDR dono antes de qualquer
+            # WhatsApp externo. Sem Sarah/Breno/Lucas Batista resolvido no negócio,
+            # não pode cair em "consultor responsável" nem usar comunicador como dono.
+            first_parts = (props.get('firstname') or lead.get('firstname') or '').strip().split()
+            first = first_parts[0] if first_parts else 'Contato'
+            block_reason = 'sem SDR dono conhecido após aguardar criação/atribuição do negócio no HubSpot'
+            group_summary=(f"⚠️ MQL bloqueado: sem SDR dono\n\n"
+                           f"Empresa: {company}\n"
+                           f"Contato: {first}\n"
+                           f"Email: {email}\n"
+                           f"{group_erp_line(props)}"
+                           f"Entrada: {fmt_created_brt(props.get('recent_conversion_date') or props.get('createdate') or lead.get('createdate'))}\n"
+                           f"Criativo/origem: {traffic_creative_line(props)}\n\n"
+                           f"Por que qualificou:\n{group_reason_bullets(r, mql=True)}\n\n"
+                           f"Bloqueio: {block_reason}.\n"
+                           f"Ação necessária: atribuir o negócio a Sarah, Breno ou Lucas Batista antes de enviar diagnóstico ao lead.")
+            latest_envios = load_wpp()
+            group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=slug)
+            if group_blocked:
+                envios = latest_envios
+                reports.append(f"{slug} | MQL sim | BLOQUEADO sem SDR dono; grupo já avisado ({group_reason}); aguardando atribuição de SDR no HubSpot")
+                continue
+            append_group_inflight(latest_envios, email, slug, contact_id=cid)
+            envios = latest_envios
+            group_port, g_resp, _group_attempts = post_group_with_rotation(group_summary, envios)
+            tid=create_task(cid, deals, "MQL bloqueado — sem SDR dono no HubSpot", group_summary + "\n\nOwner sync: " + '; '.join(owner_actions), None)
+            envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'mql_bloqueado_sem_sdr_dono', 'to':GROUP, 'group_bridge_port': group_port, 'owner_id':owner, 'phone':phone, 'empresa':company, 'reason':block_reason, 'owner_sync_notes':owner_actions, 'group_summary':group_summary, 'group_summary_response':g_resp, 'task_id':tid, 'pdf_path': str(pretty)})
+            reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | BLOQUEADO sem SDR dono: {'; '.join(owner_actions)}")
+            continue
         # Regra Rafael 23/06:
         # - Em horário comercial BRT (seg-sex 07:00-18:00), se o lead já tiver SDR dono,
         #   o diagnóstico para o LEAD sai pelo telefone do SDR dono para evitar duas pessoas
@@ -2528,38 +4018,51 @@ def main():
         # - O GRUPO sempre recebe alerta pela rotação institucional.
         hubspot_owner_info=OWNER_MAP.get(owner)
         original_sdr = hubspot_owner_info['nome'] if hubspot_owner_info else None
-        use_sdr_for_lead = bool(hubspot_owner_info) and is_work_hours_brt()
-        if use_sdr_for_lead:
-            lead_owner_info=hubspot_owner_info
-            port, ok, me, offline_detail = pick_online_port(lead_owner_info, envios)
-            if ok:
-                owner_info=lead_owner_info; sdr=owner_info['nome']; consultant_fallback=False
-                # Quando o diagnóstico sai pelo próprio SDR dono, a mensagem deve falar em
-                # primeira pessoa ("eu te chamo/sigo contigo"), porque quem escreve já é o SDR.
-                # Só comunicadores institucionais (Mariana/Lucas Resende/Rafael) devem dizer
-                # que Sarah/Breno/Lucas Batista vai chamar.
-                fallback_note=f'envio ao lead pelo SDR dono em horário comercial BRT; grupo institucional; texto em 1ª pessoa do próprio SDR'
+        force_bridge_port = lead.get('force_bridge_port')
+        if force_bridge_port:
+            # Conversas reclassificadas de Não-MQL devem continuar no mesmo
+            # comunicador/chip que já falou com o lead. O SDR dono continua sendo
+            # usado para agenda e task, mas o remetente não troca sem necessidade.
+            forced = int(force_bridge_port)
+            inst_info = INSTITUTIONAL_PORTS.get(forced, DEFAULT_OWNER)
+            owner_info = {**DEFAULT_OWNER, **inst_info, 'porta': forced, 'portas': [forced]}
+            sdr = owner_info['nome']
+            port, ok, me, offline_detail = pick_online_port(owner_info, envios)
+            consultant_fallback = True
+            fallback_note = f'owner HubSpot: {original_sdr}; envio ao lead mantido no mesmo comunicador/porta {forced}'
+        else:
+            use_sdr_for_lead = bool(hubspot_owner_info) and is_work_hours_brt()
+            if use_sdr_for_lead:
+                lead_owner_info=hubspot_owner_info
+                port, ok, me, offline_detail = pick_online_port(lead_owner_info, envios)
+                if ok:
+                    owner_info=lead_owner_info; sdr=owner_info['nome']; consultant_fallback=False
+                    # Quando o diagnóstico sai pelo próprio SDR dono, a mensagem deve falar em
+                    # primeira pessoa ("eu te chamo/sigo contigo"), porque quem escreve já é o SDR.
+                    # Só comunicadores institucionais (Mariana/Lucas Resende/Rafael) devem dizer
+                    # que Sarah/Breno/Lucas Batista vai chamar.
+                    fallback_note=f'envio ao lead pelo SDR dono em horário comercial BRT; grupo institucional; texto em 1ª pessoa do próprio SDR'
+                else:
+                    # Regra Rafael 24/06: nossos telefones/institucionais só entram em fallback.
+                    # Se o SDR dono estiver offline no horário comercial, usar rotação institucional
+                    # explicitamente registrada como fallback (não como rota principal).
+                    owner_info=DEFAULT_OWNER; sdr=owner_info['nome']
+                    port, ok, me, offline_detail = pick_online_port(owner_info, envios)
+                    if ok:
+                        inst_info = INSTITUTIONAL_PORTS.get(port, {'nome':'Institucional', 'assinatura':owner_info['assinatura']})
+                        owner_info = {**owner_info, **inst_info, 'porta': port}
+                        sdr = owner_info['nome']
+                    consultant_fallback=True
+                    fallback_note=f'FALLBACK institucional: SDR dono {original_sdr} offline/indisponível em horário comercial ({offline_detail or me})'
             else:
-                # Regra Rafael 24/06: nossos telefones/institucionais só entram em fallback.
-                # Se o SDR dono estiver offline no horário comercial, usar rotação institucional
-                # explicitamente registrada como fallback (não como rota principal).
                 owner_info=DEFAULT_OWNER; sdr=owner_info['nome']
                 port, ok, me, offline_detail = pick_online_port(owner_info, envios)
                 if ok:
                     inst_info = INSTITUTIONAL_PORTS.get(port, {'nome':'Institucional', 'assinatura':owner_info['assinatura']})
-                    owner_info = {**owner_info, **inst_info, 'porta': port}
+                    owner_info = {**DEFAULT_OWNER, **inst_info, 'porta': port}
                     sdr = owner_info['nome']
+                fallback_note=f'owner HubSpot: {original_sdr}; envio ao lead pela rotação institucional' if original_sdr else 'envio ao lead pela rotação institucional'
                 consultant_fallback=True
-                fallback_note=f'FALLBACK institucional: SDR dono {original_sdr} offline/indisponível em horário comercial ({offline_detail or me})'
-        else:
-            owner_info=DEFAULT_OWNER; sdr=owner_info['nome']
-            port, ok, me, offline_detail = pick_online_port(owner_info, envios)
-            if ok:
-                inst_info = INSTITUTIONAL_PORTS.get(port, {'nome':'Institucional', 'assinatura':owner_info['assinatura']})
-                owner_info = {**owner_info, **inst_info, 'porta': port}
-                sdr = owner_info['nome']
-            fallback_note=f'owner HubSpot: {original_sdr}; envio ao lead pela rotação institucional' if original_sdr else 'envio ao lead pela rotação institucional'
-            consultant_fallback=True
         if not ok:
             reports.append(f"{r['slug']} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado: {'; '.join(owner_actions)} | ERRO sem remetente online para lead ({offline_detail or me})")
             continue
@@ -2570,18 +4073,44 @@ def main():
         thumb=gen_thumb(pdf, slug)
         greeting=br_greeting(); timing=timing_first_person(); first=(props.get('firstname') or lead.get('firstname') or '').strip().split()
         first = first[0] if first else ''
-        if consultant_fallback:
-            timing=fallback_timing_for_owner(original_sdr)
-        agenda_url = (hubspot_owner_info or {}).get('agenda')
-        agenda_line = f"\nSe quiser adiantar e já garantir o melhor horário para atendimento, pode marcar direto aqui: {agenda_url}" if agenda_url else ''
+        high_aware_msg, _ha_terms_msg = detect_high_awareness_origin(props=props, research=r)
+        intent_question = sdr_opening_question(high_aware_msg)
         greeting_line = f"{greeting}, {first}, tudo bem?" if first else f"{greeting}, tudo bem?"
-        msg=(f"{greeting_line} {owner_info['assinatura']}.\n"
-             f"Fizemos uma leitura da operação da {company} e montei um diagnóstico em PDF com oportunidades bem práticas de digitalização B2B.\n"
-             f"O ponto que mais chamou atenção foi: dá pra {r['insight']}.\n"
-             f"Te mandei o PDF aqui porque acho que vai fazer sentido para vocês. {timing} para conversar sobre isso e ver onde está o maior ganho. Pode ser?{agenda_line}")
+        agenda_msg = agenda_followup_for_lead(consultant_fallback, owner)
+        msg=(f"{greeting_line} {owner_info['assinatura']}.\n\n"
+             f"Fiz uma análise prévia do potencial da digitalização B2B do seu negócio.")
         (PESQ/(slug+'_msg.txt')).write_text(msg, encoding='utf-8')
         phone_variants = phone_variants_with_optional_9(phone) or [only_digits(phone)]
         jid = jid_from_phone(phone_variants[0])
+        # Idempotência final imediatamente antes do primeiro WhatsApp externo.
+        # Recarrega o ledger para enxergar outro ciclo/processo que tenha começado
+        # a cadência enquanto este gerava PDF/aguardava owner. Isso evita duplicar
+        # texto/PDF em reentradas de formulário ou gate com item repetido.
+        latest_envios = load_wpp()
+        already_mql, already_reason = existing_mql_outreach(latest_envios, email=email, phone=phone, jid=jid, contact_id=cid)
+        if already_mql:
+            reports.append(f"{slug} | MQL sim | PULADO idempotência antes do WhatsApp: {already_reason}")
+            continue
+        primary_deal_id = str(deals[0]) if deals else ''
+        dedupe_ok, dedupe_reason = can_send_diagnostic(contact_id=cid, deal_id=primary_deal_id, phone=phone, email=email, company=company)
+        if not dedupe_ok:
+            reports.append(f"{slug} | MQL sim | PULADO dedupe forte antes do WhatsApp: {dedupe_reason}")
+            continue
+        queue_item, _queue_created = upsert_and_save({
+            'contact_id': cid,
+            'deal_id': primary_deal_id,
+            'email': email,
+            'phone_norm': only_digits(phone),
+            'company': company,
+            'source': lead.get('gate_trigger') or props.get('hs_object_source') or props.get('hs_latest_source') or 'gate',
+            'owner_id': owner,
+            'owner_name': original_sdr or sdr,
+            'status': 'mql_confirmed',
+            'classification': {'mql': True, 'reason': r.get('motivo') or '', 'evidence': ['formulario', 'site/pesquisa']},
+            'dedupe_keys': dedupe_keys(contact_id=cid, deal_id=primary_deal_id, phone=phone, email=email),
+        })
+        append_mql_inflight(latest_envios, email, slug, jid, port, owner, phone, company, contact_id=cid)
+        envios = latest_envios
         resp1, lead_text_attempts = post_bridge_with_retries(port,'/send', {'to':jid,'text':msg}, attempts=3, delay=12)
         if not message_ok(resp1) and len(phone_variants) > 1:
             variant_errors = [{'jid': jid, 'resp': resp1}]
@@ -2617,21 +4146,47 @@ def main():
                 port = inst_port
                 sdr = owner_info['nome']
                 fallback_note = (fallback_note + f'; fallback institucional após falha no envio SDR: {fallback_resp}') if fallback_note else f'fallback institucional após falha no envio SDR: {fallback_resp}'
-                timing = fallback_timing_for_owner(original_sdr)
-                msg=(f"{greeting_line} {owner_info['assinatura']}.\n"
-                     f"Fizemos uma leitura da operação da {company} e montei um diagnóstico em PDF com oportunidades bem práticas de digitalização B2B.\n"
-                     f"O ponto que mais chamou atenção foi: dá pra {r['insight']}.\n"
-                     f"Te mandei o PDF aqui porque acho que vai fazer sentido para vocês. {timing} para conversar sobre isso e ver onde está o maior ganho. Pode ser?{agenda_line}")
+                agenda_msg = agenda_followup_for_lead(True, owner)
+                msg=(f"{greeting_line} {owner_info['assinatura']}.\n\n"
+                     f"Fiz uma análise prévia do potencial da digitalização B2B do seu negócio.")
                 (PESQ/(slug+'_msg.txt')).write_text(msg, encoding='utf-8')
                 resp1, fallback_text_attempts = post_bridge_with_retries(port,'/send', {'to':jid,'text':msg}, attempts=2, delay=10)
         if not message_ok(resp1):
             reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado | ERRO texto lead sem messageId/status: {resp1}"); continue
-        # Rafael pediu em 24/06: deixar o envio parecer natural.
-        # Primeiro manda o texto, espera pelo menos 1 minuto, depois manda o PDF.
-        time.sleep(60)
+        # Rafael pediu: cadência natural em quatro passos.
+        # 1) texto curto sem pergunta, 2) após 1 minuto manda PDF,
+        # 3) 30s depois do PDF manda a pergunta oficial,
+        # 4) só 20 minutos depois manda agenda/continuidade do SDR.
+        time.sleep(TEXT_TO_PDF_DELAY_SECONDS)
         resp2, lead_file_attempts = post_bridge_with_retries(port,'/send-file', {'to':jid,'filePath':pretty,'fileName':f'{company} - Potencial de Digitalizacao B2B.pdf','thumbnailPath':thumb}, attempts=3, delay=12)
         if not message_ok(resp2):
             reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado | ERRO PDF lead sem messageId/status após retentativas: {lead_file_attempts}"); continue
+        try:
+            q = load_queue()
+            mark_step(q, queue_item['execution_id'], 'pdf_generated', 'done', path=str(pretty))
+            mark_step(q, queue_item['execution_id'], 'whatsapp_sent', 'done', chip=port, jid=jid, response=resp2)
+            save_queue(q)
+        except Exception as e:
+            owner_actions.append(f"fila de garantia: não consegui marcar PDF/WhatsApp enviados: {str(e)[:120]}")
+        pdf_sent_at = datetime.now(timezone.utc)
+        time.sleep(PDF_TO_QUESTION_DELAY_SECONDS)
+        replied_before_question, replies_before_question = lead_replied_after(port, jid, pdf_sent_at)
+        question_attempts = []
+        if replied_before_question:
+            resp_question = {'skipped': True, 'reason': 'lead_replied_before_question', 'replies': replies_before_question}
+            question_sent_at = pdf_sent_at
+        else:
+            question_sent_at = datetime.now(timezone.utc)
+            resp_question, question_attempts = post_bridge_with_retries(port, '/send', {'to': jid, 'text': intent_question}, attempts=3, delay=12)
+            if not message_ok(resp_question):
+                reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado | ERRO pergunta lead sem messageId/status: {question_attempts}"); continue
+        time.sleep(QUESTION_TO_AGENDA_DELAY_SECONDS)
+        replied, replies = lead_replied_after(port, jid, question_sent_at)
+        agenda_attempts = []
+        if replied or replied_before_question:
+            resp3 = {'skipped': True, 'reason': 'lead_replied_before_agenda', 'replies': (replies_before_question if replied_before_question else replies)}
+        else:
+            resp3, agenda_attempts = post_bridge_with_retries(port, '/send', {'to': jid, 'text': agenda_msg}, attempts=3, delay=12)
         # grupo: NÃO recebe o texto do lead nem PDF — apenas resumo curto de status (sem send-file)
         group_summary=(f"✅ Lead qualificado\n"
                        f"Empresa: {company}\n"
@@ -2642,12 +4197,24 @@ def main():
                        f"Criativo/origem: {traffic_creative_line(props)}\n\n"
                        f"Por que qualificou:\n{group_reason_bullets(r, mql=True)}\n\n"
                        f"Responsável: {original_sdr or 'consultor responsável'}\n"
-                       f"Diagnóstico enviado por: {sdr}")
-        group_port, g_resp, group_attempts = post_group_with_rotation(group_summary, envios)
+                       f"Diagnóstico enviado por: {sdr}\n"
+                       f"Cadência: texto curto, PDF após 1 min, pergunta após 30s, agenda após 20 min")
+        latest_envios = load_wpp()
+        group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=slug)
+        if group_blocked:
+            group_port, g_resp, group_attempts = None, {'skipped': True, 'reason': group_reason}, []
+        else:
+            append_group_inflight(latest_envios, email, slug, contact_id=cid)
+            envios = latest_envios
+            group_port, g_resp, group_attempts = post_group_with_rotation(group_summary, envios)
         # Upload no HubSpot usa o arquivo canônico sem acentos/espaços no nome.
         # O arquivo bonito (`pretty`) continua sendo usado só no WhatsApp para o lead.
         file_id, upload_err = upload_pdf_to_hubspot(pdf, slug)
-        task_body = f'Enviado texto + PDF para {jid} pela porta {port} ({sdr}).'
+        task_body = f'Enviado texto + PDF para {jid} pela porta {port} ({sdr}). Cadência: texto, PDF após 1 min, pergunta após 30s e agenda após 20 min.'
+        if resp3.get('skipped'):
+            task_body += f"\nAgenda automática após 20 min NÃO enviada porque o lead respondeu antes. Continuar a conversa pelo contexto da resposta. Respostas detectadas: {json.dumps(resp3.get('replies') or [], ensure_ascii=False)}"
+        else:
+            task_body += ' Agenda enviada após 20 min.'
         file_url = hubspot_file_url(file_id) if file_id else ''
         if file_id:
             task_body += f'\nPDF do diagnóstico: {file_url}' if file_url else ''
@@ -2655,8 +4222,19 @@ def main():
         elif upload_err:
             task_body += f'\nPDF salvo local/Drive, mas não anexado no HubSpot: {upload_err}.'
         tid=create_task(cid, deals, "WhatsApp — Diagnóstico 'Potencial de Digitalização B2B' enviado ao lead.", task_body, owner or None, [file_id] if file_id else None)
+        try:
+            q = load_queue()
+            if file_id:
+                mark_step(q, queue_item['execution_id'], 'hubspot_attached', 'done', file_id=file_id, task_id=tid)
+            elif upload_err:
+                mark_step(q, queue_item['execution_id'], 'hubspot_attached', 'failed', error=upload_err, task_id=tid)
+            if group_port or (isinstance(g_resp, dict) and g_resp.get('skipped')):
+                mark_step(q, queue_item['execution_id'], 'group_notified', 'done' if group_port else 'skipped_duplicate', group_bridge_port=group_port, response=g_resp)
+            save_queue(q)
+        except Exception as e:
+            owner_actions.append(f"fila de garantia: não consegui marcar HubSpot/grupo: {str(e)[:120]}")
         append_processed(email, slug, 'enviado_lead', phone, company)
-        envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'enviado_lead', 'to':jid, 'group':GROUP, 'bridge_port':port, 'group_bridge_port': group_port if 'group_port' in locals() else None, 'owner_id':owner, 'fallback_note': fallback_note, 'text': msg, 'group_summary': group_summary, 'pdf_path': str(pretty), 'hubspot_file_id': file_id, 'hubspot_file_error': upload_err, 'text_response':resp1, 'file_response':resp2, 'group_summary_response':g_resp, 'task_id':tid})
+        envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'enviado_lead', 'to':jid, 'group':GROUP, 'bridge_port':port, 'group_bridge_port': group_port if 'group_port' in locals() else None, 'owner_id':owner, 'fallback_note': fallback_note, 'text': msg, 'question_text': intent_question, 'agenda_text': agenda_msg, 'cadence': {'text_to_pdf_seconds': TEXT_TO_PDF_DELAY_SECONDS, 'pdf_to_question_seconds': PDF_TO_QUESTION_DELAY_SECONDS, 'question_to_agenda_seconds': QUESTION_TO_AGENDA_DELAY_SECONDS}, 'group_summary': group_summary, 'pdf_path': str(pretty), 'hubspot_file_id': file_id, 'hubspot_file_error': upload_err, 'text_response':resp1, 'file_response':resp2, 'question_response':resp_question, 'agenda_response':resp3, 'group_summary_response':g_resp, 'task_id':tid})
         reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado: {'; '.join(owner_actions)} | disparado ({sdr}/porta {port})" + (f" | {fallback_note}" if fallback_note else ""))
         time.sleep(1)
     save_wpp(envios)
