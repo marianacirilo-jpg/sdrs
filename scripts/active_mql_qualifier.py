@@ -190,6 +190,11 @@ def upsert_pipeline(contact, state, reason, site):
     items = data.setdefault('items', [])
     key = f"{email}|{p.get('recent_conversion_date') or p.get('createdate') or ''}"
     existing = next((x for x in items if x.get('key') == key), None)
+    # Sem ruído: se o candidato já foi registrado igual, manter o estado e não
+    # imprimir de novo a cada minuto. Só há novidade quando é item novo ou mudou
+    # state/reason/site_summary.
+    if existing and existing.get('state') == state and existing.get('reason') == reason and existing.get('site_summary') == site.get('summary'):
+        return False
     row = existing or {'key': key, 'events': []}
     row.update({
         'updated_at': now_iso_brt(),
