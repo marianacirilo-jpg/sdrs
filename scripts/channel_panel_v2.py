@@ -3504,7 +3504,10 @@ def collapse_automation(msgs):
             # Para PDF de diagnóstico, a mídia é a identidade; texto do ledger não
             # deve criar uma segunda bolha (incidente Schutzmann 29/06).
             if _is_diagnostic_pdf_message(m):
-                ck=(canonical_chat_for_message(m), '', _media_key(m) or 'diagnostic-pdf')
+                # Não usar nome/caminho como chave: o real vem com mediaName/mediaPath
+                # da bridge e o ledger pode vir só com pdf_path/texto. Para diagnóstico,
+                # a identidade correta é "houve um PDF de diagnóstico neste chat".
+                ck=(canonical_chat_for_message(m), '', 'diagnostic-pdf')
             else:
                 ck=(canonical_chat_for_message(m), _norm_text(m.get('text')), _media_key(m))
             minute=int(float(m.get('timestamp') or 0)//60)

@@ -1248,6 +1248,28 @@ class ChannelV2CoreTests(unittest.TestCase):
         self.assertEqual(pdfs[0]['id'], '3EB05E3B7DA0D86D534ABA')
         self.assertNotIn('PDF enviado:', pdfs[0].get('text') or '')
 
+    def test_real_pdf_and_ledger_pdf_path_without_media_name_collapse_to_one_bubble(self):
+        real_pdf = {
+            'type': 'api-send', 'fromMe': True, 'chat': '5511981839853@s.whatsapp.net',
+            'id': '3EB05E3B7DA0D86D534ABA', 'timestamp': 1782774136,
+            'mediaType': 'document', 'mimetype': 'application/pdf',
+            'mediaName': 'Schutzmann - Potencial de Digitalizacao B2B.pdf',
+        }
+        # Caso real Schutzmann: o ledger final tinha pdf_path, mas não mediaName.
+        synthetic_pdf = {
+            'type': 'seed-wpp-envios', 'fromMe': True, 'chat': '5511981839853@c.us',
+            'id': 'wpp_envios:5511981839853@c.us:1782774300',
+            'timestamp': 1782774300,
+            'text': 'PDF enviado: Schutzmann - Potencial de Digitalizacao B2B.pdf',
+            'pdf_path': '/root/.hermes/zydon-prospeccao/pdfs/Schutzmann - Potencial de Digitalizacao B2B.pdf',
+            'status': 'enviado_lead',
+        }
+        collapsed = self.mod.collapse_automation([real_pdf, synthetic_pdf])
+        pdfs = [m for m in collapsed if self.mod._is_diagnostic_pdf_message(m)]
+        self.assertEqual(len(pdfs), 1)
+        self.assertEqual(pdfs[0]['id'], '3EB05E3B7DA0D86D534ABA')
+        self.assertNotIn('PDF enviado:', pdfs[0].get('text') or '')
+
     def test_inbox_list_is_paginated_for_mobile_performance(self):
         s = MODULE_PATH.read_text(encoding='utf-8')
         self.assertIn('const LIST_PAGE_SIZE=60', s)
