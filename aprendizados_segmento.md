@@ -73,3 +73,47 @@
 - Distribuidor/revenda técnica de talhas, guinchos, acessórios e peças de reposição pode ser ICP T1 quando há loja virtual com catálogo, preço e pedido online, mesmo sem respostas completas no formulário.
 - Sinal forte: venda B2B para linhas de produção/manutenção industrial + reposição de acessórios/peças; oportunidade de digitalizar consulta de catálogo, preço e disponibilidade para reduzir cotações manuais por telefone/WhatsApp.
 - Atenção de dados: telefone do formulário veio como PABX/fixo; loja virtual revelou WhatsApp Business corporativo seguro, que deve ser priorizado e registrado como fonte pública.
+
+
+## 2026-06-26 — Marmoraria/ferramentas marketplace — Makidu
+- Não-MQL: marketplace de ferramentas diamantadas para marmorarias, sem evidência de canal atacadista/distribuidor/indústria vendendo para revendas ou estoque recorrente.
+- Olist/Tiny e loja online aceleram somente quando o ICP é claro; neste caso não substituíram a ausência de canal B2B T1.
+
+## 2026-06-26 — Projetos industriais sob medida / máquinas especiais — Carmec Soluções Industriais
+- Não-MQL: empresa B2B industrial real, com site, WhatsApp público e clientes industriais, mas o modelo público é engenharia sob encomenda, manutenção, usinagem e fabricação de máquinas/dispositivos especiais.
+- Indústria de bens de capital/projeto técnico não deve ser qualificada só por ser “industrial”: sem catálogo recorrente, tabela de preço, reposição de estoque ou canal para revendas/lojistas, fica fora do ICP T1 acirrado.
+- Sinais reforçadores de reprovação: faturamento até R$250 mil/ano, 1 a 10 pessoas, venda por boca a boca/indicação e ERP “Outro”; telefone válido não altera a qualificação.
+
+## 2026-06-26 — Serviços financeiros/consultoria — Schutzmann
+- Não-MQL: site, LinkedIn e cadastros públicos confirmam Schutzmann como serviços financeiros/consultoria em câmbio, energia, precatórios e investimentos, não operação de restaurantes/atacado/distribuição.
+- ERP nativo (Bling), loja virtual e venda por vendedores no formulário não substituem evidência de ICP T1; quando a presença pública aponta serviço/consultoria e não produto físico recorrente para revendas/lojistas, manter fail-closed.
+- Campo “Restaurantes” sem prova operacional pública deve ser tratado como dado insuficiente/possível ruído, não como base para marcar MQL.
+
+
+## 2026-06-27 07:03 — Paisagismo/serviços ambientais — Romano Verde
+- Não-MQL pelo crivo acirrado: serviço/projeto de paisagismo, jardinagem, urbanismo e consultoria ambiental, sem canal claro de revenda/lojistas ou abastecimento recorrente de estoque.
+- Formulário B2B/loja virtual pode indicar interesse digital, mas sem evidência de produto físico de catálogo e recompra B2B não deve acionar diagnóstico.
+
+## 2026-06-27 12:20 — Distribuição veterinária/pet — Vetfarm
+- MQL: distribuidora atacadista de produtos veterinários com CNPJ, diretórios setoriais e redes públicas confirmando atendimento a clínicas veterinárias e pet shops em Sergipe.
+- Mesmo com ERP “Outro”, sem loja virtual e equipe pequena no formulário, o canal B2B de clínicas/pet shops + faturamento R$1–5M + pedido desorganizado por WhatsApp sustentam potencial de catálogo, preço, disponibilidade e reposição recorrente.
+- Atenção de crivo: termos “petshop” isolados podem parecer varejo; validar se é distribuidora/atacadista e se atende clínicas, lojas/lojistas e revendas antes de reprovar.
+## 2026-06-27 — Indústria de dermocosméticos com revenda (BellaPhytus)
+- Indústria própria de cosméticos/dermocosméticos pode ser MQL T1 quando a pesquisa pública mostra fabricação própria, CNPJ industrial, loja oficial e sinais de revenda/atacado para farmácias, lojas de produtos naturais e distribuidoras.
+- Olist/Tiny + loja virtual + faturamento R$1–5M são aceleradores, mas a decisão veio do canal B2B/revenda e do produto consumível de recompra recorrente.
+- Insight útil: catálogo, preço e disponibilidade por ponto de venda para reposição de dermocosméticos reduz pedidos manuais e libera vendedor para abrir/reativar carteira.
+
+
+## 2026-06-27 23:18 — Trxas (não-MQL)
+- Segmento público: varejo/e-commerce de moda country/western; formulário divergente indicava petshop.
+- Aprendizado: ERP Bling + e-commerce pequeno não devem aprovar MQL se não houver revenda/atacado/distribuição/indústria clara.
+
+## 2026-06-28 10:56 — Software/ERP como fornecedor (Sankhya/Elaine)
+- Não-MQL: domínio corporativo e empresa real fortes, mas o segmento é fornecedor de software/ERP, não indústria/distribuidor/importador/atacado com produto físico recorrente.
+- Aprendizado: empresas de tecnologia que vendem para ICPs da Zydon não viram ICP automaticamente; quando o lead é fornecedor/parceiro/concorrente de software e não há formulário, dor operacional ou telefone, manter fail-closed e registrar só internamente.
+- Contatos vindos por Conversations sem telefone e sem vínculo operacional devem ser movidos/registrados como inválidos quando não houver negócio associado ou WhatsApp seguro.
+
+## 2026-06-29 07:03 — Serviços financeiros/meios de pagamento (MULVI PAY / Banese Card)
+- Não-MQL: mesmo com formulário B2B, faturamento alto e autosserviço, operação pública ligada a cartão/adquirência/meios de pagamento não é ICP T1 de indústria/distribuição/importação/atacado.
+- Aprendizado: clientes que “aceitam cartão” são base de estabelecimentos/serviços financeiros, não necessariamente revendas/lojistas abastecendo estoque; sem catálogo físico, tabela/preço e pedido recorrente de reposição, manter fail-closed.
+- Se o HubSpot já trouxer MQL herdado/antigo para esse perfil, não enviar diagnóstico automático; avisar internamente como não-MQL e preservar a auditoria da reentrada.

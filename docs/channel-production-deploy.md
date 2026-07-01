@@ -124,9 +124,23 @@ python3 /root/.hermes/scripts/zydon_channel_v2_security_heartbeat.py
 curl -s http://127.0.0.1:8791/health
 ```
 
+## Deploy seguro obrigatório
+
+Não editar/reiniciar diretamente o processo público enquanto SDRs estão usando o sistema. Antes de qualquer promoção, seguir `docs/channel-safe-deploy-runbook.md`:
+
+```bash
+cd /root/.hermes/zydon-prospeccao
+scripts/channel_v2_safe_deploy.sh stage
+# depois de aprovado:
+scripts/channel_v2_safe_deploy.sh promote /root/.hermes/zydon-prospeccao/controle/releases/channel-v2/<timestamp>
+```
+
+O stage sobe uma candidate em `127.0.0.1:8891` e valida APIs reais sem tocar no público. A promoção só troca o port público depois que a candidate estiver estável; falha de promoção aciona rollback.
+
 ## Importante
 
 - O app Python fica em localhost por segurança.
 - Nginx é quem recebe o tráfego público.
 - Não abrir túnel público sem login.
 - Não liberar token por URL para SDR em produção.
+- Claude Code não pode executar `promote`/`deploy` sozinho; ele só pode chegar até `stage` e reportar o release dir.

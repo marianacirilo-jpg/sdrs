@@ -17,7 +17,7 @@ PESQ = PROJ/'pesquisas'
 PDFS = PROJ/'pdfs'
 WA_DATA = pathlib.Path('/root/.hermes/whatsapp-extra/channel_data')
 WA_DATA.mkdir(parents=True, exist_ok=True)
-IMPORT_TYPES = {'cron-sdr-primeiro-contato','cron-mql-texto','cron-mql-pdf','cron-naomql-grupo','cron-whatsapp-texto','seed-wpp-envios'}
+IMPORT_TYPES = {'cron-sdr-primeiro-contato','cron-mql-texto','cron-mql-pdf','cron-naomql-grupo','cron-whatsapp-texto','cron-agenda-diagnostico-texto','cron-agenda-diagnostico-grupo','seed-wpp-envios'}
 GROUP = '120363408131718880@g.us'
 
 def load_wpp():
@@ -110,7 +110,9 @@ def primeiro_nome_valido(nome):
 
 def empresa_valida(empresa):
     empresa=(empresa or '').strip()
-    return '' if not empresa or empresa.lower() in ('sem nome','sem empresa','none') else empresa
+    empresa=re.sub(r'\s*[-–—]\s*nova\s+oportunidade\s*$', '', empresa, flags=re.I).strip()
+    empresa=re.sub(r'\s+', ' ', empresa).strip()
+    return '' if not empresa or empresa.lower() in ('sem nome','sem empresa','none','nova oportunidade') else empresa
 
 def escolher(sdr,nome,empresa,erp,total):
     return int(hashlib.sha256(f'{sdr}|{nome}|{empresa}|{erp}'.encode()).hexdigest()[:8],16)%total
@@ -202,6 +204,13 @@ def build_records(rows):
         if mt=='primeiro_contato':
             if not chat: continue
             out.append(mk(sdr_port(r), chat, ts, base_id+'_sdr_text', 'cron-sdr-primeiro-contato', text_for_sdr(r), **common))
+        elif str(r.get('campaign_id') or '') == 'diagnostico_agendado_grupo' or mt == 'diagnostico_agenda_aviso_grupo':
+            # Aviso interno no grupo operacional sobre agendamento; nunca é PDF/diagnóstico.
+            out.append(mk(group_port(r), norm_chat(r.get('to') or GROUP), ts, base_id+'_agenda_group', 'cron-agenda-diagnostico-grupo', str(r.get('text') or 'Diagnóstico agendado'), **common))
+        elif str(r.get('campaign_id') or '') == 'diagnostico_agendado' or mt.startswith('diagnostico_agenda'):
+            if not chat: continue
+            # Confirmação/lembrete de agenda é SOMENTE texto com link; nunca importar como diagnóstico/PDF.
+            out.append(mk(sdr_port(r), chat, ts, base_id+'_agenda_text', 'cron-agenda-diagnostico-texto', str(r.get('text') or 'Confirmação de agenda enviada'), **common))
         elif status in {'enviado_lead','enviado_mql'} or r.get('pdf_status') or r.get('file_response'):
             if not chat: continue
             p=sdr_port(r)

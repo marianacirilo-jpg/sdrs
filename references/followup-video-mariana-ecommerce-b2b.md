@@ -74,11 +74,13 @@ Regra obrigatória para comunicador:
 - se houver agenda individual do SDR disponível, preferir agenda;
 - se não houver agenda segura, usar WhatsApp do SDR.
 
-Telefones padrão dos SDRs:
+Telefones padrão dos SDRs para encaminhar ao lead devem ser os números dos chips que estão na automação/bridge:
 
-- Breno: `34 98447-2414`
-- Sarah: `34 98409-5632`
-- Lucas Batista: `34 98429-5409`
+- Breno: `34 8432-5076` (`553484325076`)
+- Sarah: `34 8409-5632` (`553484095632`)
+- Lucas Batista: `34 8429-5409` (`553484295409`)
+
+Não usar os números antigos de ligação (`34 98447-2414`, `34 98409-5632`, `34 98429-5409`) quando o lead pedir para falar com o SDR.
 
 Modelo de CTA quando é comunicador:
 

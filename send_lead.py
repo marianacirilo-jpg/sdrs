@@ -6,6 +6,8 @@ Le: pesquisas/<slug>_msg.txt e pdfs/Potencial-Digitalizacao-<slug>.pdf
 Gera thumbnail 600x338 JPEG q90 em /tmp.
 """
 import os, sys, json, re, subprocess, urllib.request, urllib.error
+sys.path.insert(0, '/root/.hermes/zydon-prospeccao/scripts')
+from whatsapp_safe_send import safe_post_bridge
 
 PROJ = "/root/zydon-prospeccao"
 BRIDGE = "http://127.0.0.1:4600"
@@ -112,11 +114,8 @@ def gen_thumbnail(pdf_path, slug):
     return thumb
 
 def post(path, payload):
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(BRIDGE + path, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read().decode()
+    port = int(BRIDGE.rsplit(':', 1)[-1])
+    return json.dumps(safe_post_bridge(port, path, payload, uid='send_lead', timeout=60), ensure_ascii=False)
 
 def main():
     slug = sys.argv[1]

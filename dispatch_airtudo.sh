@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# LEGACY_WHATSAPP_DIRECT_SEND_BLOCKED 2026-06-30
+# Este one-off antigo fazia curl direto em /send ou /send-file e não garante
+# PN/LID guard, auditoria, reconciliação nem visibilidade no app físico do chip.
+# Use scripts/whatsapp_safe_send.py via processo atual; não execute este arquivo.
+echo "BLOQUEADO: script legado de disparo direto. Use whatsapp_safe_send/process_gate_once." >&2
+exit 2
+
 # Disparo Airtudo: lead+grupo, MQL, atividade, registro. SEM deal (SEM_DEAL).
 set -uo pipefail
 cd /root/zydon-prospeccao

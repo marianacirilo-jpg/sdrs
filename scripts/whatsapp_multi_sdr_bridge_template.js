@@ -276,7 +276,7 @@ const server = http.createServer(async (req, res) => {
       let payload;
       if (p === '/send') {
         if (!body.text) return json(res, 400, { error: 'Missing text' });
-        payload = { text: String(body.text) };
+        payload = { text: String(body.text), linkPreview: body.linkPreview === false ? null : undefined };
       } else {
         if (!body.filePath) return json(res, 400, { error: 'Missing filePath' });
         const filePath = path.resolve(String(body.filePath));

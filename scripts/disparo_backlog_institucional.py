@@ -143,8 +143,10 @@ def clean_name(name):
 
 def empresa_valida(empresa):
     e = (empresa or '').strip()
+    e = re.sub(r'\s*[-–—]\s*nova\s+oportunidade\s*$', '', e, flags=re.I).strip()
+    e = re.sub(r'\s+', ' ', e).strip()
     low = e.lower()
-    if (not e or low in ('sem nome', 'none', 'null') or 'não usar' in low or 'nao usar' in low
+    if (not e or low in ('sem nome', 'none', 'null', 'nova oportunidade') or 'não usar' in low or 'nao usar' in low
             or 'uso iterno' in low or 'uso interno' in low or set(e) <= {'.', '-', '_', ' '} or e.startswith('@')):
         return ''
     return e

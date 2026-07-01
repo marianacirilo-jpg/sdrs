@@ -38,13 +38,23 @@ def _load_ledger(path: str | Path = DEFAULT_LEDGER) -> list[dict]:
     return [x for x in rows if isinstance(x, dict)] if isinstance(rows, list) else []
 
 
+def phone_variants(phone: str) -> set[str]:
+    k = only_digits(phone)
+    if k.startswith('55') and len(k) in (12, 13):
+        k = k[2:]
+    vals = {k} if k else set()
+    if len(k) == 11 and k[2] == '9':
+        vals.add(k[:2] + k[3:])
+    elif len(k) == 10 and k[2] in '6789':
+        vals.add(k[:2] + '9' + k[2:])
+    return {v for v in vals if v}
+
+
 def _row_phone_values(row: dict) -> set[str]:
     vals = set()
     for field in ('phone', 'telefone', 'to', 'jid', 'lead_jid'):
         raw = str(row.get(field) or '')
-        digits = only_digits(raw)
-        if digits:
-            vals.add(digits)
+        vals.update(phone_variants(raw))
     return vals
 
 
@@ -52,14 +62,14 @@ def _matches_ledger(row: dict, *, contact_id='', deal_id='', phone='', email='')
     email = str(email or '').strip().lower()
     contact_id = str(contact_id or '').strip()
     deal_id = str(deal_id or '').strip()
-    phone_norm = only_digits(phone)
+    phone_norms = phone_variants(phone)
     if email and str(row.get('email') or '').strip().lower() == email:
         return True, 'email'
     if contact_id and str(row.get('contact_id') or '').strip() == contact_id:
         return True, 'contact_id'
     if deal_id and str(row.get('deal_id') or '').strip() == deal_id:
         return True, 'deal_id'
-    if phone_norm and phone_norm in _row_phone_values(row):
+    if phone_norms and (phone_norms & _row_phone_values(row)):
         return True, 'telefone'
     return False, ''
 

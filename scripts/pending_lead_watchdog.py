@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Alert Discord when a new HubSpot form lead is pending diagnosis.
 
-This DOES NOT send WhatsApp, DOES NOT mark the lead as processed, and DOES NOT advance the MQL gate cutoff.
+WhatsApp group rule (Rafael 2026-06-28): do NOT alert the group at intake/queue time.
+The group is notified only by the final analysis step, after deciding MQL vs Não-MQL.
+This DOES NOT send WhatsApp to the lead, DOES NOT mark the lead as processed, and DOES NOT advance the MQL gate cutoff.
 It only writes controle/pending_lead_alerts.json to avoid duplicate Discord alerts.
 """
 from __future__ import annotations
@@ -105,10 +107,18 @@ def only_digits(x):
     return re.sub(r'\D', '', x or '')
 
 def is_landline_br(d):
-    # 55 + DDD + 8 digits, or DDD + 8 digits => likely landline. Mobile has 9 after DDD.
+    """Heurística conservadora: não chamar de inválido se o número pode ser WhatsApp.
+
+    Rafael mostrou caso real: 55 31 9962-6769 aparece no WhatsApp como
+    +55 31 99962-6769. Então DDD + 8 dígitos começando com 9 deve ser tratado
+    como celular antigo/normalizável, não como fixo.
+    """
     if len(d) == 12 and d.startswith('55'):
         d = d[2:]
-    return len(d) == 10
+    if len(d) == 10:
+        local = d[2:]
+        return not local.startswith('9')
+    return False
 
 def fmt_brt(s):
     try:
@@ -137,6 +147,34 @@ def mql_likely(p):
     people = p.get('quantas_pessoas_atuam_na_sua_empresa') or ''
     return strong_revenue or people in {'26_a_50','51_a_100','101_a_150','+151'}
 
+def is_test_or_internal_base(p):
+    """Base teste/admin interno não entra no alerta nem na qualificação."""
+    blob = ' '.join(str(p.get(k) or '') for k in (
+        'email','firstname','lastname','company','recent_conversion_event_name',
+        'hs_analytics_source','hs_analytics_source_data_1','hs_analytics_source_data_2',
+        'hs_latest_source','hs_latest_source_data_1','hs_latest_source_data_2',
+    )).lower()
+    return any(tok in blob for tok in (
+        'form admin', 'base teste', ' leo testes', 'leonardo tester',
+        'joao@empresa.com.br', 'empresa ltda.', 'empresa ltda', '+55(11) 99999-9999',
+    ))
+
+
+def is_form_signal(p, *, is_reentry=False):
+    """Alerta só o que parece form/lead ads. Bloqueia offline/conversa/agenda/teste."""
+    if is_test_or_internal_base(p):
+        return False
+    event = (p.get('recent_conversion_event_name') or '').strip().lower()
+    blocked = ('meeting', 'meetings link', 'agenda', 'calendly', 'conversation',
+               'conversations', 'whatsapp', 'whats app', 'chat', 'inbox', 'offline', 'interno')
+    if event:
+        return not any(tok in event for tok in blocked)
+    if is_reentry:
+        return False
+    source = (p.get('hs_object_source') or '').strip().upper()
+    source_label = (p.get('hs_object_source_label') or '').strip().upper()
+    return source == 'FORM' or source_label in {'FORM', 'FORMS'}
+
 def _dt(s):
     try:
         return datetime.fromisoformat((s or '').replace('Z', '+00:00'))
@@ -149,6 +187,7 @@ def main():
     alerts = load_alerts()
     contacts = hs_search_recent()
     sent = []
+    now_iso = datetime.now(timezone.utc).isoformat()
     for c in contacts:
         p = c.get('properties') or {}
         email = (p.get('email') or '').strip().lower()
@@ -156,9 +195,9 @@ def main():
         created_dt = _dt(p.get('createdate'))
         is_reentry = bool(recent_dt and created_dt and (recent_dt - created_dt).total_seconds() > 300)
         alert_key = f'{email}|{p.get("recent_conversion_date")}' if is_reentry else email
-        if not email or (email in processed and not is_reentry) or alert_key in alerts:
+        if not email or (email in processed and not is_reentry):
             continue
-        if (p.get('hs_object_source') or '').upper() != 'FORM' and not p.get('recent_conversion_date'):
+        if not is_form_signal(p, is_reentry=is_reentry):
             continue
         if (p.get('lifecyclestage') or '').lower() == 'customer':
             continue
@@ -186,14 +225,22 @@ def main():
                 f'Responsável: {owner}'
                 f'{phone_note}\n\n'
                 f'Status: já está na fila para qualificação. Se fizer sentido, o consultor responsável recebe para agir logo em seguida.')
-        alerts[alert_key] = {
+
+        alert = alerts.get(alert_key) or {
             'contact_id': c.get('id'),
             'email': email,
             'createdate': p.get('createdate'),
             'recent_conversion_date': p.get('recent_conversion_date'),
-            'alerted_at': datetime.now(timezone.utc).isoformat(),
-            'channel': 'discord_only',
         }
+        # Compatibilidade: alerted_at antigo significa que o Discord já recebeu.
+        discord_new = not (alert.get('discord_alerted_at') or alert.get('alerted_at'))
+        if not discord_new:
+            continue
+
+        alert['discord_alerted_at'] = now_iso
+        alert['alerted_at'] = now_iso
+        alert['channel'] = 'discord_only_until_final_analysis'
+        alerts[alert_key] = alert
         sent.append(text)
     save_alerts(alerts)
     # no_agent: stdout vazio => silêncio quando nada novo. Só reporta ao Discord quando alertou.

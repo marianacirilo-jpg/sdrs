@@ -10,11 +10,16 @@ NÃO substitui o painel atual: roda em paralelo (porta default 8791) e consome
 exatamente os mesmos dados reais. Não toca em bridges, crons ou watchdog.
 """
 from __future__ import annotations
-import argparse, base64, binascii, faulthandler, hashlib, hmac, html, http.cookies, json, mimetypes, os, re, secrets, signal, subprocess, threading, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import argparse, base64, binascii, concurrent.futures, faulthandler, hashlib, hmac, html, http.cookies, json, mimetypes, os, re, secrets, signal, subprocess, sys, threading, time, unicodedata, urllib.error, urllib.parse, urllib.request
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse, unquote
+from urllib.parse import urlparse, parse_qs, unquote
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+import whatsapp_jid_utils as jid_utils
 
 PROJECT = Path('/root/.hermes/zydon-prospeccao')
 WA_EXTRA = Path('/root/.hermes/whatsapp-extra')
@@ -24,8 +29,47 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # CH-018: limite simples de 20MB decodifica
 USERS_FILE = PROJECT / 'controle' / 'channel_users.json'
 WPP_ENVIOS_FILE = PROJECT / 'controle' / 'wpp_envios.json'
 OUTBOUND_AUDIT_FILE = PROJECT / 'controle' / 'channel_outbound_audit.jsonl'
+PROATIVIDADE_CONFIG_FILE = PROJECT / 'controle' / 'proatividade_config.json'
+ROTINAS_CONFIG_FILE = PROJECT / 'controle' / 'rotinas_orquestracao_config.json'
+INCOMING_DECISIONS_FILE = PROJECT / 'controle' / 'incoming_response_decisions.jsonl'
+HERMES_CRON_JOBS_FILE = Path('/root/.hermes/cron/jobs.json')
 MEDIA_PROXY_PREFIX = '/media/'
 GROUP_JID = '120363408131718880@g.us'
+# Centralizador Dexter (/agendas): fontes locais read-only do orquestrador Hermes.
+# Crons agendados e contextos/chats recentes. NUNCA expõe prompt completo, token,
+# secret ou JID cru — só resumo seguro para Rafael entender o que roda e de onde.
+HERMES_JOBS_FILE = Path('/root/.hermes/cron/jobs.json')
+HERMES_STATE_DB = Path('/root/.hermes/state.db')
+DEXTER_CENTER_CACHE_FILE = PROJECT / 'controle' / 'channel_dexter_center_cache.json'
+DEXTER_CENTER_CACHE_TTL = 120
+
+# Contratos de produto da Inbox: a timeline visual representa mensagens reais.
+# Registros operacionais (wpp_envios/cron/ledger) só aparecem como bolha quando a
+# bolha real do WhatsApp ainda não existe; se já existe, viram metadado/badge.
+VISIBLE_TIMELINE_REAL_MESSAGE_CONTRACT = 'timeline_visual_mostra_mensagens_reais_ledger_enriquece_metadata'
+LEDGER_REAL_MESSAGE_MATCH_WINDOW_SEC = 4 * 3600 + 300
+AUTOMATION_NEAR_DUP_WINDOW_SEC = 15 * 60
+OPS_SHORT_FRESHNESS_SEC = 15 * 60
+# CH-RT3 (envio no ledger some da lista quando a bridge atrasa): a fast-lane curta
+# usada por load_ports só injeta card para envios das últimas 36h. Mas a origem/
+# auditoria operacional vale 30-90 dias. Se a bridge atrasa ou fica offline por
+# mais de 36h, um envio operacional já gravado com sucesso em wpp_envios.json
+# (response.success/messageIds) deixa de gerar QUALQUER candidato e a conversa some
+# de /conversas — reaparecendo só quando a bridge importa a bolha real. Esta janela
+# (alinhada à de operational_rows_for_chat, usada pela timeline) garante card de
+# lista para todo envio bem-sucedido enquanto a bolha real não chega. Colapsa sem
+# duplicar: o fallback só injeta evento para conversa SEM nenhum candidato real.
+INBOX_LEDGER_FALLBACK_WINDOW_HOURS = 24 * 90
+LEDGER_METADATA_SKIP_FIELDS = ('timestamp','timestampRaw','date','id','messageId','text','mediaUrl','mediaName','mediaType','mimetype','mediaPath','fromMe','type')
+PUBLIC_INBOX_COPY = {
+    'communicator_badge': 'Comunicador:',
+    'lead_owner_badge': 'Proprietário SDR:',
+    'lead_owner_chip': 'Lead do SDR:',
+    'readonly_title': 'Somente leitura:',
+    'readonly_explainer': 'contexto de envio feito por {sender} para lead do SDR {owner}. Para responder, abra a conversa/carteira do SDR responsável.',
+}
+FORBIDDEN_VISIBLE_TECH_TERMS = ('auditoria','registro','ledger','fonte','debug','log')
+
 # CH-057: conversas iniciadas por chips institucionais/gestores também devem
 # aparecer para o SDR dono do lead/deal. Esses são os chips compartilhados que
 # podem mandar mensagem em nome de leads dos SDRs.
@@ -192,9 +236,32 @@ def validate_port_payload(body):
 
 PORTS = load_ports_config()
 INSTITUTIONAL_PRIVATE_PORTS = {p for p, meta in PORTS.items() if meta.get('role') in {'institucional','comunicador'}}
+RAFAEL_MARIANA_PRIVATE_PAIRS = {
+    (4607, '553484255965'),  # Rafael -> Mariana
+    (4600, '553496698718'),  # Mariana -> Rafael
+}
 
 def is_institutional_port(port):
     return int(port or 0) in INSTITUTIONAL_PRIVATE_PORTS
+
+
+def is_rafael_mariana_private_chat(port, chat_or_row=None):
+    """Nunca expor a conversa 1:1 Rafael↔Mariana no Channel.
+
+    Mesmo quando uma mensagem foi gerada por automação/ledger, essa conversa é
+    coordenação interna privada, não atendimento de lead.
+    """
+    try:
+        p = int(port or 0)
+    except Exception:
+        p = 0
+    if isinstance(chat_or_row, dict):
+        raw = chat_or_row.get('chat') or chat_or_row.get('to') or chat_or_row.get('jid') or chat_or_row.get('lead_jid') or ''
+    else:
+        raw = chat_or_row or ''
+    digits = re.sub(r'\D+', '', str(raw or ''))
+    return any(p == pair_port and digits.startswith(pair_phone) for pair_port, pair_phone in RAFAEL_MARIANA_PRIVATE_PAIRS)
+
 
 def is_institutional_dispatch_msg(m):
     """Só eventos operacionais enviados por chips pessoais/institucionais.
@@ -203,6 +270,8 @@ def is_institutional_dispatch_msg(m):
     registros de automação/envio para lead/negócio de SDR, com metadado de sdr/empresa/email.
     """
     if not isinstance(m, dict) or not m.get('fromMe'):
+        return False
+    if is_rafael_mariana_private_chat(m.get('port') or m.get('bridge_port') or m.get('dispatchPort'), m):
         return False
     typ = str(m.get('type') or '')
     has_meta = bool(m.get('sdr') or m.get('empresa') or m.get('lead') or m.get('email') or m.get('slug') or m.get('owner_id') or m.get('hubspot_owner_id') or m.get('deal_id') or m.get('deal_ids') or m.get('contact_id'))
@@ -220,6 +289,8 @@ def is_operational_channel_msg(m):
     por automação/envio nosso (wpp_envios, cron, api-send ou metadados de lead/deal).
     """
     if not isinstance(m, dict):
+        return False
+    if is_rafael_mariana_private_chat(m.get('port') or m.get('bridge_port') or m.get('dispatchPort'), m):
         return False
     typ=str(m.get('type') or '')
     src=str(m.get('source') or '')
@@ -255,6 +326,15 @@ def operational_conversation_has_origin(port, chat):
     return bool(operational_rows_for_chat(port, chat))
 
 def institutional_dispatch_owner_uid_from_msgs(msgs):
+    # Preferir o SDR dono explícito quando ele aparece em qualquer evento da thread.
+    # Algumas conversas institucionais começam com um ledger antigo sem `sdr`; nesse
+    # caso `_conversation_sdr_hint_from_msg` cai no owner da porta (ex.: Rafael/4607).
+    # Se aceitarmos o primeiro hint, o card fica visível para Rafael/admin mas some
+    # justamente para o SDR dono quando eventos posteriores trazem `sdr=Lucas Batista`.
+    for m in msgs:
+        uid = _conversation_sdr_hint_from_msg(m)
+        if uid in SDR_OWNER_UIDS:
+            return uid
     for m in msgs:
         uid = _conversation_sdr_hint_from_msg(m)
         # Normalmente é um SDR, mas alguns envios operacionais legítimos são do
@@ -313,14 +393,51 @@ def user_can_view_all(uid):
     """Perfis supervisores veem todas as conversas/chips sem virar admin técnico."""
     return bool(USERS.get(uid, {}).get('admin') or USERS.get(uid, {}).get('view_all'))
 
+def chip_management_allowed(uid):
+    """Todos os usuários autenticados podem parear/conectar chips no Channel.
+
+    Isso é propositalmente separado de `user_can_view_all`: liberar QR/bridge/equipe
+    não amplia a visibilidade da inbox nem o envio por chips institucionais.
+    """
+    return bool(uid and uid in USERS)
+
+def owner_ports_for_user(uid):
+    """Portas comerciais pertencentes ao usuário.
+
+    O cadastro do usuário mantém a porta base, mas quando um SDR ganha chip extra
+    (ex.: Breno 2/Sarah 2) o escopo operacional dele deve acompanhar todos os
+    PORTS cujo `owner` é o próprio uid. Isso amplia só os chips do dono; não libera
+    comunicadores/SDRs de outros usuários.
+    """
+    if not uid:
+        return []
+    owned = []
+    for p, meta in PORTS.items():
+        if _slug_uid((meta or {}).get('owner')) == str(uid):
+            owned.append(int(p))
+    return sorted(set(owned))
+
+
 def effective_ports(uid):
     if user_can_view_all(uid):
         return sorted(PORTS.keys())
-    return [int(p) for p in USERS.get(uid, {}).get('ports', []) if int(p) in PORTS]
+    configured = [int(p) for p in USERS.get(uid, {}).get('ports', []) if int(p) in PORTS]
+    return sorted(set(configured + owner_ports_for_user(uid)))
+
+def manageable_ports(uid):
+    """Portas visíveis na tela de Conexões/QR.
+
+    Rafael pediu que todos consigam bipar/conectar novos chips e QR Codes; portanto
+    qualquer usuário logado enxerga o inventário de chips nesta tela, mas inbox/envio
+    continuam presos a `effective_ports`.
+    """
+    if chip_management_allowed(uid):
+        return sorted(PORTS.keys())
+    return effective_ports(uid)
 
 def sanitize_user_record(uid, cfg):
     """Versão pública/admin sem token; usada pela UI."""
-    ports = sorted(PORTS.keys()) if bool(cfg.get('admin') or cfg.get('view_all')) else [int(p) for p in (cfg.get('ports') or []) if int(p) in PORTS]
+    ports = sorted(PORTS.keys()) if bool(cfg.get('admin') or cfg.get('view_all')) else effective_ports(uid)
     return {
         'id': uid,
         'name': str(cfg.get('name') or uid),
@@ -384,14 +501,41 @@ CHANNEL_STATE_FILE = PROJECT / 'controle' / 'channel_state.json'
 CHANNEL_TRANSCRIPTS_FILE = PROJECT / 'controle' / 'channel_audio_transcripts.json'
 HERMES_PY = '/usr/local/lib/hermes-agent/venv/bin/python'
 VALID_STATUSES = ('open', 'pending', 'resolved', 'archived')
-APP_ROUTES = {'/': 'conversas', '/index.html': 'conversas', '/conversas': 'conversas', '/foco': 'foco', '/gestao': 'gestao'}
+APP_ROUTES = {'/': 'conversas', '/index.html': 'conversas', '/conversas': 'conversas', '/foco': 'foco', '/gestao': 'gestao', '/agendas': 'agendas', '/followups': 'rotinas', '/proatividade': 'rotinas', '/rotinas': 'rotinas'}
+ROTINAS_ALLOWED_USER_IDS = {'rafael'}
+ROTINAS_HERMES_SCRIPTS = Path('/root/.hermes/scripts')
+ROTINAS_WATCHDOG_STATE = PROJECT / 'controle' / 'whatsapp_outbound_quality_monitor_state.json'
+ROTINAS_CONFIG_DEFAULTS = {
+    'version': 1,
+    'autonomyMode': 'equilibrado',  # conservador | equilibrado | expansivo
+    'notifyOnlyExceptions': True,
+    'requireApprovalForDangerousActions': True,
+    'messagePolicy': {'source': 'textos_aprovados', 'allowAutoRewrite': False, 'dailyCapPerChip': 30},
+    'logPolicy': {'retentionDays': 90, 'redactPhone': True, 'showTechnicalDetails': False},
+    'backupPolicy': {'enabled': True, 'intervalMinutes': 5, 'destination': 'gdrive/rclone'},
+    'gitPolicy': {'enabled': True, 'commitAfterValidatedChange': True, 'branch': 'main'},
+    'journeyOverrides': {},
+}
+ROTINAS_JOURNEY_DEFS = [
+    {'key': 'entrada_mql', 'label': 'Entrada MQL', 'group': 'Aquisição', 'description': 'Formulários, validação MQL, dono/SDR, diagnóstico e PDF.'},
+    {'key': 'nao_mql', 'label': 'Não-MQL', 'group': 'Aquisição', 'description': 'Tratativas legítimas de leads fora do critério MQL.'},
+    {'key': 'primeiro_contato', 'label': 'Ativação SDR (diagnóstico ou F1)', 'group': 'SDR', 'description': 'Primeira ativação do lead pelo SDR: leva para diagnóstico ou entra na régua de follow-up F1. Não existe contato solto.'},
+    {'key': 'followup_sdr', 'label': 'Follow-up SDR', 'group': 'SDR', 'description': 'F1-F4, follow pós-diagnóstico, cadência e retorno.'},
+    {'key': 'agenda_no_show', 'label': 'Agenda / No-show / Introdução', 'group': 'SDR', 'description': 'Confirmações, remarcação, no-show, retomada e preparação do diagnóstico.'},
+    {'key': 'whatsapp_infra', 'label': 'WhatsApp / chips', 'group': 'Infra', 'description': 'Bridges, canonicalização, qualidade outbound e sync.'},
+    {'key': 'channel_ui', 'label': 'Channel / painéis', 'group': 'Produto', 'description': 'Conversas, Foco, Gestão, Followups, Rotinas e performance.'},
+    {'key': 'backups_git', 'label': 'Backups / Git', 'group': 'Governança', 'description': 'Backups, commits, stage, release gate e rollback.'},
+]
 NOTE_PREVIEW_LEN = 160
 CONVERSATIONS_API_CACHE = {}
 CONVERSATIONS_PREWARM_FILE = PROJECT / 'controle' / 'channel_conversations_prewarm_operational_only_v3_identity.json'
 CONVERSATIONS_API_LOCK = threading.Lock()
 CONVERSATIONS_REFRESHING = set()
 CONVERSATIONS_API_TTL = 120
-CONVERSATIONS_MIN_REFRESH_INTERVAL = 120
+# Fonte externa (crons/bridges) muda wpp_envios/history sem chamar invalidate_*.
+# Revalide por mtime bem antes do TTL cego para a inbox parecer viva sem recompute
+# síncrono: a rota ainda serve stale imediatamente e atualiza em background.
+CONVERSATIONS_MIN_REFRESH_INTERVAL = 20
 CONVERSATIONS_DEP_FILES = (WPP_ENVIOS_FILE,)
 MESSAGES_API_CACHE = {}
 MESSAGES_API_LOCK = threading.Lock()
@@ -413,6 +557,9 @@ DISPATCH_ROWS_CACHE = {}
 DISPATCH_ROWS_TTL = 30
 CHIPS_API_CACHE = {}
 CHIPS_API_TTL = 20
+CHIP_METRICS_CACHE = {}
+CHIP_METRICS_LOCK = threading.Lock()
+CHIP_STATUS_TIMEOUT = 0.8
 CONVERSATION_PERMISSION_CACHE = {}
 CONVERSATION_PERMISSION_TTL = 30
 def invalidate_channel_api_cache(uid=None, conv_id=None):
@@ -437,6 +584,7 @@ def invalidate_channel_api_cache(uid=None, conv_id=None):
             MESSAGES_API_CACHE.clear()
             CONVERSATION_PERMISSION_CACHE.clear()
             DISPATCH_ROWS_CACHE.clear()
+            CHIP_METRICS_CACHE.clear()
             _HISTORY_MERGED_CACHE.clear()
     except Exception:
         pass
@@ -964,6 +1112,25 @@ def _split_send_message_ids(m):
     return {re.sub(r'_(text|pdf|media|file|caption)$', '', x, flags=re.I) for x in ids if x}
 
 
+def _pdf_dedupe_name(m):
+    if not isinstance(m, dict):
+        return ''
+    parts=[m.get('mediaName'), m.get('fileName'), m.get('pdf_path'), m.get('mediaPath'), m.get('mediaUrl')]
+    txt=str(m.get('text') or '')
+    mm=re.search(r'PDF enviado:\s*(.+?\.pdf)\b', txt, flags=re.I)
+    if mm:
+        parts.insert(0, mm.group(1))
+    for p in parts:
+        s=os.path.basename(str(p or '')).strip()
+        if not s:
+            continue
+        s=unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode('ascii')
+        s=re.sub(r'[^a-z0-9]+',' ',s.lower()).strip()
+        if s and 'pdf' in s:
+            return s
+    return ''
+
+
 def _same_dispatch_payload(a, b):
     aid=_event_message_id(a); bid=_event_message_id(b)
     if aid and bid and aid == bid:
@@ -976,7 +1143,87 @@ def _same_dispatch_payload(a, b):
     bm=str((b or {}).get('mediaName') or '').strip().lower()
     if am and bm and am == bm:
         return True
+    ap=_pdf_dedupe_name(a); bp=_pdf_dedupe_name(b)
+    if ap and bp and ap == bp:
+        return True
     return _same_diagnostic_pdf(a, b)
+
+
+def _timeline_text_norm_for_coverage(value):
+    s=unicodedata.normalize('NFKD', str(value or '')).encode('ascii','ignore').decode('ascii')
+    s=re.sub(r'https?://\S+', ' URL ', s, flags=re.I)
+    s=re.sub(r'\s+', ' ', s.lower()).strip()
+    return s
+
+
+def _ledger_full_text_event(m):
+    if not isinstance(m, dict):
+        return False
+    t=str(m.get('type') or '')
+    return t.startswith('cron-') or t == 'seed-wpp-envios' or str(m.get('sender') or '') == 'cron-import'
+
+
+def is_real_device_timeline_message(m):
+    """True somente para bolhas que existem no history/bridge do WhatsApp.
+
+    `wpp_envios`, fila de dispatch e cron-import podem provar que a lista deve ter
+    um card operacional, mas o detalhe da conversa precisa refletir o aparelho:
+    mensagens com hora/data/texto que vieram do history real da bridge, inclusive
+    `api-send`/`append`/`notify` e eventos enriquecidos por ledger + bridge.
+    """
+    if not isinstance(m, dict):
+        return False
+    typ = str(m.get('type') or '')
+    src = str(m.get('source') or '')
+    sender = str(m.get('sender') or '')
+    # Fila/ledger puro nunca vira bolha visual no detalhe.
+    ledger_like = (
+        typ == 'seed-wpp-envios' or typ.startswith('cron-') or sender == 'cron-import'
+        or 'wpp_envios' in src or 'whatsapp_dispatch_queue' in src or 'ledger' in src
+    )
+    # Exceção: eventos já reconciliados/enriquecidos com uma bolha real da bridge.
+    if ledger_like:
+        if m.get('bridgeMessageId') or str(m.get('timestampSource') or '') == 'bridge' or '+bridge' in src or 'bridge+' in src:
+            return bool(_message_has_visible_payload(m))
+        return False
+    if _is_timeline_technical_event(m):
+        return False
+    if typ in ('append', 'api-send', 'notify', 'message', '') or src.startswith('bridge'):
+        return bool(_message_has_visible_payload(m) or _event_message_id(m))
+    return bool(_event_message_id(m) and _message_has_visible_payload(m))
+
+
+def _ledger_text_covered_by_real_parts(ledger_msg, real_msgs, window_sec=180):
+    """True quando o ledger é só a versão colada de bolhas reais multipart.
+
+    Ex.: a bridge grava duas mensagens reais (texto principal + CTA) e o ledger
+    importa o texto completo em uma linha. A UI deve mostrar as partes reais, não
+    uma terceira bolha completa que parece reenvio ao lead.
+    """
+    if not _ledger_full_text_event(ledger_msg):
+        return False
+    full=_timeline_text_norm_for_coverage((ledger_msg or {}).get('text'))
+    if len(full) < 40:
+        return False
+    lts=float((ledger_msg or {}).get('timestamp') or 0)
+    parts=[]
+    for m in real_msgs or []:
+        if not isinstance(m, dict) or not m.get('fromMe') or _ledger_full_text_event(m) or is_institutional_dispatch_msg(m):
+            continue
+        if canonical_chat_for_message(m) != canonical_chat_for_message(ledger_msg):
+            continue
+        txt=_timeline_text_norm_for_coverage(m.get('text') or m.get('body') or m.get('caption') or m.get('message'))
+        if len(txt) < 12:
+            continue
+        mts=float(m.get('timestamp') or 0)
+        if lts and mts and abs(lts-mts) > window_sec:
+            continue
+        if txt in full:
+            parts.append(txt)
+    if len(parts) < 2:
+        return False
+    covered=sum(len(p) for p in parts)
+    return covered >= max(40, int(len(full) * 0.72))
 
 def merge_institutional_ledger_with_real_messages(port, data):
     """Para chips institucionais, usa a hora REAL da bridge e metadados do ledger.
@@ -1018,7 +1265,7 @@ def merge_institutional_ledger_with_real_messages(port, data):
                 ev=event_by_chat.get(canonical_chat_for_message(m)) or {}
                 mm=dict(m)
                 for k,v in ev.items():
-                    if k in ('timestamp','timestampRaw','date','id','messageId','text','mediaUrl','mediaName','mediaType','mimetype','mediaPath','fromMe','type'):
+                    if k in LEDGER_METADATA_SKIP_FIELDS:
                         continue
                     if v not in (None,'') and not mm.get(k):
                         mm[k]=v
@@ -1039,7 +1286,7 @@ def merge_institutional_ledger_with_real_messages(port, data):
                 continue
             et=float(ev.get('timestamp') or 0)
             diff=abs(et-mt) if et and mt else 0
-            if diff <= 4*3600+300 and diff < best_diff:
+            if diff <= LEDGER_REAL_MESSAGE_MATCH_WINDOW_SEC and diff < best_diff:
                 best=(ei,ev); best_diff=diff
         if best:
             ei,ev=best; consumed_events.add(ei)
@@ -1066,7 +1313,7 @@ def merge_institutional_ledger_with_real_messages(port, data):
             if ev:
                 mm=dict(m)
                 for k,v in ev.items():
-                    if k in ('timestamp','timestampRaw','date','id','messageId','text','mediaUrl','mediaName','mediaType','mimetype','mediaPath','fromMe','type'):
+                    if k in LEDGER_METADATA_SKIP_FIELDS:
                         continue
                     if v not in (None,'') and not mm.get(k):
                         mm[k]=v
@@ -1091,10 +1338,32 @@ def merge_institutional_ledger_with_real_messages(port, data):
             real_ids_by_chat.setdefault(ck, set()).add(mid)
     for ei,ev in events:
         if ei not in consumed_events:
+            if _is_unbacked_pdf_dispatch(ev):
+                # PDF/diagnóstico de ledger/cron sem mídia real não pode virar bolha
+                # nem prévia "PDF enviado" — mostra só envios reais.
+                continue
             sr = ev.get('send_response') if isinstance(ev, dict) else None
             mids = sr.get('messageIds') if isinstance(sr, dict) else None
             ck = canonical_chat_for_message(ev)
             if mids and ck and all(str(mid) in real_ids_by_chat.get(ck, set()) for mid in mids):
+                continue
+            # Se a bolha real/operacional do mesmo PDF já foi exibida, o ledger não
+            # pode virar outra mensagem visual. Rafael lê isso como “PDF enviado 2x”.
+            # Mantemos só quando for um envio realmente distinto fora da janela.
+            ev_ts=float(ev.get('timestamp') or 0)
+            duplicated_visible_pdf=False
+            if ck and (_same_diagnostic_pdf(ev, ev) or str(ev.get('mediaName') or '').strip()):
+                for shown in out:
+                    if not isinstance(shown, dict) or canonical_chat_for_message(shown) != ck:
+                        continue
+                    if not _same_dispatch_payload(ev, shown):
+                        continue
+                    shown_ts=float(shown.get('timestamp') or 0)
+                    diff=abs(ev_ts-shown_ts) if ev_ts and shown_ts else 0
+                    if diff <= LEDGER_REAL_MESSAGE_MATCH_WINDOW_SEC:
+                        duplicated_visible_pdf=True
+                        break
+            if duplicated_visible_pdf:
                 continue
             ee=dict(ev); ee['timestampSource']='ledger'
             out.append(ee)
@@ -1346,7 +1615,7 @@ def _dispatch_port_for_row(r):
     da conversa do cliente (incidente King Talhas 26/06: UI parecia mostrar
     Lucas Resende enviando ao lead, mas o log bruto só tinha OUT pela Sarah).
     """
-    for k in ('dispatch_port', 'bridge_port', 'port', 'porta'):
+    for k in ('dispatch_port', 'bridge_port', 'port', 'porta', 'gateway'):
         v = r.get(k) if isinstance(r, dict) else None
         if v not in (None, ''):
             try:
@@ -1382,20 +1651,685 @@ def _wpp_envios_rows():
     return rows
 
 
+def _wpp_envio_group_only_notice(r):
+    """Registro de aviso interno ao grupo, não conversa do lead.
+
+    `group_response`/`group_bridge_port` podem ter success/messageId, mas isso
+    confirma apenas mensagem no grupo operacional. Não pode virar card em
+    Conversas.
+    """
+    if not isinstance(r, dict):
+        return False
+    status = str(r.get('status') or '').lower().strip()
+    chat = str(r.get('to') or r.get('jid') or r.get('lead_jid') or '').strip()
+    port = r.get('bridge_port') or r.get('dispatchPort') or r.get('port') or r.get('group_bridge_port')
+    if is_rafael_mariana_private_chat(port, chat or r):
+        return True
+    if chat.endswith('@g.us') or chat == GROUP_JID:
+        return True
+    if any(x in status for x in ('nao_mql_grupo','não_mql_grupo','grupo_notificacao','enviado_grupo')):
+        return not (r.get('text_response') or r.get('file_response') or r.get('send_response') or r.get('bridge_response'))
+    return False
+
+
+def _wpp_envio_lead_chat(r):
+    """Chat individual do lead para fastlane.
+
+    Muitos crons novos gravam `to`/`jid`. Crons antigos ou watchdogs podem gravar
+    só `phone`/`telefone` + `gateway`; nesse caso reconstruímos o JID para que
+    “cron disparou” apareça no painel imediatamente, sem esperar history_*.json.
+    """
+    if not isinstance(r, dict) or _wpp_envio_group_only_notice(r):
+        return ''
+    chat = str(r.get('to') or r.get('jid') or r.get('lead_jid') or '').strip()
+    if chat and not chat.endswith('@g.us') and chat != GROUP_JID:
+        return canonical_chat_id(chat)
+    for k in ('phone','telefone','whatsapp','lead_phone','numero'):
+        d = ''.join(ch for ch in str(r.get(k) or '') if ch.isdigit())
+        if len(d) >= 10:
+            if not d.startswith('55') and len(d) in (10, 11):
+                d = '55' + d
+            return canonical_chat_id(d + '@s.whatsapp.net')
+    return ''
+
+
 def _wpp_envio_is_sent_dispatch(r):
     """Todo envio operacional individual deve aparecer no painel central."""
     if not isinstance(r, dict):
         return False
-    chat = str(r.get('to') or r.get('jid') or r.get('lead_jid') or '').strip()
-    if not chat or chat.endswith('@g.us') or chat == GROUP_JID:
+    chat = _wpp_envio_lead_chat(r)
+    if not chat:
         return False
     status = str(r.get('status') or '').lower().strip()
-    if any(x in status for x in ('invalido','inválido','erro','falha','failed','cancel','nao_mql_grupo','não_mql_grupo')):
+    if any(x in status for x in ('invalido','inválido','erro','falha','failed','cancel')):
         return False
     msg_type = str(r.get('msg_type') or r.get('type') or '').lower().strip()
-    has_payload = bool(r.get('text') or r.get('pdf_path') or r.get('file_response') or r.get('text_response') or r.get('send_response') or r.get('messageId') or r.get('response'))
-    has_port = bool(r.get('bridge_port') or r.get('group_bridge_port') or r.get('port'))
+    has_payload = bool(r.get('text') or r.get('pdf_path') or r.get('file_response') or r.get('text_response') or r.get('send_response') or r.get('messageId') or r.get('response') or r.get('bridge_response'))
+    has_port = bool(_dispatch_port_for_row(r))
     return bool(has_port and (has_payload or status.startswith('enviado') or msg_type))
+
+
+# --- Controle de agendas (read-only) ----------------------------------------
+# Tela /agendas: auditoria diária do ciclo de agenda/diagnóstico. Lê APENAS
+# fontes locais já registradas pela operação (o ledger wpp_envios.json e o
+# estado do monitor de diagnóstico). NÃO envia WhatsApp, NÃO escreve no HubSpot,
+# NÃO toca em cron/bridge. Telefone do lead nunca aparece cru: é mascarado.
+DIAGNOSTICO_PROCESSED_FILE = PROJECT / 'controle' / 'diagnostico_agendado_processed.json'
+
+# Tipo técnico do envio -> rótulo humano mostrado ao SDR. A UI nunca expõe a
+# chave técnica; só o label e o significado operacional do evento.
+AGENDA_MSG_KINDS = {
+    'diagnostico_agenda_confirmacao': {'key': 'confirmacao', 'label': 'Confirmação'},
+    'diagnostico_agenda_lembrete_dia': {'key': 'lembrete', 'label': 'Lembrete'},
+    'diagnostico_agenda_aviso_grupo': {'key': 'grupo', 'label': 'Aviso ao time'},
+    'diagnostico_agenda_link_complemento': {'key': 'complemento', 'label': 'Complemento de link'},
+    'diagnostico_agenda_link_corrigido_grupo': {'key': 'complemento', 'label': 'Complemento de link'},
+    'correcao_link_agenda_isolado': {'key': 'complemento', 'label': 'Complemento de link'},
+    'retorno_contato_agenda_link_reply': {'key': 'complemento', 'label': 'Complemento de link'},
+    'cron-mql-agenda': {'key': 'agenda', 'label': 'Convite de agenda'},
+    'diagnostico_manual_mql': {'key': 'diagnostico', 'label': 'Diagnóstico'},
+    'diagnostico_agenda_confirmacao_manual': {'key': 'confirmacao', 'label': 'Confirmação'},
+}
+
+AGENDA_KIND_LABELS = {
+    'confirmacao': 'Confirmação',
+    'lembrete': 'Lembrete',
+    'grupo': 'Aviso ao time',
+    'complemento': 'Complemento de link',
+    'agenda': 'Convite de agenda',
+    'diagnostico': 'Diagnóstico',
+}
+
+
+def _agenda_load_processed_state():
+    try:
+        if DIAGNOSTICO_PROCESSED_FILE.exists():
+            data = json.loads(DIAGNOSTICO_PROCESSED_FILE.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _agenda_kind_for_row(r):
+    if not isinstance(r, dict):
+        return None
+    mt = str(r.get('msg_type') or r.get('type') or '').strip()
+    return AGENDA_MSG_KINDS.get(mt)
+
+
+def _agenda_mask_phone_from_jid(to):
+    """Mascara o telefone do lead a partir do JID. Grupo não tem telefone de lead."""
+    s = str(to or '')
+    if '@g.us' in s or s == GROUP_JID:
+        return ''
+    return _cadencia_mask_phone(s.split('@', 1)[0])
+
+
+def _agenda_status_label(r):
+    """Status humano do envio, sem jargão técnico/de auditoria na tela."""
+    raw = str((r or {}).get('status') or '').lower().strip()
+    if any(x in raw for x in ('erro', 'falha', 'invalid', 'inválid', 'cancel', 'fail')):
+        return 'Falhou'
+    resp = None
+    for k in ('bridge_response', 'send_response', 'response', 'text_response', 'file_response'):
+        v = (r or {}).get(k)
+        if isinstance(v, dict):
+            resp = v
+            break
+    if 'grupo' in raw:
+        return 'Time avisado'
+    if raw.startswith('enviado'):
+        return 'Enviado'
+    if isinstance(resp, dict) and resp.get('success'):
+        return 'Enviado'
+    if 'andamento' in raw:
+        return 'Em andamento'
+    return 'Registrado'
+
+
+def _agenda_has_link(text):
+    return 'http' in str(text or '').lower()
+
+
+def agendas_report(uid='rafael', days=7, sdr='', kind='', status='', search='', limit=200):
+    """Controle de agendas e mensagens enviadas, read-only.
+
+    Reconstrói as últimas agendas/diagnósticos a partir do ledger operacional
+    (controle/wpp_envios.json) e do estado do monitor de diagnóstico. Respeita o
+    escopo do usuário: SDR comum vê só a própria carteira; supervisor/admin vê
+    consolidado. Telefone do lead sempre mascarado. Sem efeitos colaterais.
+    """
+    try:
+        days = max(1, min(60, int(days or 7)))
+    except Exception:
+        days = 7
+    try:
+        limit = max(1, min(1000, int(limit or 200)))
+    except Exception:
+        limit = 200
+
+    view_all = user_can_view_all(uid)
+    allowed_ports = set(int(p) for p in effective_ports(uid))
+    allowed_owner_names = set()
+    for p in allowed_ports:
+        meta = PORTS.get(int(p), {})
+        for nm in (meta.get('owner'), meta.get('label')):
+            nm = str(nm or '').replace('_', ' ').strip().lower()
+            if nm:
+                allowed_owner_names.add(nm)
+
+    configured = WPP_ENVIOS_FILE.exists()
+    now = time.time()
+    cutoff = now - days * 86400
+    brt = timezone(timedelta(hours=-3))
+
+    def _norm(x):
+        return str(x or '').strip().lower()
+
+    scoped = []
+    for r in _wpp_envios_rows():
+        kindinfo = _agenda_kind_for_row(r)
+        if not kindinfo:
+            continue
+        port = _dispatch_port_for_row(r)
+        sdr_name = str(r.get('sdr') or r.get('sender_name') or '').replace('_', ' ').strip()
+        if not view_all:
+            if not (port in allowed_ports or _norm(sdr_name) in allowed_owner_names):
+                continue
+        ts = _parse_wpp_envio_ts(r)
+        if ts and ts < cutoff:
+            continue
+        meta = PORTS.get(int(port), {}) if port else {}
+        chip_label = str(meta.get('label') or (str(port) if port else '')).strip()
+        text = str(r.get('text') or '')
+        preview = text.strip().replace('\n', ' ')
+        if len(preview) > 180:
+            preview = preview[:179].rstrip() + '…'
+        row = {
+            'meetingId': str(r.get('meeting_id') or r.get('meetingId') or r.get('task_id') or ''),
+            'company': str(r.get('empresa') or r.get('nome_empresa') or r.get('slug') or '').strip() or '—',
+            'lead': str(r.get('nome') or r.get('lead_name') or r.get('contato') or '').strip(),
+            'sdr': sdr_name or '—',
+            'chip': chip_label or '—',
+            'port': int(port) if port else None,
+            'phoneMasked': _agenda_mask_phone_from_jid(r.get('to') or r.get('jid')),
+            'meetingAt': str(r.get('meeting_start') or r.get('meeting_at') or '').strip(),
+            'sentAt': (datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else str(r.get('date_tz') or r.get('date') or '')),
+            'sentAtTs': ts or 0.0,
+            'kind': kindinfo['key'],
+            'kindLabel': kindinfo['label'],
+            'status': _agenda_status_label(r),
+            'messagePreview': preview,
+            'hasLink': _agenda_has_link(text),
+        }
+        deal_id = str(r.get('deal_id') or '').strip()
+        if deal_id.isdigit():
+            row['dealId'] = deal_id
+            row['hubspotDealUrl'] = 'https://app.hubspot.com/contacts/48590774/deal/' + deal_id
+        scoped.append(row)
+
+    scoped.sort(key=lambda x: x.get('sentAtTs') or 0, reverse=True)
+
+    # Facetas (opções de filtro) calculadas sobre o conjunto no escopo/período,
+    # antes de aplicar os filtros da UI, para os selects não esvaziarem sozinhos.
+    sdr_options = sorted({r['sdr'] for r in scoped if r['sdr'] and r['sdr'] != '—'}, key=lambda s: s.lower())
+    kinds_present = {r['kind'] for r in scoped}
+    kind_options = [{'key': k, 'label': AGENDA_KIND_LABELS.get(k, k)} for k in AGENDA_KIND_LABELS if k in kinds_present]
+    status_options = sorted({r['status'] for r in scoped})
+
+    rows = scoped
+    if sdr and _norm(sdr) not in ('', 'all', 'todos'):
+        rows = [r for r in rows if _norm(sdr) == _norm(r['sdr']) or _norm(sdr) in _norm(r['sdr'])]
+    if kind and _norm(kind) not in ('', 'all', 'todos'):
+        rows = [r for r in rows if r['kind'] == _norm(kind)]
+    if status and _norm(status) not in ('', 'all', 'todos'):
+        rows = [r for r in rows if _norm(status) == _norm(r['status'])]
+    if search and search.strip():
+        q = _norm(search)
+        rows = [r for r in rows if q in _norm(r['company']) or q in _norm(r['lead']) or q in _norm(r['sdr'])
+                or q in _norm(r['messagePreview']) or q in _norm(r['meetingId']) or q in _norm(r['phoneMasked'])]
+
+    total = len(rows)
+    confirmations = sum(1 for r in rows if r['kind'] == 'confirmacao')
+    reminders = sum(1 for r in rows if r['kind'] == 'lembrete')
+    group_notices = sum(1 for r in rows if r['kind'] == 'grupo')
+    # Falha real de envio é a única coisa que vira alerta. Ausência de link em
+    # lembrete/convite NÃO é falha: vira qualidade para revisar, sem alarme.
+    link_kinds = ('confirmacao', 'lembrete', 'agenda')
+    send_failures = sum(1 for r in rows if r['status'] == 'Falhou')
+    link_eligible = sum(1 for r in rows if r['kind'] in link_kinds)
+    needs_review = sum(1 for r in rows if r['status'] != 'Falhou'
+                       and r['kind'] in link_kinds and not r['hasLink'])
+    link_coverage = round(100.0 * (link_eligible - needs_review) / link_eligible) if link_eligible else 100
+
+    state = _agenda_load_processed_state()
+    limited = rows[:limit]
+
+    return {
+        'ok': True,
+        'configured': bool(configured),
+        'generatedAt': datetime.now(brt).isoformat(),
+        'filters': {'days': days, 'sdr': sdr or '', 'kind': kind or '', 'status': status or '', 'search': search or '', 'limit': limit},
+        'meta': {
+            'scope': 'consolidado' if view_all else 'sua carteira',
+            'sdrOptions': sdr_options,
+            'kindOptions': kind_options,
+            'statusOptions': status_options,
+        },
+        'summary': {
+            'total': total,
+            'shown': len(limited),
+            'confirmations': confirmations,
+            'reminders': reminders,
+            'groupNotices': group_notices,
+            # Alerta operacional = só falha real de envio.
+            'sendFailures': send_failures,
+            # Qualidade de link: revisão, não alerta.
+            'needsReview': needs_review,
+            'linkCoverage': link_coverage,
+            # Compat: 'missingLinkOrFailures' agora reflete apenas falha real,
+            # nunca ausência de link em lembrete/convite.
+            'missingLinkOrFailures': send_failures,
+            'lastRunAt': state.get('last_run_at') or '',
+            'processedMeetings': len(state.get('processed_meeting_ids') or []),
+        },
+        'rows': limited,
+    }
+
+
+# --- Centralizador Dexter (/agendas) — crons e contextos (read-only) ----------
+# Subabas "Crons" e "Contextos" da tela /agendas. Lê SOMENTE fontes locais do
+# orquestrador Hermes: o índice de jobs agendados (jobs.json) e o histórico de
+# sessões/mensagens (state.db). Nenhum efeito colateral: não cria/edita/pausa
+# cron, não envia WhatsApp, não escreve no HubSpot. Privacidade: prompt completo,
+# tokens, secrets, erro cru e JID nunca chegam à UI — só resumo seguro e curto.
+
+def _dexter_sanitize_preview(text, limit=160):
+    """Texto curto e seguro para a UI: sem quebras, sem token/secret aparente."""
+    s = str(text or '')
+    # Conteúdo pode vir como JSON de tool/estrutura: extrai algo legível.
+    if s[:1] in ('[', '{'):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                for it in parsed:
+                    if isinstance(it, dict) and it.get('text'):
+                        s = str(it.get('text'))
+                        break
+                    if isinstance(it, str):
+                        s = it
+                        break
+            elif isinstance(parsed, dict):
+                s = str(parsed.get('text') or parsed.get('content') or s)
+        except Exception:
+            pass
+    s = re.sub(r'\s+', ' ', s).strip()
+    # Redige segredos óbvios (tokens longos, bearer, chaves) por precaução.
+    s = re.sub(r'(?i)\b(bearer|token|secret|api[_-]?key|authorization)\b\s*[:=]?\s*\S+', '\\1 •••', s)
+    s = re.sub(r'\b[A-Za-z0-9_\-]{32,}\b', '•••', s)
+    if len(s) > limit:
+        s = s[:limit - 1].rstrip() + '…'
+    return s
+
+
+def _dexter_load_crons(jobs_file=None):
+    """Resumo seguro dos jobs agendados. Nunca expõe o prompt completo."""
+    path = Path(jobs_file) if jobs_file else HERMES_JOBS_FILE
+    crons = []
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return crons
+    jobs = data.get('jobs') if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        return crons
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        sched = j.get('schedule') if isinstance(j.get('schedule'), dict) else {}
+        origin = j.get('origin') if isinstance(j.get('origin'), dict) else {}
+        skills = j.get('skills')
+        if not skills and j.get('skill'):
+            skills = [j.get('skill')]
+        skills = [str(s) for s in (skills or []) if s]
+        repeat = j.get('repeat') if isinstance(j.get('repeat'), dict) else {}
+        last_status = str(j.get('last_status') or '').strip()
+        enabled = bool(j.get('enabled'))
+        state = str(j.get('state') or '').strip()
+        paused = (not enabled) or state == 'paused' or bool(j.get('paused_at'))
+        is_error = last_status not in ('', 'ok', 'success', 'done')
+        crons.append({
+            'id': str(j.get('id') or ''),
+            'name': str(j.get('name') or '—'),
+            'enabled': enabled,
+            'state': state or ('paused' if paused else 'scheduled'),
+            'paused': paused,
+            'pausedReason': _dexter_sanitize_preview(j.get('paused_reason'), 120) if j.get('paused_reason') else '',
+            'scheduleDisplay': str(j.get('schedule_display') or sched.get('display') or sched.get('expr') or '').strip(),
+            'nextRunAt': str(j.get('next_run_at') or '').strip(),
+            'lastRunAt': str(j.get('last_run_at') or '').strip(),
+            'lastStatus': last_status or '—',
+            'hasError': is_error,
+            'deliver': str(j.get('deliver') or '').strip(),
+            'script': str(j.get('script') or '').strip(),
+            'noAgent': bool(j.get('no_agent')),
+            'skills': skills,
+            'workdir': str(j.get('workdir') or '').strip(),
+            'runsCompleted': repeat.get('completed') if isinstance(repeat.get('completed'), int) else None,
+            'origin': {
+                'platform': str(origin.get('platform') or '').strip(),
+                'chatName': str(origin.get('chat_name') or '').strip(),
+                'chatId': str(origin.get('chat_id') or '').strip(),
+                'threadId': str(origin.get('thread_id') or '').strip(),
+            },
+            'promptPreview': _dexter_sanitize_preview(j.get('prompt'), 160),
+        })
+    return crons
+
+
+def _rotinas_cron_folder_for(cron):
+    name = str(cron.get('name') or '').lower()
+    script = str(cron.get('script') or '').lower()
+    blob = name + ' ' + script
+    def row(folder, meaning, crucial, redundant=False, window='conforme agenda do cron'):
+        c = dict(cron)
+        c.update({'folder': folder, 'meaning': meaning, 'crucial': bool(crucial), 'redundant': bool(redundant), 'dailyWindow': window})
+        return c
+    if 'pausado-nao-reativar' in blob or 'parallel-lanes' in blob:
+        return row('Legados pausados / não reativar', 'Rotina antiga ou experimental mantida desligada para não conflitar com a trilha oficial.', False, True, 'não deve rodar')
+    if 'active-mql' in blob or 'prospeccao-autonomo' in blob or 'mql-watchdog' in blob or 'pending-lead' in blob:
+        return row('Entrada e qualificação MQL', 'Classifica entrada, prepara decisão MQL/Não-MQL e alimenta a fila principal.', True, False, 'dia todo / alta frequência')
+    if 'agenda' in blob or 'diagnostico-agendado' in blob or 'premeeting' in blob:
+        return row('Diagnóstico e agenda', 'Confirma diagnóstico, envia lembrete, cuida de agenda marcada e preparo da reunião.', True, False, 'dia todo, próximo de reuniões')
+    if 'followup' in blob or 'cadencia' in blob or 'primeiro-contato' in blob:
+        return row('Follow-up e primeiro contato', 'Executa a régua oficial de primeiro contato e F1–F4 com pesquisa obrigatória.', True, False, 'seg-sex 06:00–19:59 BRT')
+    if 'nao-mql' in blob or 'non_mql' in blob:
+        return row('Tratativa Não-MQL', 'Aborda lead legítimo que não virou MQL, sem misturar com diagnóstico MQL.', True, False, '07:00–22:00 BRT')
+    if 'incoming' in blob or 'resposta' in blob or 'escuta' in blob:
+        return row('Respostas e conversas', 'Escuta respostas reais, separa o que SDR resolve do que precisa Rafael.', True, False, 'contínuo')
+    if 'whatsapp' in blob or 'bridge' in blob or 'quality' in blob or 'warmup' in blob:
+        return row('WhatsApp e chips', 'Monitora saúde, qualidade, aquecimento e riscos de envio dos chips.', True, False, 'contínuo / janelas de warmup')
+    if 'channel' in blob or 'watchdog' in blob or 'cron-processing' in blob or 'drive-sync' in blob or 'backup' in blob:
+        return row('Sistema e painéis', 'Mantém painel, watchdogs, deploy, backup e auto-recuperação operacional.', True, False, 'contínuo')
+    return row('Outras rotinas', 'Rotina de suporte ainda não classificada no cockpit.', False, False, 'conforme agenda')
+
+
+def _rotinas_cron_folders(crons):
+    order = ['Entrada e qualificação MQL', 'Diagnóstico e agenda', 'Follow-up e primeiro contato', 'Tratativa Não-MQL', 'Respostas e conversas', 'WhatsApp e chips', 'Sistema e painéis', 'Legados pausados / não reativar', 'Outras rotinas']
+    groups = {k: [] for k in order}
+    for c in crons or []:
+        r = _rotinas_cron_folder_for(c)
+        groups.setdefault(r['folder'], []).append(r)
+    out = []
+    for name in order:
+        items = groups.get(name) or []
+        if not items:
+            continue
+        crucial = sum(1 for x in items if x.get('crucial'))
+        active = sum(1 for x in items if x.get('enabled'))
+        redundant = sum(1 for x in items if x.get('redundant'))
+        out.append({'name': name, 'count': len(items), 'active': active, 'crucial': crucial, 'redundant': redundant, 'items': items})
+    return out
+
+
+def _dexter_load_contexts(days=14, search='', limit=80, state_db=None, crons=None):
+    """Sessões/chats recentes ligados à operação Zydon/Dexter, resumo seguro.
+
+    Liga cada contexto aos crons que rodam dali: sessões de cron têm id no
+    formato cron_<jobid>_<ts>; chats de origem casam pelo chat/thread do job.
+    Nunca devolve mensagem inteira — só preview curto e truncado.
+    """
+    import sqlite3
+    path = Path(state_db) if state_db else HERMES_STATE_DB
+    if not path.exists():
+        return []
+    try:
+        days = max(1, min(60, int(days or 14)))
+    except Exception:
+        days = 14
+    try:
+        limit = max(1, min(200, int(limit or 80)))
+    except Exception:
+        limit = 80
+    q = str(search or '').strip().lower()
+    crons = crons or []
+    crons_by_id = {c['id']: c for c in crons if c.get('id')}
+    # Mapas de origem (chat/thread) -> crons, para ligar chats de Discord aos jobs.
+    crons_by_chat = {}
+    for c in crons:
+        o = c.get('origin') or {}
+        for key in (o.get('chatId'), o.get('threadId')):
+            key = str(key or '').strip()
+            if key:
+                crons_by_chat.setdefault(key, []).append(c)
+
+    cutoff = time.time() - days * 86400
+    rows = []
+    try:
+        conn = sqlite3.connect('file:%s?mode=ro' % path, uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return []
+    try:
+        cur = conn.execute(
+            "SELECT id, source, title, chat_id, thread_id, chat_type, cwd, "
+            "started_at, ended_at, message_count, tool_call_count "
+            "FROM sessions WHERE started_at >= ? ORDER BY started_at DESC LIMIT 600",
+            (cutoff,),
+        )
+        candidates = cur.fetchall()
+    except Exception:
+        candidates = []
+
+    def _linked_crons(sess):
+        out = []
+        seen = set()
+        sid = str(sess['id'] or '')
+        if sid.startswith('cron_'):
+            parts = sid.split('_', 2)
+            jid = parts[1] if len(parts) > 1 else ''
+            c = crons_by_id.get(jid)
+            if c:
+                out.append(c)
+                seen.add(c['id'])
+        for key in (sess['chat_id'], sess['thread_id']):
+            for c in crons_by_chat.get(str(key or '').strip(), []):
+                if c['id'] not in seen:
+                    out.append(c)
+                    seen.add(c['id'])
+        return [{'id': c['id'], 'name': c['name']} for c in out]
+
+    selected = []
+    for s in candidates:
+        source = str(s['source'] or '').lower()
+        hay = ' '.join(str(s[k] or '') for k in ('title', 'cwd', 'chat_id', 'thread_id')).lower()
+        relevant = source in ('discord', 'cron') or 'zydon' in hay or 'dexter' in hay
+        if not relevant:
+            continue
+        if q and q not in hay and q not in source:
+            continue
+        selected.append(s)
+        if len(selected) >= limit:
+            break
+
+    previews = {}
+    selected_ids = [str(s['id'] or '') for s in selected if str(s['id'] or '')]
+    if selected_ids:
+        try:
+            ph = ','.join('?' for _ in selected_ids)
+            cur = conn.execute(
+                "SELECT session_id, content FROM messages "
+                f"WHERE session_id IN ({ph}) AND content IS NOT NULL "
+                "AND TRIM(content)!='' AND role IN ('user','assistant') "
+                "ORDER BY session_id ASC, timestamp ASC",
+                selected_ids,
+            )
+            for mr in cur.fetchall():
+                sid0 = str(mr['session_id'] or '')
+                txt = _dexter_sanitize_preview(mr['content'], 140)
+                if not txt:
+                    continue
+                rec = previews.setdefault(sid0, {'first': '', 'last': ''})
+                if not rec['first']:
+                    rec['first'] = txt
+                rec['last'] = txt
+        except Exception:
+            previews = {}
+
+    for s in selected:
+        sid = str(s['id'] or '')
+        prev = previews.get(sid) or {}
+        first_prev = prev.get('first') or ''
+        last_prev = prev.get('last') or ''
+
+        def _iso(v):
+            try:
+                return datetime.fromtimestamp(float(v), timezone.utc).isoformat() if v else ''
+            except Exception:
+                return ''
+
+        linked = _linked_crons(s)
+        rows.append({
+            'sessionId': sid,
+            'title': str(s['title'] or '').strip() or '(sem título)',
+            'source': str(s['source'] or '').strip(),
+            'chatId': str(s['chat_id'] or '').strip(),
+            'threadId': str(s['thread_id'] or '').strip(),
+            'chatType': str(s['chat_type'] or '').strip(),
+            'cwd': str(s['cwd'] or '').strip(),
+            'startedAt': _iso(s['started_at']),
+            'endedAt': _iso(s['ended_at']),
+            'messageCount': int(s['message_count'] or 0),
+            'toolCallCount': int(s['tool_call_count'] or 0),
+            'firstPreview': first_prev,
+            'lastPreview': last_prev,
+            'linkedCrons': linked,
+        })
+    try:
+        conn.close()
+    except Exception:
+        pass
+    return rows
+
+
+def _dexter_dep_mtime(jobs_file=None, state_db=None):
+    mt = 0.0
+    for p in (Path(jobs_file) if jobs_file else HERMES_JOBS_FILE, Path(state_db) if state_db else HERMES_STATE_DB):
+        try:
+            mt = max(mt, float(p.stat().st_mtime))
+        except Exception:
+            pass
+    return mt
+
+
+def _dexter_cache_key(uid, days, search, limit, jobs_file=None, state_db=None):
+    return {
+        'uid': str(uid or ''),
+        'days': int(days or 14),
+        'search': str(search or ''),
+        'limit': int(limit or 80),
+        'depsMtime': _dexter_dep_mtime(jobs_file, state_db),
+    }
+
+
+def _dexter_cache_read(key):
+    try:
+        if not DEXTER_CENTER_CACHE_FILE.exists():
+            return None
+        data = json.loads(DEXTER_CENTER_CACHE_FILE.read_text(encoding='utf-8'))
+        if not isinstance(data, dict) or data.get('key') != key:
+            return None
+        if time.time() - float(data.get('ts') or 0) > DEXTER_CENTER_CACHE_TTL:
+            return None
+        payload = data.get('payload')
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _dexter_cache_write(key, payload):
+    try:
+        DEXTER_CENTER_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DEXTER_CENTER_CACHE_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'ts': time.time(), 'key': key, 'payload': payload}, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(DEXTER_CENTER_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def dexter_center_report(uid='rafael', days=14, search='', limit=80, jobs_file=None, state_db=None):
+    """Centralizador Dexter read-only: agendas + crons + contextos.
+
+    Reúne, em uma resposta só, o resumo de agendas (reaproveita agendas_report),
+    os jobs agendados do Hermes (jobs.json) e os chats/sessões recentes da
+    operação (state.db), ligando cada contexto aos crons que rodam dali. Sem
+    qualquer efeito colateral e sem expor prompt completo, token ou JID cru.
+    """
+    brt = timezone(timedelta(hours=-3))
+    try:
+        days = max(1, min(60, int(days or 14)))
+    except Exception:
+        days = 14
+    try:
+        limit = max(1, min(200, int(limit or 80)))
+    except Exception:
+        limit = 80
+
+    cache_key = _dexter_cache_key(uid, days, search, limit, jobs_file, state_db)
+    cached = _dexter_cache_read(cache_key)
+    if cached:
+        cached = dict(cached)
+        cached['cache'] = {'hit': True, 'ttlSeconds': DEXTER_CENTER_CACHE_TTL}
+        return cached
+
+    crons = _dexter_load_crons(jobs_file)
+    if search and str(search).strip():
+        qs = str(search).strip().lower()
+        crons_view = [c for c in crons if qs in (c['name'] + ' ' + c['script'] + ' '
+                      + c['scheduleDisplay'] + ' ' + (c['origin'].get('chatName') or '')).lower()]
+    else:
+        crons_view = crons
+    contexts = _dexter_load_contexts(days=days, search=search, limit=limit, state_db=state_db, crons=crons)
+
+    crons_enabled = sum(1 for c in crons if c['enabled'] and not c['paused'])
+    crons_paused = sum(1 for c in crons if c['paused'])
+    crons_errors = sum(1 for c in crons if c['hasError'])
+
+    agendas_summary = {}
+    try:
+        ag = agendas_report(uid, days=min(days, 30), limit=50)
+        s = ag.get('summary') or {}
+        agendas_summary = {
+            'total': s.get('total', 0),
+            'confirmations': s.get('confirmations', 0),
+            'reminders': s.get('reminders', 0),
+            'groupNotices': s.get('groupNotices', 0),
+            'missingLinkOrFailures': s.get('missingLinkOrFailures', 0),
+            'lastRunAt': s.get('lastRunAt', ''),
+            'scope': (ag.get('meta') or {}).get('scope', ''),
+        }
+    except Exception:
+        agendas_summary = {}
+
+    out = {
+        'ok': True,
+        'generatedAt': datetime.now(brt).isoformat(),
+        'filters': {'days': days, 'search': str(search or ''), 'limit': limit},
+        'summary': {
+            'cronsTotal': len(crons),
+            'cronsEnabled': crons_enabled,
+            'cronsPaused': crons_paused,
+            'cronsErrors': crons_errors,
+            'contextsRecent': len(contexts),
+            'agendas': agendas_summary,
+        },
+        'crons': crons_view,
+        'contexts': contexts,
+    }
+    _dexter_cache_write(cache_key, out)
+    return out
 
 
 def wpp_envios_fastlane_events(ports, max_age_hours=36):
@@ -1421,13 +2355,12 @@ def wpp_envios_fastlane_events(ports, max_age_hours=36):
     for r in _wpp_envios_rows():
         if not isinstance(r, dict):
             continue
+        if is_rafael_mariana_private_chat(r.get('bridge_port') or r.get('dispatchPort') or r.get('port') or r.get('group_bridge_port'), r):
+            continue
         if not _wpp_envio_is_sent_dispatch(r):
             continue
-        chat = str(r.get('to') or r.get('jid') or r.get('lead_jid') or '').strip()
-        try:
-            port = int(r.get('bridge_port') or r.get('port') or 0)
-        except Exception:
-            port = 0
+        chat = _wpp_envio_lead_chat(r)
+        port = _dispatch_port_for_row(r)
         try:
             group_port = int(r.get('group_bridge_port') or 0)
         except Exception:
@@ -2269,6 +3202,11 @@ def dispatch_stats(uid='rafael', days=14, force=False):
         elif _mts and _mts < _now_ts:
             _ao_past_no.append(_item)
             if _ow_out: _ow_out['pastNoOutcome'] += 1
+        else:
+            # Sem horário válido e sem outcome conclusivo ainda é uma agenda sem
+            # desfecho operacional; não pode ficar fora da soma do resumo.
+            _ao_past_no.append(_item)
+            if _ow_out: _ow_out['pastNoOutcome'] += 1
     agenda_outcome = {
         'future': _ao_future[:30],
         'realized': _ao_realized[:30],
@@ -2427,8 +3365,44 @@ def load_ports(ports):
     # para mostrar diagnóstico recém-enviado na inbox.
     items.extend(wpp_envios_fastlane_events(norm_ports))
     items=_dedupe_loaded_items(items)
+    # CH-RT3: fallback de lista para envio operacional ainda não importado pela
+    # bridge (lag/offline > 36h). Só injeta card sintético para conversa SEM nenhum
+    # candidato real/fast-lane; conversa já presente fica intacta (sem duplicar).
+    items=_inject_ledger_fallback_cards(items, norm_ports)
     items.sort(key=lambda x: float(x.get('timestamp') or 0))
     return items
+
+def _inject_ledger_fallback_cards(items, norm_ports):
+    """Garante card de lista para envio operacional que a bridge ainda não importou.
+
+    Contrato (Rafael): todo envio bem-sucedido/cron registrado em wpp_envios.json
+    deve gerar conversa visível para supervisor e/ou SDR correto, mesmo se a bolha
+    real do WhatsApp ainda não chegou. A fast-lane curta (36h) de load_ports cobre
+    só envios recentíssimos; envios entre 36h e a importação da bridge sumiam da
+    lista. Aqui injetamos o evento do ledger (janela ampla) APENAS para (porta,chat)
+    sem nenhum candidato ainda. Assim:
+    - conversa já representada (bolha real OU fast-lane de 36h) não recebe nada → sem duplicar;
+    - conversa ausente ganha um card fiel (texto/anexo/horário do ledger);
+    - quando a bridge importa a bolha real depois, o chat deixa de estar ausente e o
+      card passa a ser dirigido pela mensagem real, colapsando numa timeline única.
+    Os filtros de privacidade/permissão de conversations() continuam valendo sobre
+    o evento injetado (institucional só vira auditoria read-only do SDR dono/supervisor).
+    """
+    present=set()
+    for x in items:
+        if isinstance(x, dict):
+            present.add((int(x.get('port') or 0), canonical_chat_for_message(x)))
+    extra=[]
+    for ev in wpp_envios_fastlane_events(norm_ports, max_age_hours=INBOX_LEDGER_FALLBACK_WINDOW_HOURS):
+        if not isinstance(ev, dict):
+            continue
+        key=(int(ev.get('port') or 0), canonical_chat_for_message(ev))
+        if not key[1] or key in present:
+            continue
+        extra.append(ev)
+    if not extra:
+        return items
+    return items + _dedupe_loaded_items(extra)
 
 def load_all(uid):
     return load_ports(effective_ports(uid))
@@ -2621,30 +3595,16 @@ def short_phone(chat):
 
 
 def real_phone_digits(chat):
-    """Dígitos de telefone BR válido para agrupar JIDs equivalentes.
-
-    Baileys/WhatsApp às vezes grava o envio como `@c.us` e a resposta como
-    `@s.whatsapp.net`/`@lid` com `remoteJidAlt`. Para a UI, esses são a mesma
-    conversa se os dígitos são telefone BR válido. Nunca deriva número de @lid puro.
-    """
-    if not short_phone(chat):
-        return ''
-    return ''.join(ch for ch in str(chat or '') if ch.isdigit())
+    """Dígitos de telefone BR canônico (com DDI 55), usando regra central WhatsApp."""
+    return jid_utils.real_phone_digits(chat)
 
 
 def canonical_chat_for_message(m):
-    if not isinstance(m, dict):
-        return ''
-    for v in (real_jid_from(m), m.get('chat')):
-        d = real_phone_digits(v)
-        if d:
-            return f'{d}@s.whatsapp.net'
-    return str(m.get('chat') or '')
+    return jid_utils.canonical_chat_for_message(m if isinstance(m, dict) else {})
 
 
 def canonical_chat_id(chat):
-    d = real_phone_digits(chat)
-    return f'{d}@s.whatsapp.net' if d else str(chat or '')
+    return jid_utils.canonical_chat_id(chat)
 
 
 def message_matches_chat(m, chat):
@@ -2687,6 +3647,46 @@ def outbound_delivery_jid(port, chat):
     return '', 'chat não é um telefone WhatsApp válido'
 
 
+def normalize_new_conversation_request(uid, body):
+    """Valida início manual de conversa pelo painel, sem criar conversa fantasma.
+
+    A conversa só nasce quando há mensagem inicial enviada por uma bridge real.
+    O telefone é normalizado para PN (`@s.whatsapp.net`) e chips institucionais /
+    pessoais seguem bloqueados para envio direto pelo Channel.
+    """
+    body = body or {}
+    allowed = [int(p) for p in effective_ports(uid) if int(p) in PORTS and not is_institutional_port(int(p))]
+    if not allowed:
+        return None, 'Nenhum chip de envio permitido para este usuário.'
+    raw_port = body.get('port')
+    try:
+        port = int(raw_port) if str(raw_port or '').strip() else allowed[0]
+    except Exception:
+        return None, 'Chip inválido.'
+    if port not in effective_ports(uid):
+        return None, 'Porta nao permitida'
+    if is_institutional_port(port):
+        return None, 'Chip institucional/pessoal somente leitura no Channel'
+    phone_raw = str(body.get('phone') or body.get('telefone') or body.get('chat') or '').strip()
+    digits = re.sub(r'\D+', '', phone_raw)
+    if not digits:
+        return None, 'Informe o telefone do lead.'
+    if not digits.startswith('55') and len(digits) in (10, 11):
+        digits = '55' + digits
+    if not digits.startswith('55') or len(digits) < 12 or len(digits) > 13:
+        return None, 'Telefone deve ser um número brasileiro com DDD.'
+    chat = f'{digits}@s.whatsapp.net'
+    if is_internal_contact(chat):
+        return None, 'Telefone interno Zydon/SDR não pode ser iniciado pelo painel comercial.'
+    text = str(body.get('text') or body.get('message') or '').strip()
+    if not text:
+        return None, 'Escreva a mensagem inicial para abrir a conversa.'
+    target_jid, target_err = outbound_delivery_jid(port, chat)
+    if target_err:
+        return None, target_err
+    return {'port': port, 'chat': chat, 'target_jid': target_jid, 'text': text, 'conv': f'{port}::{canonical_chat_id(target_jid)}'}, ''
+
+
 # Números internos Zydon/SDR/institucionais. Conversas entre esses chips são
 # aquecimento, validação ou coordenação interna — não são leads e não devem
 # poluir inbox/Responder agora.
@@ -2704,8 +3704,7 @@ def chat_digits(chat):
     return ''.join(ch for ch in str(chat or '') if ch.isdigit())
 
 def is_internal_contact(chat):
-    d = chat_digits(chat)
-    return any(d.startswith(n) for n in INTERNAL_WPP_DIGITS)
+    return jid_utils.is_internal_contact(chat)
 
 
 def _is_diag_dispatch(m):
@@ -2795,23 +3794,91 @@ def _auto_sent_ok(m):
     return (not st) or st in {'ok','sent','enviado','enviado_lead','enviado_mql','1','2','manual_nao_mql_convertido_mql','correcao_whatsapp_enviada'} or st.startswith('enviado_') or st.endswith('_enviada')
 
 
+def _message_has_renderable_body(m):
+    if not isinstance(m, dict):
+        return False
+    return bool(_norm_text(m.get('text')) or m.get('mediaUrl') or m.get('mediaPath') or m.get('mediaName') or m.get('mimetype') or m.get('mediaType'))
+
+
+def _baileys_protocol_message(m):
+    mc = (m or {}).get('messageContent')
+    if not isinstance(mc, dict):
+        return {}
+    proto = mc.get('protocolMessage')
+    return proto if isinstance(proto, dict) else {}
+
+
+def _is_delete_revoke_event(m):
+    """Evento técnico de apagar/revogar mensagem vindo da bridge/Baileys.
+
+    O caso real Marildo/M Vezaro chegou como append fromMe sem texto e
+    `messageContent.protocolMessage.type = REVOKE`. Se a timeline renderiza isso
+    vira bolha "(mensagem sem texto)", dando impressão de novo loop. Esses eventos
+    servem para auditoria técnica, mas não são mensagem comercial ao lead.
+    """
+    if not isinstance(m, dict):
+        return False
+    if m.get('delete_revoke_message_id') or m.get('deleted_message_id'):
+        return not _message_has_renderable_body(m)
+    proto = _baileys_protocol_message(m)
+    ptype = str(proto.get('type') or '').upper()
+    return ptype in {'REVOKE', 'EPHEMERAL_SETTING', 'HISTORY_SYNC_NOTIFICATION'} and not _message_has_renderable_body(m)
+
+
+def _is_protocol_control_event(m):
+    """Evento de controle Baileys/WhatsApp sem conteúdo comercial renderizável.
+
+    Casos como `EPHEMERAL_SYNC_RESPONSE` chegam como `notify` inbound sem texto
+    logo após envios reais. Se renderizados, viram bolha "(mensagem sem texto)"
+    e ainda marcam falso "Lead respondeu". ProtocolMessage sem corpo/mídia é
+    sincronização/configuração/revoke, não mensagem do lead.
+    """
+    if not isinstance(m, dict) or _message_has_renderable_body(m):
+        return False
+    proto = _baileys_protocol_message(m)
+    if not proto:
+        return False
+    ptype = str(proto.get('type') or '').upper()
+    return bool(ptype)
+
+
+def _is_reaction_only_event(m):
+    """Reação Baileys sem corpo/mídia não é bolha de conversa.
+
+    Caso real SURGIC/Geraldo: `messageContent.reactionMessage.text=👍` chegou
+    como notify inbound sem texto/mídia e virou "(mensagem sem texto)" na UI.
+    Reação deve enriquecer a bolha alvo no futuro; enquanto isso, não aparece como
+    mensagem vazia nem governa preview/horário do card.
+    """
+    if not isinstance(m, dict) or _message_has_renderable_body(m):
+        return False
+    mc = m.get('messageContent')
+    if not isinstance(mc, dict):
+        return False
+    reaction = mc.get('reactionMessage')
+    return isinstance(reaction, dict) and bool(str(reaction.get('text') or '').strip() or reaction.get('key'))
+
+
+def _is_timeline_technical_event(m):
+    if not isinstance(m, dict):
+        return False
+    if _is_delete_revoke_event(m) or _is_protocol_control_event(m) or _is_reaction_only_event(m):
+        return True
+    return str(m.get('status') or '').lower() == 'deleted_whatsapp_duplicate'
+
+
 def _visible_for_card_last(m):
     """Mensagem que pode governar preview/horário do card da inbox.
 
     Eventos técnicos de apagar/revogar mensagem entram no history como append
-    fromMe sem texto/mídia. Eles devem aparecer no detalhe como contexto técnico
-    quando necessário, mas não podem esconder a última mensagem real do WhatsApp
-    nem empurrar o card para cima com preview vazio.
+    fromMe sem texto/mídia. Eles não podem virar preview nem bolha vazia.
     """
     if not isinstance(m, dict):
         return False
-    if m.get('deleted'):
+    if m.get('deleted') or _is_timeline_technical_event(m):
         return False
-    if m.get('delete_revoke_message_id') or m.get('deleted_message_id'):
-        if not _norm_text(m.get('text')) and not (m.get('mediaUrl') or m.get('mediaPath') or m.get('mediaName') or m.get('mimetype') or m.get('mediaType')):
-            return False
     typ = str(m.get('type') or '')
-    if typ == 'append' and m.get('fromMe') and not _norm_text(m.get('text')) and not (m.get('mediaUrl') or m.get('mediaPath') or m.get('mediaName') or m.get('mimetype') or m.get('mediaType')):
+    if typ == 'append' and m.get('fromMe') and not _message_has_renderable_body(m):
         return False
     return True
 
@@ -3228,10 +4295,9 @@ def conversations(uid):
         # `sdr` (ex.: Breno/Sarah/Lucas). Esse é o atalho seguro para mostrar
         # ao SDR a conversa iniciada por Mariana/Lucas/Rafael enquanto o cache
         # HubSpot confirma/enriquece o owner do deal quando disponível.
-        if not c.get('_sdrHintUid'):
-            hu=_conversation_sdr_hint_from_msg(m)
-            if hu:
-                c['_sdrHintUid']=hu
+        hu=_conversation_sdr_hint_from_msg(m)
+        if hu and (not c.get('_sdrHintUid') or (c.get('_sdrHintUid') not in SDR_OWNER_UIDS and hu in SDR_OWNER_UIDS)):
+            c['_sdrHintUid']=hu
         # CH-003: pistas baratas p/ reler o cache HubSpot (email/empresa) sem rede.
         if not c.get('_hsEmail') and m.get('email'):
             c['_hsEmail'] = str(m.get('email')).strip()
@@ -3244,14 +4310,15 @@ def conversations(uid):
             c['lastTime'] = ts
             c['last'] = m
             c['lastSource'] = source_label(m)
-        if not m.get('fromMe'):
+        incoming_visible = (not m.get('fromMe')) and _visible_for_card_last(m)
+        if incoming_visible:
             c['unread'] += 1
             c['responses'] += 1
             if ts > float(c.get('lastIncomingTime') or 0):
                 c['lastIncomingTime'] = ts
             if ts >= float((c.get('lastIncoming') or {}).get('timestamp') or 0):
                 c['lastIncoming'] = m
-        else:
+        elif m.get('fromMe'):
             if ts > float(c.get('lastOutgoingTime') or 0):
                 c['lastOutgoingTime'] = ts
         if m.get('fromMe'):
@@ -3281,7 +4348,7 @@ def conversations(uid):
         real = c.get('realJid') or ''
         # Telefone exibível: real do alt-JID, senão do chat se for número de verdade.
         # @lid e IDs LID-derivados (sem telefone válido) devolvem '' aqui.
-        display_phone = short_phone(real) or short_phone(chat)
+        display_phone = short_phone(canonical_chat_id(real)) or short_phone(canonical_chat_id(chat))
         # "Protegido" = sem telefone real exibível (inclui @lid e JIDs LID-derivados).
         protected = not display_phone
         c['lid'] = protected
@@ -3398,6 +4465,7 @@ def automation_badge(m):
     if t == 'cron-sdr-primeiro-contato': return 'Automação · 1º contato'
     if t == 'cron-mql-texto': return 'Automação · Diagnóstico'
     if t == 'cron-mql-pdf': return 'Automação · Diagnóstico (PDF)'
+    if _is_diagnostic_pdf_message(m): return 'Automação · Diagnóstico (PDF)'
     if t == 'cron-whatsapp-texto': return 'Automação'
     if t == 'cron-naomql-grupo': return 'Automação · interno'
     return 'Automação'
@@ -3433,6 +4501,57 @@ def _is_diagnostic_pdf_message(m):
 def _same_diagnostic_pdf(a, b):
     return _is_diagnostic_pdf_message(a) and _is_diagnostic_pdf_message(b)
 
+
+# A mídia entregue pela bridge fica no diretório de mídia do canal e é servida via
+# /media/. O PDF de origem que o gerador cria fica em pdfs/ — ter esse caminho NÃO
+# prova que o arquivo foi enviado neste chat/chip.
+_BRIDGE_MEDIA_DIR_MARKER = '/channel_data/media/'
+
+def _pdf_dispatch_has_real_media(m):
+    """True só quando há prova real de que o PDF foi entregue pela bridge.
+
+    Prova real = mídia servida (`mediaUrl`) OU arquivo dentro do diretório de mídia
+    do canal (`mediaPath` em channel_data/media) OU um id real do WhatsApp numa
+    bolha de bridge (`append/notify/message`). Um import de ledger/cron que só
+    herdou o `pdf_path` de origem e o texto "PDF enviado:" não conta como prova.
+    """
+    if not isinstance(m, dict):
+        return False
+    if str(m.get('mediaUrl') or '').strip():
+        return True
+    mp = str(m.get('mediaPath') or '').replace('\\', '/').strip()
+    if mp and _BRIDGE_MEDIA_DIR_MARKER in mp:
+        return True
+    typ = str(m.get('type') or '')
+    if typ in ('append', 'notify', 'message', 'api-send', ''):
+        mid = str(m.get('id') or m.get('messageId') or '').strip().lower()
+        if mid and not mid.startswith(('wpp_', 'seed', 'cron', 'api-send')):
+            return True
+    return False
+
+def _is_unbacked_pdf_dispatch(m):
+    """Evento de PDF/diagnóstico de ledger/cron sem nenhuma prova real de envio.
+
+    Caso real (Secchi/4603, 30/06): o import gravou um `cron-mql-pdf` herdando o
+    PDF do diagnóstico mandado horas antes por OUTRO chip (4610). Sem mediaUrl/
+    arquivo de bridge, isso não pode virar uma bolha "PDF enviado" na timeline —
+    seria inventar um PDF no meio da conversa. O PDF real (com mídia) continua.
+    """
+    if not isinstance(m, dict):
+        return False
+    is_pdf = _is_diagnostic_pdf_message(m)
+    if not is_pdf:
+        if re.search(r'pdf enviado\s*:', str(m.get('text') or ''), flags=re.I):
+            is_pdf = True
+        else:
+            mime = str(m.get('mimetype') or '').lower()
+            mtype = str(m.get('mediaType') or '').lower()
+            blob = ' '.join(str(m.get(k) or '') for k in ('mediaName', 'mediaPath')).lower()
+            is_pdf = ('pdf' in mime) or (mtype == 'document' and '.pdf' in blob)
+    if not is_pdf:
+        return False
+    return not _pdf_dispatch_has_real_media(m)
+
 def collapse_automation(msgs):
     """Funde evento de automação + mensagem enviada idêntica numa bolha única.
 
@@ -3443,6 +4562,42 @@ def collapse_automation(msgs):
     msgs = [m for m in msgs if isinstance(m, dict)]
     events = [m for m in msgs if is_automation_event(m)]
     consumed = set()
+    # Quando um envio saiu em partes reais no WhatsApp, o ledger pode trazer o
+    # texto completo como uma linha adicional. Isso parece duplicação para o SDR.
+    # A cobertura por texto exige 2+ partes; em produção às vezes o history ainda
+    # só expôs uma parte (ou a pergunta final ainda não entrou), mas o ledger já
+    # carrega `send_response.messageIds`. Se qualquer id real do multipart já está
+    # na timeline, o full-text do ledger é somente metadado e não deve virar bolha.
+    real_bridge_ids = {
+        _normalize_bridge_message_id(m.get('id') or m.get('messageId'))
+        for m in msgs
+        if isinstance(m, dict)
+        and m.get('fromMe')
+        and not _ledger_full_text_event(m)
+        and _normalize_bridge_message_id(m.get('id') or m.get('messageId'))
+    }
+    real_bridge_ids.discard('')
+    covered_full_text_events=[]
+    for ev in events:
+        if not _ledger_full_text_event(ev):
+            continue
+        split_ids = _split_send_message_ids(ev)
+        if (split_ids and (split_ids & real_bridge_ids)) or _ledger_text_covered_by_real_parts(ev, msgs, window_sec=600):
+            consumed.add(id(ev))
+            covered_full_text_events.append(ev)
+    if covered_full_text_events:
+        for ev in events:
+            if id(ev) in consumed or not _ledger_full_text_event(ev):
+                continue
+            ev_text=_norm_text(ev.get('text'))
+            ev_chat=canonical_chat_for_message(ev)
+            ev_ts=float(ev.get('timestamp') or 0)
+            for covered in covered_full_text_events:
+                if ev_chat and ev_chat != canonical_chat_for_message(covered):
+                    continue
+                if ev_text and ev_text == _norm_text(covered.get('text')) and abs(ev_ts-float(covered.get('timestamp') or 0)) <= 600:
+                    consumed.add(id(ev))
+                    break
     for m in msgs:
         if not m.get('fromMe') or is_automation_event(m):
             continue  # só mensagens "reais" enviadas (append/notify) puxam um evento
@@ -3465,11 +4620,11 @@ def collapse_automation(msgs):
             # independentemente do horário de importação. Sem id comum, usa janela
             # operacional segura para texto/PDF exatamente iguais.
             if not same_bridge_id:
-                if same_text and delta > 15 * 60:
+                if same_text and delta > AUTOMATION_NEAR_DUP_WINDOW_SEC:
                     continue
-                if same_media and delta > 15 * 60:
+                if same_media and delta > AUTOMATION_NEAR_DUP_WINDOW_SEC:
                     continue
-                if same_diag_pdf and delta > 15 * 60:
+                if same_diag_pdf and delta > AUTOMATION_NEAR_DUP_WINDOW_SEC:
                     continue
             if not (same_bridge_id or same_text or same_media or same_diag_pdf):
                 continue
@@ -3499,6 +4654,11 @@ def collapse_automation(msgs):
     seen_auto={}
     for m in remaining:
         if is_automation_event(m):
+            if _is_unbacked_pdf_dispatch(m):
+                # PDF/diagnóstico herdado do ledger/cron sem prova real de envio
+                # neste chat/chip não vira bolha "PDF enviado". A bolha real (com
+                # mídia/append de documento) continua aparecendo normalmente.
+                continue
             # PDF real da bridge pode chegar como api-send sem texto, e o cron-import
             # entra minutos depois como cron-mql-pdf com texto "PDF enviado: ...".
             # Para PDF de diagnóstico, a mídia é a identidade; texto do ledger não
@@ -3514,7 +4674,7 @@ def collapse_automation(msgs):
             prev_idx=seen_auto.get(ck)
             if ck[0] and (ck[1] or ck[2]) and prev_idx is not None:
                 prev=out[prev_idx]
-                if abs(float(prev.get('timestamp') or 0)-float(m.get('timestamp') or 0)) <= 15*60 and (ck[1] or ck[2] or _same_diagnostic_pdf(prev, m)):
+                if abs(float(prev.get('timestamp') or 0)-float(m.get('timestamp') or 0)) <= AUTOMATION_NEAR_DUP_WINDOW_SEC and (ck[1] or ck[2] or _same_diagnostic_pdf(prev, m)):
                     # Preferir o evento com id/bridge real quando existir.
                     if _event_message_id(m) and not _event_message_id(prev):
                         out[prev_idx]=m
@@ -3604,6 +4764,8 @@ def _raw_history_for_chat(port, chat):
     for m in (rows if isinstance(rows,list) else []):
         if not isinstance(m, dict) or not message_matches_chat(m, chat):
             continue
+        if _is_timeline_technical_event(m):
+            continue
         mm=dict(m); mm['port']=int(mm.get('port') or port); mm['portLabel']=PORTS.get(int(port),{}).get('label',str(port))
         raw_ts=mm.get('timestamp'); fixed_ts=normalize_channel_timestamp(raw_ts)
         if fixed_ts and raw_ts is not None and abs(float(raw_ts or 0)-fixed_ts) > 1:
@@ -3622,9 +4784,42 @@ def _timeline_source_for_chat(port, chat):
     """
     raw=_raw_history_for_chat(port, chat)
     if not is_institutional_port(port):
-        raw.extend(operational_rows_for_chat(port, chat))
-        out=_dedupe_loaded_items(raw); out.sort(key=lambda x: float(x.get('timestamp') or 0)); return out
-    ledger=[m for m in wpp_envios_fastlane_events([int(port)], max_age_hours=24*14) if isinstance(m,dict) and is_institutional_dispatch_msg(m) and message_matches_chat(m, chat)]
+        # Detalhe da conversa = aparelho/history real. O ledger/fila pode criar card
+        # na listagem e autorização operacional, mas não inventa bolha no detalhe.
+        ledger=[m for m in wpp_envios_fastlane_events([int(port)], max_age_hours=INBOX_LEDGER_FALLBACK_WINDOW_HOURS) if isinstance(m,dict) and message_matches_chat(m, chat)]
+        out=[]
+        for m in raw:
+            if not is_real_device_timeline_message(m):
+                continue
+            mm=dict(m)
+            if mm.get('fromMe'):
+                mt=float(mm.get('timestamp') or 0)
+                best=None; best_diff=10**9
+                for ev in ledger:
+                    if canonical_chat_for_message(ev) != canonical_chat_for_message(mm):
+                        continue
+                    ev_mid=_event_message_id(ev); mm_mid=_event_message_id(mm)
+                    if not (_same_dispatch_payload(ev, mm) or (ev_mid and mm_mid and ev_mid == mm_mid) or (mm_mid and mm_mid in _split_send_message_ids(ev))):
+                        continue
+                    et=float(ev.get('timestamp') or 0)
+                    diff=abs(et-mt) if et and mt else 0
+                    if diff <= LEDGER_REAL_MESSAGE_MATCH_WINDOW_SEC and diff < best_diff:
+                        best=ev; best_diff=diff
+                if best:
+                    for k,v in best.items():
+                        if k in LEDGER_METADATA_SKIP_FIELDS:
+                            continue
+                        if v not in (None,'') and not mm.get(k):
+                            mm[k]=v
+                    if not mm.get('automation'):
+                        mm['automation']=automation_badge(best)
+                    if m.get('id') and not mm.get('bridgeMessageId'):
+                        mm['bridgeMessageId']=m.get('id')
+                    mm['timestampSource']='bridge'
+                    mm['source']='bridge+controle/wpp_envios.json:operational-thread'
+            out.append(mm)
+        out=_dedupe_loaded_items(out); out.sort(key=lambda x: float(x.get('timestamp') or 0)); return out
+    ledger=[m for m in wpp_envios_fastlane_events([int(port)], max_age_hours=INBOX_LEDGER_FALLBACK_WINDOW_HOURS) if isinstance(m,dict) and is_institutional_dispatch_msg(m) and message_matches_chat(m, chat)]
     has_ledger=bool(ledger)
     out=[]
     if has_ledger:
@@ -3633,6 +4828,32 @@ def _timeline_source_for_chat(port, chat):
             # Se o history contém também o evento ledger cheio de um envio em partes,
             # não renderize esse full-text; as bolhas reais das partes já estão no raw.
             if m.get('fromMe') and is_institutional_dispatch_msg(m):
+                # Se o history contém também o evento ledger do mesmo PDF, mas a
+                # bolha real do WhatsApp já entrou no out, não renderizar o ledger
+                # como segunda mensagem. A timeline deve mostrar envios reais.
+                mt=float(m.get('timestamp') or 0)
+                duplicate_pdf=False
+                for shown in out:
+                    if not isinstance(shown, dict) or canonical_chat_for_message(shown) != canonical_chat_for_message(m):
+                        continue
+                    if not _same_dispatch_payload(m, shown):
+                        continue
+                    st=float(shown.get('timestamp') or 0)
+                    diff=abs(mt-st) if mt and st else 0
+                    if diff <= LEDGER_REAL_MESSAGE_MATCH_WINDOW_SEC:
+                        if not shown.get('automation'):
+                            shown['automation'] = automation_badge(m)
+                        for k,v in m.items():
+                            if k in LEDGER_METADATA_SKIP_FIELDS:
+                                continue
+                            if v not in (None,'') and not shown.get(k):
+                                shown[k]=v
+                        duplicate_pdf=True
+                        break
+                if duplicate_pdf:
+                    continue
+                if _ledger_text_covered_by_real_parts(m, raw):
+                    continue
                 split_ids=_split_send_message_ids(m)
                 if not split_ids:
                     for ev in ledger:
@@ -3641,6 +4862,33 @@ def _timeline_source_for_chat(port, chat):
                 if split_ids & raw_bridge_ids:
                     continue
             mm=dict(m)
+            best_ledger=None
+            best_diff=10**9
+            mt=float(mm.get('timestamp') or 0)
+            if mm.get('fromMe'):
+                for ev in ledger:
+                    if canonical_chat_for_message(ev) != canonical_chat_for_message(mm):
+                        continue
+                    ev_mid=_event_message_id(ev)
+                    mm_mid=_event_message_id(mm)
+                    if not (_same_dispatch_payload(ev, mm) or (ev_mid and mm_mid and ev_mid == mm_mid) or (mm_mid and mm_mid in _split_send_message_ids(ev))):
+                        continue
+                    et=float(ev.get('timestamp') or 0)
+                    diff=abs(et-mt) if et and mt else 0
+                    if diff <= LEDGER_REAL_MESSAGE_MATCH_WINDOW_SEC and diff < best_diff:
+                        best_ledger=ev; best_diff=diff
+            if best_ledger:
+                for k,v in best_ledger.items():
+                    if k in LEDGER_METADATA_SKIP_FIELDS:
+                        continue
+                    if v not in (None,'') and not mm.get(k):
+                        mm[k]=v
+                if not mm.get('automation'):
+                    mm['automation']=automation_badge(best_ledger)
+                if m.get('id') and not mm.get('bridgeMessageId'):
+                    mm['bridgeMessageId']=m.get('id')
+                mm['timestampSource']='bridge'
+                mm['source']='bridge+controle/wpp_envios.json:operational-thread'
             mm['readOnlyInstitutionalThread']=True
             if not mm.get('fromMe'):
                 mm['readOnlyInstitutionalReply']=True
@@ -3652,15 +4900,9 @@ def _timeline_source_for_chat(port, chat):
             # operacional identificado. Evita vazar conversa pessoal do comunicador.
             if m.get('fromMe') and is_institutional_dispatch_msg(m):
                 out.append(m)
-    # Garante auditoria operacional mesmo quando a bolha real ainda não chegou.
-    for ev in ledger:
-        found=False
-        for m in out:
-            m_mid=_event_message_id(m)
-            if _same_dispatch_payload(ev,m) or (_event_message_id(ev) and _event_message_id(ev)==m_mid) or (m_mid and m_mid in _split_send_message_ids(ev)):
-                found=True; break
-        if not found:
-            ee=dict(ev); ee['timestampSource']=ee.get('timestampSource') or 'ledger'; ee['readOnlyInstitutionalThread']=True; out.append(ee)
+    # Não reinjetar ledger puro como bolha no detalhe. Ele só autoriza/identifica a
+    # conversa operacional; a timeline visual precisa vir do history real do device.
+    out=[m for m in out if is_real_device_timeline_message(m)]
     out=_dedupe_loaded_items(out); out.sort(key=lambda x: float(x.get('timestamp') or 0)); return out
 
 def messages_for(uid, conv_id, autotranscribe=False):
@@ -3675,6 +4917,10 @@ def messages_for(uid, conv_id, autotranscribe=False):
         if not isinstance(m, dict) or not message_matches_chat(m, chat):
             continue
         if is_institutional_port(port) and m.get('fromMe') and not (is_institutional_dispatch_msg(m) or m.get('readOnlyInstitutionalThread')):
+            continue
+        if _is_timeline_technical_event(m):
+            continue
+        if not is_real_device_timeline_message(m):
             continue
         mm=dict(m, port=int(m.get('port') or port), portLabel=PORTS.get(int(m.get('port') or port),{}).get('label',str(m.get('port') or port)))
         _enrich_dispatch_identity(mm)
@@ -3744,9 +4990,9 @@ def post_json(url, payload, timeout=20):
             raise
     raise last_err
 
-def bridge_status(port):
+def bridge_status(port, timeout=CHIP_STATUS_TIMEOUT):
     try:
-        with urllib.request.urlopen(f'http://127.0.0.1:{port}/status', timeout=2) as r:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/status', timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e: return {'connected':False,'error':str(e)}
 
@@ -4476,10 +5722,22 @@ def _is_individual(chat):
     return True
 
 def chip_metrics(port):
-    """Volume enviado e respostas capturadas a partir do histórico do chip."""
-    today = _today_str()
+    """Volume enviado e respostas capturadas a partir do histórico do chip.
+
+    Cacheia por mtime do history para evitar que /api/chips revarra 8
+    arquivos grandes em toda chamada fria. Usa o history cru, sem merge de ledger,
+    porque saúde de chip precisa de volume/respostas do WhatsApp e não de timeline
+    operacional enriquecida. Read-only; invalida quando history_<port>.json muda.
+    """
+    port_i=int(port)
+    sig=(_history_file_mtime(port_i), _today_str())
+    with CHIP_METRICS_LOCK:
+        cached=CHIP_METRICS_CACHE.get(port_i)
+        if cached and cached.get('sig') == sig:
+            return dict(cached.get('data') or {})
+    today = sig[1]
     st = {'volumeTotal':0, 'volumeToday':0, 'responses':0, 'responsesToday':0}
-    for m in read_history(int(port)):
+    for m in _history_raw_rows(port_i):
         if not isinstance(m, dict) or not _is_individual(m.get('chat')):
             continue
         ts = m.get('timestamp')
@@ -4491,7 +5749,11 @@ def chip_metrics(port):
         else:
             st['responses'] += 1
             if day == today: st['responsesToday'] += 1
-    return st
+    with CHIP_METRICS_LOCK:
+        if len(CHIP_METRICS_CACHE) > 64:
+            CHIP_METRICS_CACHE.clear()
+        CHIP_METRICS_CACHE[port_i]={'sig': sig, 'data': dict(st)}
+    return dict(st)
 
 def chip_health(connected, needs_qr, m):
     load_pct = int(round((m['volumeToday'] / max(1, SUGGESTED_DAILY_LIMIT)) * 100))
@@ -4527,14 +5789,33 @@ def chips_for(uid):
     """Chips permitidos do usuário com status, volume, risco e ação sugerida."""
     out=[]; online=attention=offline=0
     paused=load_paused_ports()
-    for p in effective_ports(uid):
+    ports=[int(p) for p in manageable_ports(uid)]
+    status_by_port={}
+    metric_by_port={}
+    active_ports=[p for p in ports if p not in paused]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(ports)))) as ex:
+        status_futs={ex.submit(bridge_status, p): p for p in active_ports}
+        metric_futs={ex.submit(chip_metrics, p): p for p in ports}
+        done_status, _pending_status = concurrent.futures.wait(status_futs, timeout=max(1.0, CHIP_STATUS_TIMEOUT * max(1, len(active_ports))))
+        for fut in done_status:
+            p=status_futs[fut]
+            try: status_by_port[p]=fut.result(timeout=0)
+            except Exception as e: status_by_port[p]={'connected':False,'error':str(e)}
+        for fut,p in status_futs.items():
+            if p not in status_by_port:
+                status_by_port[p]={'connected':False,'error':'status timeout'}
+        for fut in concurrent.futures.as_completed(metric_futs):
+            p=metric_futs[fut]
+            try: metric_by_port[p]=fut.result()
+            except Exception: metric_by_port[p]={'volumeTotal':0,'volumeToday':0,'responses':0,'responsesToday':0}
+    for p in ports:
         port=int(p)
         is_paused = port in paused
         meta=PORTS.get(port, {})
-        st=bridge_status(port) if not is_paused else {'connected': False, 'needsQR': False, 'paused': True}
+        st=(status_by_port.get(port) if not is_paused else {'connected': False, 'needsQR': False, 'paused': True}) or {'connected':False}
         connected=bool(st.get('connected')); needs_qr=bool(st.get('needsQR'))
         err='pausado operacionalmente' if is_paused else str(st.get('error') or '')
-        m=chip_metrics(port)
+        m=metric_by_port.get(port) or {'volumeTotal':0,'volumeToday':0,'responses':0,'responsesToday':0}
         if is_paused:
             rec, risk = 'pausado', 'baixo'
         else:
@@ -5189,6 +6470,1997 @@ def pipeline_focus(uid='rafael'):
     return out
 
 
+def rotinas_access_allowed(uid):
+    """Tela central de rotinas: somente Rafael.
+
+    É o cockpit privado de orquestração comercial do head. SDRs usam /agendas
+    para sua carteira; supervisores/admins não herdam acesso a /rotinas.
+    """
+    return uid in ROTINAS_ALLOWED_USER_IDS
+
+
+def _safe_stat(path):
+    try:
+        st = Path(path).stat()
+        return {'exists': True, 'mtime': st.st_mtime, 'size': st.st_size}
+    except Exception:
+        return {'exists': False, 'mtime': None, 'size': None}
+
+
+def _rotina_age_label(ts):
+    if not ts:
+        return 'sem sinal'
+    age = max(0, time.time() - float(ts))
+    if age < 90:
+        return 'agora'
+    if age < 3600:
+        return f'{int(age//60)} min'
+    if age < 86400:
+        return f'{int(age//3600)} h'
+    return f'{int(age//86400)} d'
+
+
+def _script_label(name):
+    base = Path(name).stem
+    base = re.sub(r'^zydon[_-]?', '', base)
+    base = base.replace('_', ' ').replace('-', ' ')
+    return ' '.join(w.capitalize() if w not in ('sdr','mql','whatsapp') else w.upper() for w in base.split())
+
+
+def _rotinas_script_rows(limit=80):
+    rows = []
+    roots = [(ROTINAS_HERMES_SCRIPTS, 'Hermes cron/wrapper'), (PROJECT / 'scripts', 'Projeto Zydon')]
+    seen = set()
+    allow = re.compile(r'(zydon|whatsapp|mql|sdr|cadencia|agenda|follow|diagnostico|channel|pending|watchdog|monitor)', re.I)
+    for root, origin in roots:
+        try:
+            files = sorted([p for p in root.iterdir() if p.is_file() and p.suffix in ('.sh', '.py')], key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            continue
+        for p in files:
+            if p.name in seen or not allow.search(p.name):
+                continue
+            seen.add(p.name)
+            st = _safe_stat(p)
+            rows.append({'name': p.name, 'label': _script_label(p.name), 'origin': origin, 'path': str(p), 'mtime': st['mtime'], 'age': _rotina_age_label(st['mtime']), 'size': st['size']})
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def _rotinas_process_rows():
+    rows = []
+    try:
+        out = subprocess.run(['bash','-lc', "ps -eo pid,etimes,cmd | grep -E 'channel_panel_v2.py|single-extra.js --port|roteiro_panel.py|envios_dashboard.py' | grep -v grep"], capture_output=True, text=True, timeout=4)
+        for line in out.stdout.splitlines():
+            m = re.match(r'\s*(\d+)\s+(\d+)\s+(.+)$', line)
+            if not m:
+                continue
+            pid, etimes, cmd = m.groups()
+            label = 'Processo'
+            port = ''
+            pm = re.search(r'--port\s+(\d+)', cmd)
+            if pm:
+                port = pm.group(1)
+                label = 'Bridge WhatsApp' if 'single-extra.js' in cmd else f'Channel porta {port}'
+            elif 'channel_panel_v2.py' in cmd:
+                label = 'Channel V2'
+            elif 'roteiro_panel.py' in cmd:
+                label = 'Roteiro'
+            rows.append({'pid': int(pid), 'uptimeSeconds': int(etimes), 'label': label, 'port': port, 'cmd': cmd[:220]})
+    except Exception as e:
+        rows.append({'label': 'Erro ao ler processos', 'error': str(e)})
+    return rows
+
+
+def _rotinas_bridge_rows():
+    rows = []
+    for port in sorted(PORTS):
+        meta = PORTS.get(port, {})
+        status = bridge_status(port)
+        auth_ok = bool(status.get('authExists') or status.get('hasAuth'))
+        rows.append({'port': port, 'label': meta.get('label') or str(port), 'role': meta.get('role') or '', 'connected': bool(status.get('connected')), 'needsQR': bool(status.get('needsQR')), 'authExists': auth_ok, 'ok': bool(status.get('connected') and not status.get('needsQR') and auth_ok)})
+    return rows
+
+
+def _rotinas_watchdog_rows():
+    candidates = [
+        ('Qualidade outbound WhatsApp', ROTINAS_HERMES_SCRIPTS / 'zydon_whatsapp_outbound_quality_monitor.sh', ROTINAS_WATCHDOG_STATE),
+        ('Saúde bridges WhatsApp', ROTINAS_HERMES_SCRIPTS / 'zydon_whatsapp_bridge_health_monitor.sh', None),
+        ('Follow-up SDR unificado', ROTINAS_HERMES_SCRIPTS / 'zydon_sdr_followup_unificado_5min.sh', PROJECT / 'controle' / 'followup_unificado_last_run.json'),
+        ('Ativação SDR (diagnóstico ou F1)', ROTINAS_HERMES_SCRIPTS / 'zydon_sdr_primeiro_contato_fresh_5min.sh', PROJECT / 'controle' / 'sdr_primeiro_contato_last_run.json'),
+        ('MQL / diagnóstico', ROTINAS_HERMES_SCRIPTS / 'zydon_active_mql_qualifier.sh', PROJECT / 'controle' / 'mql_active_qualifier_last_run.json'),
+    ]
+    rows = []
+    for label, script, state in candidates:
+        ss = _safe_stat(script)
+        st = _safe_stat(state) if state else {'exists': False, 'mtime': None, 'size': None}
+        ok = bool(ss['exists']) and (not state or st['exists'])
+        rows.append({'label': label, 'script': str(script), 'scriptExists': ss['exists'], 'state': str(state) if state else '', 'stateExists': st['exists'], 'stateAge': _rotina_age_label(st['mtime']), 'ok': ok})
+    return rows
+
+
+def _rotinas_deep_merge(base, override):
+    out = dict(base)
+    if not isinstance(override, dict):
+        return out
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _rotinas_deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def rotinas_config():
+    cfg = dict(ROTINAS_CONFIG_DEFAULTS)
+    cfg['messagePolicy'] = dict(ROTINAS_CONFIG_DEFAULTS['messagePolicy'])
+    cfg['logPolicy'] = dict(ROTINAS_CONFIG_DEFAULTS['logPolicy'])
+    cfg['backupPolicy'] = dict(ROTINAS_CONFIG_DEFAULTS['backupPolicy'])
+    cfg['gitPolicy'] = dict(ROTINAS_CONFIG_DEFAULTS['gitPolicy'])
+    cfg['journeyOverrides'] = dict(ROTINAS_CONFIG_DEFAULTS['journeyOverrides'])
+    try:
+        if ROTINAS_CONFIG_FILE.exists():
+            data = json.loads(ROTINAS_CONFIG_FILE.read_text(encoding='utf-8'))
+            cfg = _rotinas_deep_merge(cfg, data)
+    except Exception:
+        pass
+    return sanitize_rotinas_config(cfg)
+
+
+def sanitize_rotinas_config(data):
+    data = data if isinstance(data, dict) else {}
+    cfg = _rotinas_deep_merge(ROTINAS_CONFIG_DEFAULTS, data)
+    mode = str(cfg.get('autonomyMode') or 'equilibrado').lower()
+    if mode not in {'conservador', 'equilibrado', 'expansivo'}:
+        mode = 'equilibrado'
+    cfg['autonomyMode'] = mode
+    cfg['notifyOnlyExceptions'] = bool(cfg.get('notifyOnlyExceptions', True))
+    cfg['requireApprovalForDangerousActions'] = True  # trava de segurança fixa nesta fase
+    mp = cfg.get('messagePolicy') if isinstance(cfg.get('messagePolicy'), dict) else {}
+    cfg['messagePolicy'] = {
+        'source': str(mp.get('source') or 'textos_aprovados')[:80],
+        'allowAutoRewrite': bool(mp.get('allowAutoRewrite', False)),
+        'dailyCapPerChip': max(1, min(80, int(mp.get('dailyCapPerChip') or 30))),
+    }
+    lp = cfg.get('logPolicy') if isinstance(cfg.get('logPolicy'), dict) else {}
+    cfg['logPolicy'] = {'retentionDays': max(7, min(365, int(lp.get('retentionDays') or 90))), 'redactPhone': bool(lp.get('redactPhone', True)), 'showTechnicalDetails': bool(lp.get('showTechnicalDetails', False))}
+    bp = cfg.get('backupPolicy') if isinstance(cfg.get('backupPolicy'), dict) else {}
+    cfg['backupPolicy'] = {'enabled': bool(bp.get('enabled', True)), 'intervalMinutes': max(5, min(1440, int(bp.get('intervalMinutes') or 5))), 'destination': str(bp.get('destination') or 'gdrive/rclone')[:120]}
+    gp = cfg.get('gitPolicy') if isinstance(cfg.get('gitPolicy'), dict) else {}
+    cfg['gitPolicy'] = {'enabled': bool(gp.get('enabled', True)), 'commitAfterValidatedChange': bool(gp.get('commitAfterValidatedChange', True)), 'branch': re.sub(r'[^A-Za-z0-9._/-]+', '', str(gp.get('branch') or 'main'))[:80] or 'main'}
+    valid = {j['key'] for j in ROTINAS_JOURNEY_DEFS}
+    overrides = {}
+    raw_over = cfg.get('journeyOverrides') if isinstance(cfg.get('journeyOverrides'), dict) else {}
+    for key, val in raw_over.items():
+        if key not in valid or not isinstance(val, dict):
+            continue
+        overrides[key] = {
+            'enabled': bool(val.get('enabled', True)),
+            'owner': str(val.get('owner') or 'Dexter')[:80],
+            'notes': str(val.get('notes') or '')[:240],
+        }
+    cfg['journeyOverrides'] = overrides
+    cfg['version'] = 1
+    return cfg
+
+
+def save_rotinas_config(data):
+    cfg = sanitize_rotinas_config(data)
+    ROTINAS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ROTINAS_CONFIG_FILE.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True), encoding='utf-8')
+    tmp.replace(ROTINAS_CONFIG_FILE)
+    return cfg
+
+
+def _rotina_journey_for_name(name):
+    n = str(name or '').lower()
+    rules = [
+        # Ativação SDR vem antes de entrada_mql para que o rótulo
+        # "Ativação SDR (diagnóstico ou F1)" não caia em entrada_mql por conter
+        # "diagnóstico". "ativacao/ativação" é específico e não pega "proatividade".
+        ('primeiro_contato', r'primeiro|fresh|inicio|início|ativacao|ativação'),
+        ('entrada_mql', r'mql|diagnostico|diagnóstico|qualifier|pdf'),
+        ('nao_mql', r'nao[_-]?mql|não[_-]?mql|naomql'),
+        ('followup_sdr', r'follow|cadencia|cadência|f1|f2|f3|f4'),
+        ('agenda_no_show', r'agenda|meeting|no[_-]?show|remarc'),
+        ('whatsapp_infra', r'whatsapp|bridge|chip|outbound|canonical|sync'),
+        ('backups_git', r'backup|rclone|git|commit'),
+        ('channel_ui', r'channel|watchdog|monitor|panel|painel|rotinas'),
+    ]
+    for key, pat in rules:
+        if re.search(pat, n):
+            return key
+    return 'channel_ui'
+
+
+def _rotinas_journey_rows(scripts, watchdogs, cfg):
+    by = {j['key']: dict(j, enabled=True, owner='Dexter', notes='', scripts=[], watchdogs=[]) for j in ROTINAS_JOURNEY_DEFS}
+    for key, ov in (cfg.get('journeyOverrides') or {}).items():
+        if key in by:
+            by[key].update(ov)
+    seen = set()
+    for r in scripts:
+        k = _rotina_journey_for_name(r.get('name') or r.get('label'))
+        if k in by and r.get('name') not in seen:
+            by[k]['scripts'].append(r); seen.add(r.get('name'))
+    for w in watchdogs:
+        k = _rotina_journey_for_name(w.get('label') or w.get('script'))
+        if k in by:
+            by[k]['watchdogs'].append(w)
+    rows = []
+    for j in ROTINAS_JOURNEY_DEFS:
+        row = by[j['key']]
+        row['count'] = len(row.get('scripts') or []) + len(row.get('watchdogs') or [])
+        row['ok'] = all(x.get('ok', True) for x in (row.get('watchdogs') or [])) and bool(row.get('enabled', True))
+        rows.append(row)
+    return rows
+
+
+def _rotinas_centralized_modules(uid):
+    """Resumo seguro das telas/abas absorvidas pela Central de Rotinas.
+
+    Não chama followups_dashboard(), porque ele anexa rotinas_summary() e isso
+    criaria recursão. Tudo aqui é read-only e resumido para configuração central.
+    """
+    modules = []
+    try:
+        queue = _followups_json_file(FOLLOWUPS_QUEUE_FILE, {}) or {}
+        matrix_path, matrix = _followups_latest_matrix()
+        qsum = queue.get('summary') if isinstance(queue.get('summary'), dict) else {}
+        modules.append({
+            'key': 'followups', 'label': 'Followups MQL / F1-F4', 'route': '/rotinas',
+            'absorbedFrom': '/followups', 'journey': 'Follow-up SDR', 'status': 'centralizado',
+            'description': 'Pesquisa, fila, textos aprovados, envios e bloqueios de follow-up ficam parametrizados por jornada.',
+            'metrics': [
+                {'label': 'pendentes', 'value': qsum.get('pending_total', 0)},
+                {'label': 'prontos', 'value': qsum.get('ready_total', 0)},
+                {'label': 'pesquisa', 'value': len(matrix.get('leads') or [])},
+            ],
+            'config': {'manifesto': str(FOLLOWUPS_MANIFEST_FILE), 'matrizPesquisa': str(matrix_path or ''), 'modo': 'centralizado em /rotinas'},
+        })
+    except Exception as e:
+        modules.append({'key': 'followups', 'label': 'Followups MQL / F1-F4', 'absorbedFrom': '/followups', 'journey': 'Follow-up SDR', 'status': 'atenção', 'description': type(e).__name__, 'metrics': []})
+    try:
+        p = proatividade_summary(uid)
+        modules.append({
+            'key': 'proatividade', 'label': 'Proatividade / respostas / CRM', 'route': '/rotinas',
+            'absorbedFrom': '/proatividade', 'journey': 'Entrada MQL / CRM', 'status': 'centralizado',
+            'description': 'Decisões recentes, execuções, pontos de atenção, crons e parâmetros do atendimento ficam na configuração central.',
+            'metrics': [
+                {'label': 'decisões', 'value': len(p.get('decisions') or [])},
+                {'label': 'execuções', 'value': len(p.get('executions') or [])},
+                {'label': 'atenções', 'value': len(p.get('attention') or [])},
+                {'label': 'crons', 'value': len([c for c in (p.get('crons') or []) if c.get('enabled')])},
+            ],
+            'config': p.get('config') or {},
+        })
+    except Exception as e:
+        modules.append({'key': 'proatividade', 'label': 'Proatividade / respostas / CRM', 'absorbedFrom': '/proatividade', 'journey': 'Entrada MQL / CRM', 'status': 'atenção', 'description': type(e).__name__, 'metrics': []})
+    try:
+        ag = agendas_report(uid, days=14, limit=80)
+        s = ag.get('summary') or {}
+        modules.append({
+            'key': 'agendas', 'label': 'Agendas / No-show / Introdução', 'route': '/rotinas',
+            'absorbedFrom': '/agendas', 'journey': 'Agenda / No-show / Introdução', 'status': 'centralizado',
+            'description': 'Confirmações, lembretes, remarcações, no-show e handoff ficam acompanhados na orquestração do Dexter; análise de conversão continua na Gestão.',
+            'metrics': [
+                {'label': 'agendas', 'value': s.get('total', 0)},
+                {'label': 'confirmações', 'value': s.get('confirmations', 0)},
+                {'label': 'lembretes', 'value': s.get('reminders', 0)},
+                # Só falha real de envio vira atenção; ausência de link é revisão.
+                {'label': 'falhas de envio', 'value': s.get('sendFailures', 0)},
+                {'label': 'links para revisar', 'value': s.get('needsReview', 0)},
+            ],
+            'config': {'scope': (ag.get('meta') or {}).get('scope', ''), 'modo': 'centralizado em /rotinas'},
+        })
+    except Exception as e:
+        modules.append({'key': 'agendas', 'label': 'Agendas / No-show / Introdução', 'absorbedFrom': '/agendas', 'journey': 'Agenda / No-show / Introdução', 'status': 'atenção', 'description': type(e).__name__, 'metrics': []})
+    try:
+        d = dexter_center_report(uid, days=14, limit=40)
+        s = d.get('summary') or {}
+        modules.append({
+            'key': 'dexter_center', 'label': 'Dexter Center / crons e contextos', 'route': '/rotinas',
+            'absorbedFrom': '/api/dexter-center + bloco em Gestão/Agendas', 'journey': 'Backups / Git / Deploy', 'status': 'centralizado',
+            'description': 'Crons, contextos e origem dos chats deixam de virar aba solta e entram como governança operacional.',
+            'metrics': [
+                {'label': 'crons ativos', 'value': s.get('cronsEnabled', 0)},
+                {'label': 'pausados', 'value': s.get('cronsPaused', 0)},
+                {'label': 'erros', 'value': s.get('cronsErrors', 0)},
+                {'label': 'contextos', 'value': s.get('contextsRecent', 0)},
+            ],
+            'config': {'days': (d.get('filters') or {}).get('days'), 'limit': (d.get('filters') or {}).get('limit')},
+        })
+    except Exception as e:
+        modules.append({'key': 'dexter_center', 'label': 'Dexter Center / crons e contextos', 'absorbedFrom': '/api/dexter-center', 'journey': 'Backups / Git / Deploy', 'status': 'atenção', 'description': type(e).__name__, 'metrics': []})
+    return modules
+
+
+def _rotinas_intelligence_rows(journeys, modules, bridges, watchdogs, scripts, processes, cfg):
+    """Materializa as lentes de negócio que Rafael quer ver em Rotinas.
+
+    É resumo read-only/parametrizável: mostra onde a máquina começa, para onde
+    vai, o que rodou/precisa atenção e onde há redundância. Gestão continua sendo
+    análise; Foco/Agendas continuam preparação/execução SDR.
+    """
+    enabled_journeys = len([j for j in journeys if j.get('enabled', True)])
+    bad_bridges = len([b for b in bridges if not b.get('ok')])
+    bad_watchdogs = len([w for w in watchdogs if not w.get('ok', True) or not w.get('scriptExists', True)])
+    paused_or_warn = len([m for m in modules if str(m.get('status') or '').lower() not in ('centralizado', 'ok')])
+    return [
+        {'key':'journey_end_to_end','label':'Jornada ponta a ponta','value': f"{enabled_journeys}/{len(journeys)}", 'status':'ok', 'description':'Entrada do lead → qualificação → ativação SDR → follows → agenda/no-show → diagnóstico/introdução.'},
+        {'key':'daily_work','label':'Trabalhos realizados no dia','value': len(processes), 'status':'ok', 'description':'Processos vivos, rotinas em execução e superfícies que sustentam a operação de hoje.'},
+        {'key':'alerts','label':'Alertas e atenção','value': bad_bridges + bad_watchdogs + paused_or_warn, 'status':'warn' if (bad_bridges + bad_watchdogs + paused_or_warn) else 'ok', 'description':'Sinais que pedem intervenção sem misturar com análise comercial da Gestão.'},
+        {'key':'redundancies','label':'Redundâncias evitadas','value': len(modules), 'status':'ok', 'description':'Abas/tentativas absorvidas como módulos para não duplicar responsabilidades.'},
+        {'key':'proactivity','label':'Proatividades','value': 'ativo' if (cfg.get('autonomyMode') != 'conservador') else 'conservador', 'status':'ok', 'description':'Regras de exceção, revisão e autonomia comercial controladas por parâmetro.'},
+        {'key':'logs_rotinas','label':'Rastro operacional','value': len(scripts) + len(watchdogs), 'status':'ok', 'description':'Base de conferência recolhida para revisão, sem poluir a leitura principal.'},
+        {'key':'follow_execution','label':'Execução de follows','value': 'F1-F4', 'status':'ok', 'description':'Follows e follow pós-diagnóstico centralizados como jornada, com análise de resultado mantida na Gestão.'},
+        {'key':'business_intelligence','label':'Inteligência de negócio','value': 'materializada', 'status':'ok', 'description':'Conhecimento comercial construído: critérios MQL, Não-MQL, cadência, agenda, no-show, introdução e gargalos.'},
+    ]
+
+
+def _rotinas_simplification_rows(journeys, modules, bridges, watchdogs, scripts, processes, cfg):
+    """Lente executiva de robustez e economia (sem jargão técnico).
+
+    Mostra, em linguagem de decisão, onde a operação já está enxuta, onde há
+    capacidade ociosa, o que dá para escalar e como segurança/auditoria estão
+    preservadas. Não é alerta nem ação: é leitura de maturidade para o Rafael
+    decidir simplificar, economizar ou crescer com confiança.
+    """
+    rows = []
+    absorbed = [m for m in modules if str(m.get('status') or '').lower() == 'centralizado']
+    if absorbed:
+        rows.append({
+            'key': 'unificacao', 'theme': 'Simplificação',
+            'title': 'Telas separadas viraram uma central só',
+            'detail': f'{len(absorbed)} fluxos antes soltos (followups, proatividade, agendas e rotinas automáticas) operam aqui como um só painel, sem responsabilidade duplicada nem retrabalho.',
+            'gain': 'menos retrabalho',
+        })
+    idle_bridges = [b for b in bridges if not b.get('connected')]
+    cap = ((cfg.get('messagePolicy') or {}).get('dailyCapPerChip')) or 30
+    if idle_bridges:
+        rows.append({
+            'key': 'capacidade', 'theme': 'Economia',
+            'title': 'Capacidade de envio parada',
+            'detail': f'{len(idle_bridges)} de {len(bridges)} canais sem conexão ativa. Reconectar ou aposentar o que não se usa libera custo e evita gargalo silencioso.',
+            'gain': 'economia e capacidade',
+        })
+    else:
+        rows.append({
+            'key': 'capacidade', 'theme': 'Escala',
+            'title': 'Capacidade pronta para crescer',
+            'detail': f'{len(bridges)} canais ativos com limite de {cap} mensagens por canal/dia. Dá para aumentar volume de forma previsível, sem risco de bloqueio.',
+            'gain': 'escala com previsibilidade',
+        })
+    auto_off = [j for j in journeys if not j.get('enabled', True)]
+    if auto_off:
+        rows.append({
+            'key': 'cobertura', 'theme': 'Robustez',
+            'title': 'Parte da jornada está pausada',
+            'detail': f'{len(auto_off)} etapa(s) da esteira desligada(s). Reativar fecha buracos onde o lead pode esfriar sem ninguém perceber.',
+            'gain': 'menos lead perdido',
+        })
+    else:
+        rows.append({
+            'key': 'cobertura', 'theme': 'Robustez',
+            'title': 'Esteira coberta de ponta a ponta',
+            'detail': 'Todas as etapas (entrada, qualificação, ativação SDR, follows, agenda, diagnóstico) estão ligadas, então nenhum lead fica sem próximo passo definido.',
+            'gain': 'continuidade garantida',
+        })
+    lp = cfg.get('logPolicy') or {}
+    bp = cfg.get('backupPolicy') or {}
+    rows.append({
+        'key': 'seguranca', 'theme': 'Segurança e revisão',
+        'title': 'Rastro confiável e privacidade preservada',
+        'detail': 'Ações sensíveis seguem exigindo aprovação, telefone do lead fica mascarado e o histórico é guardado por '
+                  + str(lp.get('retentionDays', 90)) + ' dias' + (', com backup automático ' + ('ligado' if bp.get('enabled') else 'desligado'))
+                  + '. Qualquer envio pode ser reconstruído e revisado depois.',
+        'gain': 'pronto para revisão',
+    })
+    redundant = len(scripts) + len(watchdogs)
+    rows.append({
+        'key': 'inventario', 'theme': 'Simplificação',
+        'title': 'Mapa para enxugar redundâncias',
+        'detail': f'{redundant} rotina(s) e monitor(es) catalogados em um só lugar. Ver tudo junto facilita identificar o que é redundante, raro ou já pode sair de cena.',
+        'gain': 'decisão de cortar com clareza',
+    })
+    return rows
+
+
+MQL_PIPELINE_QUEUE_FILE = PROJECT / 'controle' / 'mql_pipeline_queue.json'
+MQL_EXECUTION_QUEUE_FILE = PROJECT / 'controle' / 'mql_execution_queue.json'
+PENDING_LEAD_ALERTS_FILE = PROJECT / 'controle' / 'pending_lead_alerts.json'
+
+
+def _rotinas_read_json(path, default=None):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default
+        return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return default
+
+
+def _rotinas_short(text, limit=220):
+    s = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if len(s) > limit:
+        return s[:limit - 1].rstrip() + '…'
+    return s
+
+
+def _rotinas_execution_index():
+    """Última execução MQL por e-mail/contato, read-only."""
+    data = _rotinas_read_json(MQL_EXECUTION_QUEUE_FILE, {}) or {}
+    items = data.get('items') if isinstance(data, dict) else data
+    out = {}
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        keys = [str(it.get('email') or '').strip().lower(), str(it.get('contact_id') or '').strip()]
+        for k in keys:
+            if k:
+                prev = out.get(k)
+                if not prev or str(it.get('updated_at') or it.get('created_at') or '') >= str(prev.get('updated_at') or prev.get('created_at') or ''):
+                    out[k] = it
+    return out
+
+
+def _rotinas_parse_dt(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _rotinas_ts_key(value):
+    dt = _rotinas_parse_dt(value)
+    return dt.timestamp() if dt else 0
+
+
+def _rotinas_decision_from_state(state, final_status='', executed=False, mql=None):
+    blob = (str(state or '') + ' ' + str(final_status or '')).lower()
+    if executed and mql is True:
+        return ('MQL executado', 'ok', 'Diagnóstico/PDF/WhatsApp/HubSpot concluídos')
+    if executed and mql is False:
+        return ('Não-MQL tratado', 'ok', 'Tratativa concluída')
+    if 'nao_mql' in blob or 'não_mql' in blob or 'final_nao' in blob:
+        return ('Não-MQL', 'no', 'Não seguir diagnóstico automático')
+    if 'mql_enviado' in blob or 'enviado_lead' in blob:
+        return ('MQL enviado', 'ok', 'Diagnóstico enviado ao lead')
+    if 'mql_confirmado' in blob or 'mql_convertido' in blob:
+        return ('MQL confirmado', 'ok', 'Seguir como MQL')
+    if 'mql_candidate' in blob:
+        return ('MQL provável', 'warn', 'Confirmar no pipeline antes do diagnóstico')
+    if 'pending_review' in blob or 'pendente' in blob:
+        return ('Pendente', 'warn', 'Precisa decisão humana')
+    if final_status:
+        return (_rotinas_short(final_status.replace('_', ' '), 60), 'warn', 'Verificar decisão registrada')
+    return ('Sem decisão final', 'warn', 'Entrada detectada; aguardar classificação')
+
+
+def _rotinas_exec_steps_summary(ex):
+    steps = ex.get('steps') if isinstance(ex, dict) and isinstance(ex.get('steps'), dict) else {}
+    labels = []
+    mapping = [('pdf_generated', 'PDF'), ('whatsapp_sent', 'WhatsApp'), ('hubspot_attached', 'HubSpot'), ('group_notified', 'grupo')]
+    for key, label in mapping:
+        st = steps.get(key)
+        if isinstance(st, dict) and st.get('status') in ('done', 'skipped_duplicate'):
+            labels.append(label)
+    return labels
+
+
+def _rotinas_lead_intake_summary(limit=12):
+    """Linha do tempo de entradas de leads e decisão MQL/Não-MQL.
+
+    Rafael precisa ver se o combinado está acontecendo sem caçar em chat/log:
+    entrou lead -> foi classificado? -> MQL/Não-MQL/pendente? -> ação feita?
+    """
+    alerts = _rotinas_read_json(PENDING_LEAD_ALERTS_FILE, {}) or {}
+    pipe = _rotinas_read_json(MQL_PIPELINE_QUEUE_FILE, {}) or {}
+    pipe_items = pipe.get('items') if isinstance(pipe, dict) else pipe
+    execs = _rotinas_execution_index()
+    rows_by_key = {}
+
+    def upsert(key, data):
+        if not key:
+            return
+        cur = rows_by_key.get(key) or {}
+        merged = dict(cur)
+        for k, v in data.items():
+            if v not in (None, '', [], {}):
+                merged[k] = v
+        old_ts = _rotinas_ts_key(cur.get('enteredAt') or cur.get('updatedAt'))
+        new_ts = _rotinas_ts_key(data.get('enteredAt') or data.get('updatedAt'))
+        merged['_sortTs'] = max(old_ts, new_ts, cur.get('_sortTs') or 0)
+        rows_by_key[key] = merged
+
+    alert_items = alerts.items() if isinstance(alerts, dict) else []
+    for key, r in alert_items:
+        if not isinstance(r, dict):
+            continue
+        email = str(r.get('email') or key.split('|')[0]).strip().lower()
+        cid = str(r.get('contact_id') or '').strip()
+        upsert(email or cid, {
+            'key': key,
+            'email': email,
+            'contactId': cid,
+            'enteredAt': r.get('recent_conversion_date') or r.get('createdate') or r.get('alerted_at'),
+            'updatedAt': r.get('finalized_at') or r.get('alerted_at') or r.get('discord_alerted_at'),
+            'source': r.get('source') or '',
+            'state': r.get('channel') or '',
+            'finalStatus': r.get('final_status') or '',
+            'reason': r.get('final_reason') or '',
+        })
+
+    for it in (pipe_items or []):
+        if not isinstance(it, dict):
+            continue
+        email = str(it.get('email') or '').strip().lower()
+        cid = str(it.get('contact_id') or '').strip()
+        upsert(email or cid, {
+            'key': it.get('key') or email or cid,
+            'company': it.get('company') or '',
+            'contact': it.get('firstname') or '',
+            'email': email,
+            'contactId': cid,
+            'phone': it.get('phone') or '',
+            'enteredAt': it.get('recent_conversion_date') or it.get('createdate') or it.get('created_at'),
+            'updatedAt': it.get('updated_at') or it.get('created_at'),
+            'source': it.get('source') or '',
+            'state': it.get('state') or '',
+            'reason': it.get('reason') or '',
+            'siteSummary': it.get('site_summary') or '',
+            'mqlConfirmed': it.get('mql_confirmed'),
+        })
+
+    rows = []
+    for key, r in rows_by_key.items():
+        email = str(r.get('email') or '').strip().lower()
+        cid = str(r.get('contactId') or '').strip()
+        ex = execs.get(email) or execs.get(cid) or {}
+        classification = ex.get('classification') if isinstance(ex.get('classification'), dict) else {}
+        executed = str(ex.get('status') or '').lower() in ('completed', 'done')
+        mql = classification.get('mql') if 'mql' in classification else (True if r.get('mqlConfirmed') is True else None)
+        label, cls, action = _rotinas_decision_from_state(r.get('state'), r.get('finalStatus'), executed, mql)
+        reason = classification.get('reason') or r.get('reason') or ''
+        if not reason and r.get('siteSummary'):
+            reason = 'Pesquisa/site: ' + str(r.get('siteSummary'))
+        steps_done = _rotinas_exec_steps_summary(ex)
+        rows.append({
+            'company': ex.get('company') or r.get('company') or r.get('email') or 'Lead',
+            'contact': r.get('contact') or '',
+            'email': r.get('email') or ex.get('email') or '',
+            'phoneMasked': _cadencia_mask_phone(r.get('phone') or ex.get('phone_norm') or ''),
+            'enteredAt': r.get('enteredAt') or r.get('updatedAt') or ex.get('created_at') or '',
+            'updatedAt': ex.get('updated_at') or r.get('updatedAt') or '',
+            'decision': label,
+            'decisionClass': cls,
+            'nextAction': action,
+            'reason': _rotinas_short(reason, 260),
+            'source': _rotinas_short(r.get('source') or ex.get('source') or '', 160),
+            'stepsDone': steps_done,
+            'state': r.get('state') or '',
+            'finalStatus': r.get('finalStatus') or '',
+            '_sortTs': max(r.get('_sortTs') or 0, _rotinas_ts_key(r.get('enteredAt')), _rotinas_ts_key(ex.get('created_at'))),
+        })
+    rows.sort(key=lambda x: x.get('_sortTs') or 0, reverse=True)
+    visible = rows[:limit]
+    counts = Counter(x.get('decision') or 'Sem decisão' for x in rows)
+    for x in visible:
+        x.pop('_sortTs', None)
+    return {
+        'totalTracked': len(rows),
+        'visible': len(visible),
+        'counts': dict(counts),
+        'items': visible,
+        'updatedAt': datetime.now(BRT_TZ).isoformat(),
+    }
+
+
+def _rotinas_escalated_dependencies(limit=80):
+    """Pendências escaladas/aprovações que hoje aparecem no WhatsApp.
+
+    Fonte real: fila MQL fail-closed + execução posterior. Não aprova, não envia,
+    não escreve HubSpot; apenas materializa na tela a decisão humana pendente.
+    """
+    data = _rotinas_read_json(MQL_PIPELINE_QUEUE_FILE, {}) or {}
+    items = data.get('items') if isinstance(data, dict) else data
+    execs = _rotinas_execution_index()
+    rows = []
+    counts = {'pending': 0, 'approved_or_resolved': 0, 'candidate': 0}
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        state = str(it.get('state') or '').strip()
+        email = str(it.get('email') or '').strip().lower()
+        cid = str(it.get('contact_id') or '').strip()
+        ex = execs.get(email) or execs.get(cid) or {}
+        ex_status = str(ex.get('status') or '').strip()
+        steps = ex.get('steps') if isinstance(ex.get('steps'), dict) else {}
+        resolved = ex_status in ('completed', 'done') or any((isinstance(v, dict) and v.get('status') == 'done') for v in steps.values())
+        if state == 'pending_review' and not resolved:
+            counts['pending'] += 1
+        elif state == 'mql_candidate_needs_main_pipeline' and not resolved:
+            counts['candidate'] += 1
+        elif resolved:
+            counts['approved_or_resolved'] += 1
+        else:
+            continue
+        assignee = 'Rafael' if state == 'pending_review' and not resolved else ('Pipeline MQL / Dexter' if state == 'mql_candidate_needs_main_pipeline' and not resolved else 'Resolvido')
+        status_label = 'Aguardando aprovação' if state == 'pending_review' and not resolved else ('Aguardando confirmação MQL' if state == 'mql_candidate_needs_main_pipeline' and not resolved else 'Aprovado / executado')
+        action = 'Revisar e aprovar MQL ou manter como Não-MQL' if state == 'pending_review' and not resolved else ('Confirmar no pipeline principal antes do diagnóstico' if not resolved else 'Sem ação pendente; manter rastro da decisão')
+        why = []
+        reason = str((ex.get('classification') or {}).get('reason') if isinstance(ex.get('classification'), dict) else '' or it.get('reason') or '')
+        if reason:
+            why.extend([_rotinas_short(x, 180) for x in re.split(r'\s*\|\s*', reason) if x.strip()][:3])
+        site_summary = _rotinas_short(it.get('site_summary'), 180) if it.get('site_summary') else ''
+        if site_summary and not re.search(r'jquery|function\(|/\*!|use strict', site_summary, re.I):
+            why.append('Site/pesquisa: ' + site_summary)
+        if it.get('source'):
+            why.append('Origem: ' + _rotinas_short(it.get('source'), 160))
+        history = []
+        for ev in (it.get('events') or [])[-4:]:
+            if isinstance(ev, dict):
+                history.append({'at': str(ev.get('at') or ''), 'state': str(ev.get('state') or ''), 'reason': _rotinas_short(ev.get('reason'), 160)})
+        if ex:
+            history.append({'at': str(ex.get('updated_at') or ex.get('created_at') or ''), 'state': ex_status or 'execução', 'reason': _rotinas_short((ex.get('classification') or {}).get('reason') if isinstance(ex.get('classification'), dict) else 'Execução registrada', 180)})
+        rows.append({
+            'id': str(it.get('key') or email or cid),
+            'company': str(it.get('company') or ex.get('company') or 'Empresa sem nome'),
+            'contact': str(it.get('firstname') or ''),
+            'email': email,
+            'phoneMasked': _cadencia_mask_phone(it.get('phone') or ex.get('phone_norm') or ''),
+            'source': _rotinas_short(it.get('source') or ex.get('source') or '', 180),
+            'state': state,
+            'status': 'pending' if not resolved and state == 'pending_review' else ('candidate' if not resolved else 'resolved'),
+            'statusLabel': status_label,
+            'assignee': assignee,
+            'updatedAt': str(it.get('updated_at') or it.get('created_at') or ''),
+            'enteredAt': str(it.get('createdate') or it.get('recent_conversion_date') or ''),
+            'reason': _rotinas_short(reason or it.get('reason'), 240),
+            'why': why[:5],
+            'action': action,
+            'executionStatus': ex_status,
+            'stepsDone': [k for k, v in steps.items() if isinstance(v, dict) and v.get('status') == 'done'],
+            'history': history[-5:],
+        })
+    rows.sort(key=lambda r: (0 if r.get('status') == 'pending' else 1, str(r.get('updatedAt') or r.get('enteredAt') or '')), reverse=False)
+    pending_rows = [r for r in rows if r.get('status') == 'pending']
+    other_rows = [r for r in rows if r.get('status') != 'pending']
+    ordered = pending_rows + sorted(other_rows, key=lambda r: str(r.get('updatedAt') or r.get('enteredAt') or ''), reverse=True)
+    return {'total': len(rows), 'pending': counts['pending'], 'candidate': counts['candidate'], 'resolved': counts['approved_or_resolved'], 'items': ordered[:limit]}
+
+
+def _rotinas_recent_followup_worker_summary(limit=18):
+    """Lê logs reais do worker unificado para explicar por que 'prontos' não saiu.
+
+    Não envia WhatsApp e não toca cron. A tela precisa mostrar se o item foi
+    enviado, pulado por conversa real hoje, ou se a janela acabou.
+    """
+    base = PROJECT / 'logs' / 'followup-unificado'
+    rows = []
+    counts = Counter()
+    try:
+        files = sorted(base.glob('worker_*.log'))[-int(limit):]
+    except Exception:
+        files = []
+    for p in files:
+        try:
+            txt = p.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            continue
+        sent = len(re.findall(r'✅ Enviado!|^OK |^SEND |^ENVIANDO ', txt, re.M))
+        skipped = len(re.findall(r'PULADO histórico real WhatsApp hoje|BLOQUEADO|Limite horário|limite global', txt, re.I))
+        owner_m = re.search(r'owner: ([^\n]+)', txt) or re.search(r'SDR: ([^\n]+)', txt)
+        start_m = re.search(r'START ([^\n]+)', txt)
+        end_m = re.search(r'END ([^\n]+)', txt)
+        reasons = []
+        if 'PULADO histórico real WhatsApp hoje' in txt:
+            reasons.append('lead já teve WhatsApp real hoje')
+            counts['already_whatsapp_today'] += skipped
+        if 'require-research' in txt or 'sem pesquisa' in txt.lower():
+            reasons.append('pesquisa obrigatória faltando')
+            counts['research'] += 1
+        if sent:
+            counts['sent_workers'] += sent
+        if skipped:
+            counts['skipped_workers'] += skipped
+        if not sent and not skipped:
+            counts['silent_workers'] += 1
+        rows.append({
+            'file': p.name,
+            'startedAt': start_m.group(1) if start_m else '',
+            'endedAt': end_m.group(1) if end_m else '',
+            'owner': (owner_m.group(1).strip() if owner_m else ''),
+            'sent': sent,
+            'skipped': skipped,
+            'reason': ' · '.join(reasons) or ('sem candidato acionável no tick' if not sent else 'enviado'),
+            'status': 'enviado' if sent else ('pulou' if skipped else 'sem ação'),
+        })
+    return {'counts': dict(counts), 'items': rows[-limit:]}
+
+
+def _rotinas_file_age_seconds(path):
+    try:
+        return max(0, int(time.time() - Path(path).stat().st_mtime))
+    except Exception:
+        return None
+
+
+def _rotinas_followup_execution_health(crons=None):
+    q = _rotinas_read_json(FOLLOWUPS_QUEUE_FILE, {}) or {}
+    summary = q.get('summary') if isinstance(q.get('summary'), dict) else {}
+    ready = int(summary.get('ready_total') or 0)
+    sent = int(summary.get('sent_today_total') or 0)
+    pending = int(summary.get('pending_total') or 0)
+    blocked = int(summary.get('blocked_research_total') or 0)
+    gen = str(q.get('generated_at_brt') or '')
+    sent_by = q.get('sent_today_by_phase') if isinstance(q.get('sent_today_by_phase'), dict) else {}
+    ready_by = q.get('ready_by_phase') if isinstance(q.get('ready_by_phase'), dict) else {}
+    blocked_by = q.get('blocked_research_by_phase') if isinstance(q.get('blocked_research_by_phase'), dict) else {}
+    age = _rotinas_file_age_seconds(FOLLOWUPS_QUEUE_FILE)
+    worker = _rotinas_recent_followup_worker_summary()
+    status = 'ok'
+    title = 'Follows com execução acompanhável'
+    problem = 'Cron oficial roda 1 owner por tick, prioriza Lead Sem Contato e só envia 1 follow por execução para não empilhar conversa.'
+    if age is not None and age > 60 * 90:
+        status = 'attention'
+        title = 'Fila de follow-up com leitura atrasada'
+        problem = f'O número de prontos vem de snapshot antigo ({age//60} min). O coletor pesado está atrasando; o cron de envio pode ter rodado mesmo assim.'
+    elif ready > 0 and worker.get('counts', {}).get('skipped_workers'):
+        title = 'Prontos não significam “mandar tudo agora”'
+        problem = 'O worker encontrou candidatos prontos, mas pulou vários porque já havia WhatsApp real hoje naquela conversa. Isso é proteção correta contra sobreposição.'
+    elif ready > 0 and sent == 0:
+        status = 'attention'
+        title = 'Fila pronta, mas nenhum follow disparado hoje'
+        problem = 'A tela diferencia cron rodando de envio real. Se continuar assim dentro da janela operacional, precisa intervenção.'
+    related = []
+    for c in (crons or []):
+        blob = ' '.join([str(c.get('name') or ''), str(c.get('script') or ''), str(c.get('promptPreview') or '')]).lower()
+        if 'follow' in blob or 'cadencia' in blob or 'cadência' in blob or 'mql_sdr' in blob:
+            related.append({k: c.get(k) for k in ('id','name','enabled','state','scheduleDisplay','lastRunAt','lastStatus','nextRunAt','script')})
+    return {
+        'status': status,
+        'title': title,
+        'problem': problem,
+        'generatedAt': gen,
+        'snapshotAgeSeconds': age,
+        'snapshotStale': bool(age is not None and age > 60 * 90),
+        'pending': pending,
+        'ready': ready,
+        'sentToday': sent,
+        'blockedResearch': blocked,
+        'readyByPhase': ready_by,
+        'blockedResearchByPhase': blocked_by,
+        'sentTodayByPhase': sent_by,
+        'workerSummary': worker,
+        'explain37': [
+            {'title': '37 era snapshot da fila, não ordem de disparar em massa', 'detail': 'O cron oficial envia de forma serializada, 1 owner por tick e com stop-after-sent=1.'},
+            {'title': 'Muitos “prontos” já tinham WhatsApp real hoje', 'detail': 'O worker pulou leads com histórico real no WhatsApp para não sobrepor SDR/comunicador.'},
+            {'title': '161 estavam bloqueados por pesquisa', 'detail': 'Sem pesquisa/estudo obrigatório, o follow-up não deve sair.'},
+            {'title': 'Snapshot da fila ficou velho', 'detail': 'O coletor de status pesado deu timeout; a tela agora mostra idade do snapshot e logs reais do worker.'},
+        ],
+        'relatedCrons': related[:10],
+    }
+
+
+def _rotinas_visible_config_rows(cfg, journeys, modules):
+    mp, lp, bp, gp = cfg.get('messagePolicy') or {}, cfg.get('logPolicy') or {}, cfg.get('backupPolicy') or {}, cfg.get('gitPolicy') or {}
+    return [
+        {'area': 'Mensagens', 'value': f"{mp.get('dailyCapPerChip', 30)} por chip/dia", 'detail': f"Fonte: {mp.get('source') or 'textos_aprovados'}; reescrita automática {'ligada' if mp.get('allowAutoRewrite') else 'desligada'}."},
+        {'area': 'Autonomia', 'value': str(cfg.get('autonomyMode') or 'equilibrado'), 'detail': 'Ações sensíveis continuam travadas por aprovação.'},
+        {'area': 'Alertas', 'value': 'só exceções' if cfg.get('notifyOnlyExceptions') else 'todos os eventos', 'detail': 'Evita ruído; pendências reais aparecem na tela.'},
+        {'area': 'Histórico', 'value': f"{lp.get('retentionDays', 90)} dias", 'detail': 'Telefone mascarado' if lp.get('redactPhone') else 'Telefone visível para revisão interna.'},
+        {'area': 'Backup', 'value': 'ligado' if bp.get('enabled') else 'desligado', 'detail': f"Intervalo: {bp.get('intervalMinutes', 5)} min; destino: {bp.get('destination') or 'gdrive/rclone'}."},
+        {'area': 'Mudanças', 'value': 'com histórico' if gp.get('enabled') else 'sem histórico', 'detail': f"Linha: {gp.get('branch') or 'main'}; salvar após validação {'sim' if gp.get('commitAfterValidatedChange') else 'não'}."},
+        {'area': 'Jornadas', 'value': f"{len([j for j in journeys if j.get('enabled', True)])}/{len(journeys)} ativas", 'detail': f"{len(modules)} módulos centralizados em Rotinas."},
+    ]
+
+
+OUTBOUND_AUDIT_FILE = PROJECT / 'controle' / 'channel_outbound_audit.jsonl'
+PENDING_LEAD_ALERTS_FILE = PROJECT / 'controle' / 'pending_lead_alerts.json'
+INCOMING_RESPONSE_ALERTS_FILE = PROJECT / 'controle' / 'incoming_response_alerts.json'
+
+
+def _rotinas_read_jsonl_tail(path, max_lines=500):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return []
+        lines = p.read_text(encoding='utf-8', errors='ignore').splitlines()[-max_lines:]
+        out = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _rotinas_automation_label(kind):
+    k = str(kind or '').lower()
+    if 'follow' in k or 'mql_sdr_followup' in k:
+        return 'Follow-up SDR'
+    if 'agenda' in k or 'meeting' in k or 'no_show' in k or 'noshow' in k:
+        return 'Agenda / no-show'
+    if 'nao_mql' in k or 'não_mql' in k or 'non_mql' in k:
+        return 'Tratativa Não-MQL'
+    if 'process_gate' in k or 'mql' in k or 'diagnostico' in k or 'diagnóstico' in k:
+        return 'MQL / diagnóstico'
+    if 'incoming' in k or 'response' in k or 'resposta' in k:
+        return 'Resposta / escalação'
+    if 'channel' in k or 'watchdog' in k or 'panel' in k:
+        return 'Painel / monitoramento'
+    if 'backup' in k or 'git' in k or 'deploy' in k:
+        return 'Backup / mudanças'
+    return 'Outras automações'
+
+
+def _rotinas_row_failed(r):
+    if not isinstance(r, dict):
+        return False
+    st = str(r.get('status') or r.get('text_status') or r.get('msg_status') or '').lower()
+    # Estados históricos já corrigidos/neutralizados não são falha operacional
+    # atual. Exemplos reais: telefone inválido superado no mesmo ciclo, aviso de
+    # grupo bloqueado por política e revogado, ou marcação técnica corrigida.
+    if r.get('neutralized_at') or r.get('policy_violation_corrected') or r.get('deleted'):
+        return False
+    if 'superado' in st or st.startswith('correcao_') or st.startswith('correção_'):
+        return False
+    if any(x in st for x in ('erro', 'falha', 'failed', 'invalid', 'inválido', 'invalido')):
+        return True
+    for key in ('response','send_response','text_response','file_response','followup_response','group_response','bridge'):
+        v = r.get(key)
+        if isinstance(v, dict) and v.get('success') is False:
+            return True
+    return False
+
+
+def _rotinas_row_success(r):
+    if not isinstance(r, dict):
+        return False
+    if _rotinas_row_failed(r):
+        return False
+    st = str(r.get('status') or r.get('text_status') or r.get('msg_status') or '').lower()
+    if any(x in st for x in ('ok','enviado','sent','done','success','mql_enviado_lead','nao_mql_grupo')):
+        return True
+    if r.get('messageId') or r.get('message_id'):
+        return True
+    for key in ('response','send_response','text_response','file_response','followup_response','group_response','bridge'):
+        v = r.get(key)
+        if isinstance(v, dict) and v.get('success') is True:
+            return True
+    return False
+
+
+def _rotinas_ts_for_item(r):
+    for k in ('date_tz','ts','at','updated_at','created_at','alerted_at','dt','lastRunAt','last_run_at','date'):
+        v = r.get(k) if isinstance(r, dict) else None
+        if v:
+            return str(v)
+    return ''
+
+
+def _rotinas_automation_audit(crons=None, approvals=None, execution=None, limit=18):
+    """Auditoria executiva das automações da jornada.
+
+    Junta fontes reais sem efeitos colaterais: crons, envios WhatsApp, fila MQL,
+    execução MQL, respostas escaladas e status de follow-up. A finalidade é mostrar
+    sucesso, falha, motivo, pendência e escalação na tela de configuração.
+    """
+    crons = crons or []
+    approvals = approvals or {}
+    execution = execution or {}
+    lanes = {}
+    events = []
+    failures = []
+    pending = []
+    escalated = []
+
+    def lane(name):
+        return lanes.setdefault(name, {'name': name, 'success': 0, 'failure': 0, 'pending': 0, 'escalated': 0, 'lastAt': '', 'examples': []})
+
+    def add(kind, status, title, detail='', at='', owner='', source='', severity='normal'):
+        name = _rotinas_automation_label(kind)
+        ln = lane(name)
+        if status in ('success','ok','done'):
+            ln['success'] += 1
+        elif status in ('failure','error'):
+            ln['failure'] += 1
+        elif status in ('pending','waiting'):
+            ln['pending'] += 1
+        elif status in ('escalated','approval'):
+            ln['escalated'] += 1
+        if at and str(at) > str(ln.get('lastAt') or ''):
+            ln['lastAt'] = str(at)
+        item = {'kind': name, 'status': status, 'title': _rotinas_short(title, 140), 'detail': _rotinas_short(detail, 220), 'at': str(at or ''), 'owner': str(owner or ''), 'source': _rotinas_short(source, 120), 'severity': severity}
+        events.append(item)
+        if status in ('failure','error'):
+            failures.append(item)
+        if status in ('pending','waiting'):
+            pending.append(item)
+        if status in ('escalated','approval'):
+            escalated.append(item)
+        if len(ln['examples']) < 3:
+            ln['examples'].append(item)
+
+    # 1) Crons: sucesso/falha/pendência de execução agendada.
+    for c in crons:
+        if not isinstance(c, dict):
+            continue
+        cname = str(c.get('name') or '')
+        # Legados explicitamente marcados para não reativar não são falha atual
+        # da operação; mantê-los visíveis como erro só confunde Rafael.
+        if cname.startswith('PAUSADO-NAO-REATIVAR-'):
+            continue
+        blob = ' '.join(str(c.get(k) or '') for k in ('name','script','promptPreview'))
+        status = 'pending' if c.get('paused') else 'success'
+        severity = 'normal'
+        last = str(c.get('lastStatus') or '').lower()
+        if c.get('hasError') or (last and last not in ('—','ok','success','done')):
+            status = 'failure'; severity = 'alta'
+        add(blob, status, c.get('name') or 'Rotina agendada', f"agenda: {c.get('scheduleDisplay') or '—'} · última: {c.get('lastRunAt') or '—'} · status: {c.get('lastStatus') or '—'}", c.get('lastRunAt') or c.get('nextRunAt'), source=c.get('script') or 'cron')
+
+    # 2) WhatsApp/outbound: últimas linhas do ledger operacional.
+    try:
+        rows = (_wpp_envios_rows() or [])[-500:]
+    except Exception:
+        rows = []
+    for r in rows:
+        if not isinstance(r, dict) or _wpp_envio_group_only_notice(r):
+            # grupo também importa como alerta, mas não como lead individual; mantemos se tiver falha explícita.
+            if not _rotinas_row_failed(r):
+                continue
+        kind = r.get('msg_type') or r.get('status') or r.get('campaign') or r.get('sender') or 'whatsapp'
+        company = r.get('empresa') or r.get('company') or r.get('lead_name') or r.get('nome') or r.get('email') or 'Envio WhatsApp'
+        owner = r.get('sender_name') or r.get('sdr') or r.get('owner_name') or r.get('sender') or ''
+        if _rotinas_row_failed(r):
+            add(kind, 'failure', f'Falha em {company}', r.get('error') or r.get('reason') or r.get('status') or 'Falha declarada no envio', _rotinas_ts_for_item(r), owner, 'WhatsApp', 'alta')
+        elif _rotinas_row_success(r):
+            add(kind, 'success', f'Envio confirmado: {company}', r.get('text') or r.get('note') or r.get('status') or '', _rotinas_ts_for_item(r), owner, 'WhatsApp')
+
+    # 3) Auditoria de outbound: reconciliação/sucesso/falha.
+    for r in _rotinas_read_jsonl_tail(OUTBOUND_AUDIT_FILE, 500):
+        if not isinstance(r, dict):
+            continue
+        if r.get('event') == 'reconcile':
+            st = 'success' if r.get('status') == 'found' else 'pending'
+            add('whatsapp_reconcile', st, 'Entrega reconciliada' if st == 'success' else 'Entrega aguardando conferência', r.get('messageId') or '', r.get('ts'), source='Conferência WhatsApp')
+        elif r.get('event') == 'send':
+            bridge = r.get('bridge') if isinstance(r.get('bridge'), dict) else {}
+            st = 'failure' if bridge.get('success') is False else ('success' if bridge.get('success') is True or r.get('messageIds') else 'pending')
+            add(r.get('uid') or r.get('sendType') or 'whatsapp', st, 'Disparo WhatsApp registrado', r.get('textPreview') or r.get('fileName') or r.get('targetKind') or '', r.get('ts'), owner=r.get('uid'), source=f"porta {r.get('port') or '—'}", severity='alta' if st == 'failure' else 'normal')
+
+    # 4) Aprovações/pendências MQL já consolidadas.
+    for a in (approvals.get('items') or []):
+        st = 'escalated' if a.get('status') == 'pending' else ('pending' if a.get('status') == 'candidate' else 'success')
+        add('mql_approval', st, a.get('company') or 'Lead em revisão', a.get('action') or a.get('reason') or '', a.get('updatedAt') or a.get('enteredAt'), owner=a.get('assignee'), source='Revisão MQL', severity='alta' if st == 'escalated' else 'normal')
+
+    # 5) Follows: fila pronta sem envio real é falha operacional/pendência de execução.
+    if execution.get('status') == 'attention':
+        add('followup_sdr', 'failure', execution.get('title') or 'Fila pronta sem envio real', f"{execution.get('ready') or 0} prontos · {execution.get('sentToday') or 0} enviados hoje · {execution.get('pending') or 0} pendentes", execution.get('generatedAt'), source='Fila de follow-up', severity='alta')
+    else:
+        add('followup_sdr', 'success', 'Follows acompanhados', f"{execution.get('ready') or 0} prontos · {execution.get('sentToday') or 0} enviados hoje", execution.get('generatedAt'), source='Fila de follow-up')
+
+    # 6) Alertas de novos leads e respostas escaladas.
+    pls = _rotinas_read_json(PENDING_LEAD_ALERTS_FILE, {}) or {}
+    for key, r in list(pls.items())[-80:]:
+        if not isinstance(r, dict):
+            continue
+        done = bool(r.get('final_status') or r.get('finalized_at'))
+        add('mql_alert', 'success' if done else 'escalated', r.get('email') or key, r.get('final_reason') or 'Aguardando análise final', r.get('finalized_at') or r.get('alerted_at'), source='Entrada de lead', severity='alta' if not done else 'normal')
+    inc = _rotinas_read_json(INCOMING_RESPONSE_ALERTS_FILE, {}) or {}
+    seen_incoming = set()
+    incoming_rows = [r for r in (inc.values() if isinstance(inc, dict) else []) if _rotinas_should_surface_incoming_alert(r)]
+    incoming_rows.sort(key=lambda r: str(r.get('alerted_at') or r.get('dt') or ''), reverse=True)
+    for r in incoming_rows[:80]:
+        chat = str(r.get('chat') or '')
+        key = (int(r.get('port') or 0), chat)
+        if key in seen_incoming:
+            continue
+        seen_incoming.add(key)
+        add(
+            'incoming_response',
+            'escalated',
+            _rotinas_incoming_title(r),
+            _rotinas_incoming_detail(r),
+            r.get('alerted_at') or r.get('dt'),
+            owner=f"porta {r.get('port') or '—'}",
+            source='Resposta WhatsApp',
+            severity='alta',
+        )
+
+    # Sumário por lane, recentes e prioridades.
+    lane_rows = list(lanes.values())
+    lane_rows.sort(key=lambda x: (x.get('failure',0)+x.get('pending',0)+x.get('escalated',0), x.get('lastAt') or ''), reverse=True)
+    events.sort(key=lambda x: str(x.get('at') or ''), reverse=True)
+    failures.sort(key=lambda x: str(x.get('at') or ''), reverse=True)
+    pending.sort(key=lambda x: str(x.get('at') or ''), reverse=True)
+    escalated.sort(key=lambda x: str(x.get('at') or ''), reverse=True)
+    totals = {
+        'success': sum(x['success'] for x in lane_rows),
+        'failure': sum(x['failure'] for x in lane_rows),
+        'pending': sum(x['pending'] for x in lane_rows),
+        'escalated': sum(x['escalated'] for x in lane_rows),
+        'lanes': len(lane_rows),
+    }
+    return {'summary': totals, 'lanes': lane_rows[:10], 'recent': events[:limit], 'failures': failures[:limit], 'pending': pending[:limit], 'escalated': escalated[:limit]}
+
+
+
+def _rotinas_my_work(approvals=None, automation=None, limit=80):
+    """Visão explícita do que está com Rafael: pendências, escaladas e histórico."""
+    approvals = approvals or {}
+    automation = automation or {}
+    approval_items = approvals.get('items') or []
+    waiting = []
+    history = []
+    for x in approval_items:
+        if not isinstance(x, dict):
+            continue
+        row = {
+            'type': 'approval',
+            'company': x.get('company') or 'Empresa',
+            'title': x.get('company') or x.get('email') or 'Lead em revisão',
+            'subtitle': 'MQL / diagnóstico',
+            'status': x.get('status') or '',
+            'statusLabel': x.get('statusLabel') or 'revisão',
+            'responsible': x.get('assignee') or 'Rafael',
+            'email': x.get('email') or '',
+            'contact': x.get('contact') or '',
+            'phoneMasked': x.get('phoneMasked') or '',
+            'at': x.get('updatedAt') or x.get('enteredAt') or '',
+            'reason': x.get('reason') or '',
+            'action': x.get('action') or '',
+            'why': x.get('why') or [],
+            'history': x.get('history') or [],
+            'stepsDone': x.get('stepsDone') or [],
+        }
+        if x.get('status') in ('pending', 'candidate'):
+            waiting.append(row)
+        else:
+            history.append(row)
+    escalated = []
+    for x in (automation.get('escalated') or []):
+        if not isinstance(x, dict):
+            continue
+        if x.get('source') != 'Resposta WhatsApp':
+            continue
+        escalated.append({
+            'type': 'escalation',
+            'title': x.get('title') or 'Escalação',
+            'subtitle': x.get('kind') or 'Resposta / escalação',
+            'status': 'escalated',
+            'statusLabel': 'Escalado para você',
+            'responsible': 'Rafael',
+            'at': x.get('at') or '',
+            'reason': x.get('detail') or '',
+            'action': 'Revisar a resposta/contexto e decidir próximo passo',
+            'source': x.get('source') or '',
+            'owner': x.get('owner') or '',
+            'history': [{'at': x.get('at') or '', 'state': 'escalated', 'reason': x.get('detail') or ''}],
+        })
+    for x in (automation.get('failures') or []):
+        if not isinstance(x, dict):
+            continue
+        history.append({
+            'type': 'failure',
+            'title': x.get('title') or 'Falha operacional',
+            'subtitle': x.get('kind') or 'Automação',
+            'status': 'failure',
+            'statusLabel': 'Falha registrada',
+            'responsible': 'Dexter',
+            'at': x.get('at') or '',
+            'reason': x.get('detail') or '',
+            'action': 'Revisar causa e destravar execução',
+            'history': [{'at': x.get('at') or '', 'state': 'failure', 'reason': x.get('detail') or ''}],
+        })
+    waiting.sort(key=lambda r: str(r.get('at') or ''), reverse=True)
+    escalated.sort(key=lambda r: str(r.get('at') or ''), reverse=True)
+    history.sort(key=lambda r: str(r.get('at') or ''), reverse=True)
+    return {
+        'waitingCount': len(waiting),
+        'escalatedCount': len(escalated),
+        'historyCount': len(history),
+        'waiting': waiting[:limit],
+        'escalated': escalated[:limit],
+        'history': history[:limit],
+    }
+
+
+def _rot_metric_value(module, label, default=0):
+    """Lê uma métrica de módulo pelo rótulo, sem expor estrutura técnica na UI."""
+    for x in (module.get('metrics') or []):
+        if str(x.get('label') or '') == label:
+            return x.get('value')
+    return default
+
+
+def _pt_plural(n, singular, plural=None):
+    try:
+        n_i = int(n)
+    except Exception:
+        n_i = 0
+    word = singular if abs(n_i) == 1 else (plural or singular + 's')
+    return f'{n_i} {word}'
+
+
+def _rotinas_incoming_text_label(text, classification=''):
+    raw = re.sub(r'\s+', ' ', str(text or '').strip())
+    t = raw.lower()
+    if not raw or t in {'(sem texto extraído)', 'sem texto extraído'}:
+        if 'áudio' in str(classification).lower() or 'imagem' in str(classification).lower():
+            return 'Áudio/imagem recebido — abrir conversa para decidir'
+        return 'Resposta recebida sem texto legível — abrir conversa para decidir'
+    return raw
+
+
+def _rotinas_should_surface_incoming_alert(row):
+    if not isinstance(row, dict):
+        return False
+    # Suppressed rows are decisions already handled by the classifier. They should
+    # not appear as "escalado para você" because they do not ask Rafael to act.
+    if row.get('suppressed_reason'):
+        return False
+    if str(row.get('action') or '') != 'alerted_or_escalated':
+        return False
+    cls = str(row.get('classification') or '').lower()
+    text_l = str(row.get('text') or '').lower()
+    if 'mensagem_automatica_empresa' in cls or 'automática' in cls or 'automatica' in cls:
+        return False
+    auto_markers = ('obrigado pelo contato', 'conheça nosso catálogo', 'catalogo digital', 'catálogo digital', 'para agilizar seu atendimento', 'retornarei o mais breve possível')
+    if any(x in text_l for x in auto_markers):
+        return False
+    # A /rotinas é a visão do Rafael, não uma caixa de triagem do Dexter.
+    # Preço, agenda, negativa/opt-out, resposta curta e resposta com contexto são
+    # casos operacionais: Dexter/SDR devem responder, mover etapa, criar task ou
+    # encerrar. Só mantemos aqui o que realmente precisa de ajuda humana porque o
+    # conteúdo não está legível ainda (áudio/imagem sem transcrição).
+    operational = (
+        'preço', 'preco', 'custo', 'valor',
+        'levantada de mão', 'levantada de mao', 'ligação', 'ligacao', 'agenda', 'reunião', 'reuniao',
+        'negativa', 'opt-out', 'encerrar', 'resposta curta', 'fraca', 'resposta com contexto',
+    )
+    if any(x in cls for x in operational):
+        return False
+    if 'rafa' in text_l or 'hub' in text_l:
+        return False
+    return ('áudio/imagem sem texto' in cls or 'audio/imagem sem texto' in cls or 'sem texto' in cls)
+
+
+def _rotinas_incoming_title(row):
+    txt = _rotinas_incoming_text_label(row.get('text'), row.get('classification'))
+    if txt.startswith('Áudio/imagem') or txt.startswith('Resposta recebida sem texto'):
+        return txt
+    return 'Resposta de lead aguardando decisão'
+
+
+def _rotinas_incoming_detail(row):
+    txt = _rotinas_incoming_text_label(row.get('text'), row.get('classification'))
+    cls = _norm_text(row.get('classification') or '')
+    if cls:
+        return f'{txt} · {cls}'
+    return txt
+
+
+def _rotinas_headline(journeys, modules, bridges, watchdogs, processes, cfg, approvals=None, execution=None, automation=None):
+    """Traduz o estado da máquina para linguagem de negócio (1º fold de Rotinas).
+
+    Responde, sem números técnicos crus: a máquina está bem hoje? o que rodou
+    hoje? o que pede decisão do Rafael? como está configurada a operação?
+    """
+    approvals = approvals or {}
+    execution = execution or {}
+    automation = automation or {}
+    bad_bridges = [b for b in bridges if not b.get('ok')]
+    bad_watchdogs = [w for w in watchdogs if not w.get('ok', True) or not w.get('scriptExists', True)]
+    disabled = [j for j in journeys if not j.get('enabled', True)]
+    warn_modules = [m for m in modules if str(m.get('status') or '').lower() not in ('centralizado', 'ok')]
+    by_key = {m.get('key'): m for m in modules}
+
+    attention = []
+    for b in bad_bridges:
+        name = b.get('label') or ('Chip ' + str(b.get('port')))
+        attention.append({'area': 'WhatsApp', 'text': f'{name} pedindo reconexão', 'severity': 'alta'})
+    # Monitor só vira alerta quando o wrapper em si está indisponível (quebra real).
+    # Ausência momentânea de estado/última execução não é falha e não pede decisão:
+    # antes gerava ruído como "Primeiro contato SDR sem sinal recente".
+    for w in bad_watchdogs:
+        if not w.get('scriptExists', True):
+            attention.append({'area': 'Monitoramento', 'text': f"{w.get('label')} indisponível", 'severity': 'média'})
+    for j in disabled:
+        attention.append({'area': 'Jornada', 'text': f"{j.get('label')} está desativada", 'severity': 'média'})
+    for m in warn_modules:
+        attention.append({'area': m.get('journey') or 'Operação', 'text': f"{m.get('label')} precisa de revisão", 'severity': 'média'})
+    # Agenda só pede decisão quando há falha real de envio. Convite/lembrete sem
+    # link é qualidade para revisar (não-alerta), nunca alarme.
+    ag = by_key.get('agendas') or {}
+    ag_fail = _rot_metric_value(ag, 'falhas de envio', 0) or 0
+    try:
+        ag_fail = int(ag_fail)
+    except Exception:
+        ag_fail = 0
+    if ag_fail:
+        attention.append({'area': 'Agenda', 'text': f'{ag_fail} falha(s) de envio para revisar', 'severity': 'média'})
+    try:
+        pending_approvals = int(approvals.get('pending') or 0)
+    except Exception:
+        pending_approvals = 0
+    if pending_approvals:
+        attention.append({'area': 'Aprovações', 'text': f'{_pt_plural(pending_approvals, "lead")} aguardando decisão humana', 'severity': 'alta'})
+    if execution.get('status') == 'attention':
+        attention.append({'area': 'Follow-ups', 'text': execution.get('title') or 'Fila pronta sem envio real hoje', 'severity': 'alta'})
+    auto_sum = automation.get('summary') if isinstance(automation.get('summary'), dict) else {}
+    auto_fail = int(auto_sum.get('failure') or 0)
+    auto_pending = int(auto_sum.get('pending') or 0)
+    auto_escalated = int(auto_sum.get('escalated') or 0)
+    if auto_fail:
+        attention.append({'area': 'Automações', 'text': f'{_pt_plural(auto_fail, "falha")} de execução para revisar', 'severity': 'alta'})
+    # Pendência técnica/reconciliação em volume não deve virar decisão no 1º fold.
+    # Só escalação acionável entra aqui; detalhe técnico fica nos blocos abaixo.
+    if auto_escalated:
+        attention.append({'area': 'Respostas', 'text': f'{_pt_plural(auto_escalated, "resposta")} aguardando revisão', 'severity': 'alta'})
+
+    # "Hoje": o que o Dexter efetivamente tocou, em frase de negócio.
+    today = []
+    fu = by_key.get('followups') or {}
+    ready = _rot_metric_value(fu, 'prontos', 0) or 0
+    pending = _rot_metric_value(fu, 'pendentes', 0) or 0
+    if ready or pending:
+        today.append({'icon': 'follow', 'text': f'{_pt_plural(ready, "follow")} prontos e {pending} em acompanhamento'})
+    confs = _rot_metric_value(ag, 'confirmações', 0) or 0
+    rems = _rot_metric_value(ag, 'lembretes', 0) or 0
+    if confs or rems:
+        today.append({'icon': 'agenda', 'text': f'{_pt_plural(confs, "confirmação", "confirmações")} e {_pt_plural(rems, "lembrete")} de agenda'})
+    pro = by_key.get('proatividade') or {}
+    execs = _rot_metric_value(pro, 'execuções', 0) or 0
+    decs = _rot_metric_value(pro, 'decisões', 0) or 0
+    if execs or decs:
+        today.append({'icon': 'auto', 'text': f'{_pt_plural(execs, "execução", "execuções")} e {_pt_plural(decs, "decisão", "decisões")} feitas pelo Dexter'})
+    if not today:
+        today.append({'icon': 'ok', 'text': 'Nada novo agora — pode focar nas conversas e decisões comerciais.'})
+
+    active_journeys = [j for j in journeys if j.get('enabled', True)]
+    work_bits = []
+    if ready or pending:
+        work_bits.append(f'{_pt_plural(ready + pending, "follow")} acompanhados')
+    if confs or rems:
+        work_bits.append(f'{_pt_plural(confs + rems, "agenda/lembrete", "agendas/lembretes")} tratados')
+    if execs or decs:
+        work_bits.append(f'{_pt_plural(execs + decs, "ação", "ações")} de proatividade registradas')
+    work_sentence = '; '.join(work_bits) if work_bits else 'sem novas ações registradas desde a última leitura'
+    status = 'attention' if attention else 'ok'
+    if status == 'ok':
+        status_label = 'O Dexter está conduzindo a jornada sem pedir decisão agora'
+        status_detail = f'Esteira comercial ativa de entrada até diagnóstico/introdução; {work_sentence}.'
+    else:
+        point_count = len(attention)
+        status_label = f'{_pt_plural(point_count, "ponto")} ' + ('pede' if point_count == 1 else 'pedem') + ' sua atenção'
+        status_detail = f'O restante da jornada segue rodando; {work_sentence}.'
+
+    # Configuração em linguagem humana (sem expor chaves técnicas).
+    mp = cfg.get('messagePolicy') or {}
+    lp = cfg.get('logPolicy') or {}
+    bp = cfg.get('backupPolicy') or {}
+    gp = cfg.get('gitPolicy') or {}
+    mode_label = {'conservador': 'conservador', 'equilibrado': 'equilibrado', 'expansivo': 'expansivo'}.get(cfg.get('autonomyMode'), 'equilibrado')
+    config_human = [
+        f'Autonomia em modo {mode_label}',
+        f"Mensagens só de textos aprovados, até {mp.get('dailyCapPerChip', 30)} por chip/dia",
+        ('Backup automático ligado' if bp.get('enabled') else 'Backup automático desligado') + f" a cada {bp.get('intervalMinutes', 5)} min",
+        f"Histórico guardado por {lp.get('retentionDays', 90)} dias" + (', telefone mascarado' if lp.get('redactPhone') else ''),
+        ('Mudanças com histórico seguro' if gp.get('enabled') else 'Mudanças sem histórico automático') + f" ({gp.get('branch', 'main')})",
+    ]
+
+    return {
+        'status': status,
+        'statusLabel': status_label,
+        'statusDetail': status_detail,
+        'attentionCount': len(attention),
+        'attention': attention,
+        'today': today,
+        'config': config_human,
+        'journeyStages': len(active_journeys),
+        'journeyStagesTotal': len(journeys),
+        'technical': {
+            'bridgesOk': len(bridges) - len(bad_bridges),
+            'bridgesTotal': len(bridges),
+            'monitors': len(watchdogs),
+            'processes': len(processes),
+        },
+    }
+
+
+def _rotinas_dispatch_queue_status(limit=12):
+    """Leitura executiva da fila unificada de disparos WhatsApp.
+
+    Read-only: só lê o snapshot local da fila (`whatsapp_dispatch_queue`) e
+    devolve resumo + linhas recentes para o painel. Não enfileira nem envia.
+    """
+    origin_labels = {
+        'diagnostico': 'Diagnóstico',
+        'followup': 'Follow-up',
+        'agenda': 'Agenda',
+        'proatividade': 'Proatividade',
+        'conversa_automatica': 'Conversa automática',
+        'nao_mql': 'Não-MQL',
+        'manual_operacional': 'Manual operacional',
+    }
+    state_labels = {
+        'queued': 'Na fila',
+        'locked': 'Em processamento',
+        'sent': 'Enviado',
+        'skipped': 'Descartado',
+        'failed': 'Falhou',
+        'blocked': 'Bloqueado',
+        'cancelled': 'Cancelado',
+    }
+    capacity = {
+        'dailyUniqueConversationTarget': 1000,
+        'maxSimultaneousConversations': 10,
+        'requiredSdrChips': 6,
+        'perChipDailyTarget': 167,
+        'globalHourlyTarget': 100,
+        'perChipHourlyTarget': 17,
+        'locks': ['lock_by_port', 'lock_by_destination', 'lock_by_dedupe_key'],
+        'mode': 'shadow_until_all_senders_dual_write',
+    }
+    empty = {
+        'ok': True,
+        'capacity': capacity,
+        'summary': {'total': 0, 'queued': 0, 'locked': 0, 'sentToday': 0, 'failed': 0, 'blocked': 0,
+                    'throughputLastHour': 0, 'origins': [], 'byStatus': {}, 'byOrigin': {}, 'byOwner': {}},
+        'origins': [],
+        'rows': [],
+    }
+    try:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location('whatsapp_dispatch_queue', PROJECT / 'scripts' / 'whatsapp_dispatch_queue.py')
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        snap = mod.dispatch_queue_snapshot(limit=int(limit))
+        try:
+            capacity = mod.dispatch_capacity_policy()
+        except Exception:
+            capacity = dict(empty['capacity'])
+    except Exception as exc:
+        empty['ok'] = False
+        empty['error'] = str(exc)
+        return empty
+    summary = snap.get('summary') or {}
+    by_origin = summary.get('byOrigin') or {}
+    origins = [{
+        'origin': o,
+        'label': origin_labels.get(o, o),
+        'count': by_origin.get(o, 0),
+    } for o in sorted(by_origin.keys())]
+    rows = []
+    for r in snap.get('rows') or []:
+        origin = r.get('origin') or ''
+        status = r.get('status') or ''
+        rows.append({
+            'origin': origin_labels.get(origin, origin),
+            'nature': r.get('nature') or '',
+            'owner': r.get('owner') or '—',
+            'destination': r.get('leadKey') or r.get('phone') or r.get('jid') or '—',
+            'port': r.get('port') if r.get('port') is not None else '—',
+            'state': state_labels.get(status, status or '—'),
+            'nextAttempt': r.get('scheduledAt') or '—',
+            'attempts': r.get('attempts') if r.get('attempts') is not None else 0,
+            'dedupe': (str(r.get('dedupeKey') or '')[:14] or '—'),
+            'updatedAt': r.get('updatedAt') or '',
+        })
+    return {
+        'ok': True,
+        'capacity': capacity,
+        'summary': {
+            'total': summary.get('total', 0),
+            'queued': summary.get('queued', 0),
+            'locked': summary.get('locked', 0),
+            'sentToday': summary.get('sentToday', 0),
+            'failed': summary.get('failed', 0),
+            'blocked': summary.get('blocked', 0),
+            'throughputLastHour': summary.get('throughputLastHour', 0),
+            'origins': summary.get('origins', []),
+            'byStatus': summary.get('byStatus', {}),
+            'byOrigin': by_origin,
+            'byOwner': summary.get('byOwner', {}),
+        },
+        'origins': origins,
+        'rows': rows,
+    }
+
+
+def _rotinas_whatsapp_centralizer_status():
+    modules = [
+        ('MessageIntent / nature', PROJECT / 'scripts' / 'whatsapp_message_nature.py'),
+        ('Roteamento multichip', PROJECT / 'scripts' / 'whatsapp_routing.py'),
+        ('Quota shadow', PROJECT / 'scripts' / 'whatsapp_quota_manager.py'),
+        ('Dispatch orchestrator', PROJECT / 'scripts' / 'whatsapp_send_orchestrator.py'),
+        ('Escopo de conversa', PROJECT / 'scripts' / 'whatsapp_conversation_scope.py'),
+        ('Ledger com lock', PROJECT / 'scripts' / 'zydon_operational_queues.py'),
+    ]
+    senders = [
+        ('Follow-up / primeiro contato', PROJECT / 'disparo_dinamico.py'),
+        ('Cadência F1-F4', PROJECT / 'scripts' / 'cadencia_primeiro_contato.py'),
+        ('Diagnóstico MQL', PROJECT / 'scripts' / 'process_gate_once.py'),
+        ('Agenda pós-diagnóstico', PROJECT / 'scripts' / 'agenda_queue_sender.py'),
+        ('Monitor agenda/diagnóstico', PROJECT / 'scripts' / 'monitor_diagnostico_agendado.py'),
+        ('Tratativa Não-MQL', PROJECT / 'scripts' / 'non_mql_legit_outreach.py'),
+    ]
+    def txt(p):
+        try: return p.read_text(encoding='utf-8', errors='ignore')
+        except Exception: return ''
+    sender_rows = []
+    for name, path in senders:
+        s = txt(path)
+        sender_rows.append({
+            'name': name,
+            'file': str(path.relative_to(PROJECT)) if str(path).startswith(str(PROJECT)) else str(path),
+            'centralEnvelope': ('enrich_legacy_row' in s) or ('record_dispatch' in s),
+            'routing': 'choose_outbound_port' in s or name in {'Agenda pós-diagnóstico', 'Monitor agenda/diagnóstico', 'Tratativa Não-MQL'},
+            'lockedLedger': 'append_wpp_envio_locked' in s or 'replace_wpp_envios_locked' in s or 'append_wpp_envio' in s or 'registrar_envio' in s or 'p.save_wpp' in s or 'save_wpp(' in s,
+            'dispatchQueue': 'record_dispatch_shadow' in s or 'enqueue_dispatch' in s or 'enqueue_intent' in s,
+        })
+    return {
+        'modules': [{'name': n, 'ok': p.exists(), 'file': str(p.relative_to(PROJECT))} for n, p in modules],
+        'senders': sender_rows,
+        'summary': {
+            'modulesOk': sum(1 for _n, p in modules if p.exists()),
+            'modulesTotal': len(modules),
+            'sendersWithEnvelope': sum(1 for r in sender_rows if r['centralEnvelope']),
+            'sendersTotal': len(sender_rows),
+            'routingConnected': sum(1 for r in sender_rows if r['routing']),
+            'sendersWithDispatchQueue': sum(1 for r in sender_rows if r['dispatchQueue']),
+        },
+    }
+
+
+def _rotinas_cron_governance(crons, whatsapp_centralizer=None):
+    """Gestão executiva da estrutura: todo cron classificado por papel e contrato.
+
+    Não executa ação. Serve para Rafael enxergar: quem envia WhatsApp comercial,
+    quem só monitora, quem escuta resposta, quem é warmup e quais legados não
+    devem ser reativados sem migração.
+    """
+    commercial = {
+        'zydon_followup_parallel_lanes_launcher.sh': ('Follow-up / primeiro contato', 'centralizado', 'cadencia_primeiro_contato.py → MessageIntent/nature/quota/routing'),
+        'zydon_agenda_queue_sender.sh': ('Agenda pós-diagnóstico', 'centralizado', 'agenda_queue_sender.py → envelope central'),
+        'zydon_monitor_diagnostico_agendado.sh': ('Monitor agenda/diagnóstico', 'centralizado', 'monitor_diagnostico_agendado.py → envelope central'),
+        'zydon_non_mql_legit_backfill.sh': ('Tratativa Não-MQL', 'centralizado', 'non_mql_legit_outreach.py → envelope central'),
+    }
+    paused_legacy_names = ('pausado-nao-reativar', 'lead-sem-contato-primeira-hora', 'mql-sdr-followup', 'cadencia-primeiro-contato-all', 'sdr-primeiro-contato-5min')
+    rows = []
+    counts = {'total': 0, 'active': 0, 'commercialCentralized': 0, 'commercialTotal': 0, 'listener': 0, 'warmup': 0, 'readOnly': 0, 'pausedLegacy': 0, 'needsReviewBeforeEnable': 0}
+
+    def classify(c):
+        name = str(c.get('name') or '')
+        script = str(c.get('script') or '')
+        blob = (name + ' ' + script).lower()
+        enabled = bool(c.get('enabled')) and not bool(c.get('paused'))
+        if any(x in blob for x in paused_legacy_names):
+            return {
+                'type': 'Legado pausado', 'architecture': 'não reativar', 'coverage': 'fora da rota ativa',
+                'safeAction': 'Manter pausado; se voltar, migrar antes para centralizador', 'canEnable': False,
+                'risk': 'alto', 'managed': False, 'countsKey': 'pausedLegacy'
+            }
+        if script in commercial:
+            family, arch, coverage = commercial[script]
+            return {
+                'type': family, 'architecture': arch, 'coverage': coverage,
+                'safeAction': 'Acompanhar fila/log; envio passa pelo contrato central', 'canEnable': True,
+                'risk': 'controlado', 'managed': True, 'countsKey': 'commercialCentralized', 'commercial': True
+            }
+        if 'active-mql-qualifier' in blob or 'prospeccao-autonomo' in blob:
+            return {
+                'type': 'Entrada e qualificação', 'architecture': 'qualificação central',
+                'coverage': 'classifica/gera fila; envio MQL/Não-MQL cai nos senders centralizados',
+                'safeAction': 'Acompanhar decisões e divergências MQL', 'canEnable': True,
+                'risk': 'controlado', 'managed': True, 'countsKey': 'readOnly'
+            }
+        if 'incoming' in blob or 'escuta-respostas' in blob:
+            return {
+                'type': 'Escuta de respostas', 'architecture': 'escopo central',
+                'coverage': 'whatsapp_conversation_scope: só conversa operacional iniciada pelo sistema',
+                'safeAction': 'Acompanhar fila de conversas; não é sender de volume', 'canEnable': True,
+                'risk': 'privacidade', 'managed': True, 'countsKey': 'listener'
+            }
+        if 'warmup' in blob:
+            return {
+                'type': 'Aquecimento WhatsApp', 'architecture': 'separado do comercial',
+                'coverage': 'warmup não mistura quota/lead comercial',
+                'safeAction': 'Manter separado; não usar como sender de lead', 'canEnable': True,
+                'risk': 'baixo', 'managed': True, 'countsKey': 'warmup'
+            }
+        if any(x in blob for x in ('watchdog', 'monitor', 'snapshot', 'relatorio', 'dashboard', 'drive-sync', 'heartbeat', 'health', 'backup', 'performance', 'quality', 'bridge', 'channel', 'roteiro', 'premeeting', 'pre-reuni', 'nextday-followup-research', 'prepare-nextday', 'funnel-audit', 'aprendizado-diario')):
+            return {
+                'type': 'Monitor / painel / read-only', 'architecture': 'não-sender',
+                'coverage': 'não decide chip/envio comercial; observa ou mantém infraestrutura',
+                'safeAction': 'Acompanhar saúde; não precisa MessageIntent', 'canEnable': True,
+                'risk': 'baixo', 'managed': True, 'countsKey': 'readOnly'
+            }
+        return {
+            'type': 'Outras rotinas', 'architecture': 'revisar antes de ação',
+            'coverage': 'sem contrato comercial explícito nesta matriz',
+            'safeAction': 'Revisar script/prompt antes de ativar ou mudar', 'canEnable': False if not enabled else True,
+            'risk': 'médio', 'managed': False, 'countsKey': 'needsReviewBeforeEnable'
+        }
+
+    for c in crons or []:
+        counts['total'] += 1
+        if c.get('enabled') and not c.get('paused'):
+            counts['active'] += 1
+        meta = classify(c)
+        if meta.get('commercial'):
+            counts['commercialTotal'] += 1
+        key = meta.get('countsKey')
+        if key in counts:
+            counts[key] += 1
+        rows.append({
+            'id': c.get('id') or '',
+            'name': c.get('name') or '—',
+            'script': c.get('script') or '—',
+            'enabled': bool(c.get('enabled')),
+            'state': c.get('state') or ('ativo' if c.get('enabled') else 'pausado'),
+            'scheduleDisplay': c.get('scheduleDisplay') or '',
+            'type': meta['type'],
+            'architecture': meta['architecture'],
+            'coverage': meta['coverage'],
+            'safeAction': meta['safeAction'],
+            'canEnable': meta['canEnable'],
+            'risk': meta['risk'],
+            'managed': meta['managed'],
+        })
+    # Ordena para o painel: atenção/legados primeiro, depois senders, depois leitura.
+    priority = {'Legado pausado': 0, 'Outras rotinas': 1, 'Follow-up / primeiro contato': 2, 'Agenda pós-diagnóstico': 3, 'Monitor agenda/diagnóstico': 4, 'Tratativa Não-MQL': 5, 'Entrada e qualificação': 6, 'Escuta de respostas': 7, 'Aquecimento WhatsApp': 8, 'Monitor / painel / read-only': 9}
+    rows.sort(key=lambda r: (priority.get(r.get('type'), 50), r.get('name') or ''))
+    counts['commercialCentralized'] = sum(1 for r in rows if r.get('architecture') == 'centralizado')
+    counts['commercialTotal'] = max(counts['commercialTotal'], counts['commercialCentralized'])
+    return {'summary': counts, 'rows': rows}
+
+
+def _rotinas_omnichannel_architecture(bridges, dexter_crons, whatsapp_centralizer, cron_governance, execution, my_work):
+    """Tela executiva da arquitetura omni: bots, sequências, chips e escuta.
+
+    Objetivo: Rafael acompanhar crescimento para 2 chips por SDR, parar uso de
+    comunicadores na régua comercial e enxergar pendências/escuta sem depender
+    de memória verbal. Read-only.
+    """
+    bridge_by_port = {int(b.get('port')): b for b in bridges or [] if str(b.get('port') or '').isdigit()}
+    sdrs = []
+    communicators = []
+    try:
+        users = USERS if isinstance(USERS, dict) else {}
+    except Exception:
+        users = {}
+    for uid, u in users.items():
+        role = str(u.get('role') or '').lower()
+        ports = [int(p) for p in (u.get('ports') or []) if str(p).isdigit()]
+        if role == 'sdr':
+            connected = sum(1 for p in ports if (bridge_by_port.get(p) or {}).get('connected'))
+            sdrs.append({
+                'ownerUid': uid,
+                'name': u.get('name') or uid,
+                'hubspotOwnerId': str(u.get('hubspot_owner_id') or ''),
+                'ports': ports,
+                'portsLabel': ', '.join(str(p) for p in ports) or 'sem chip',
+                'currentChips': len(ports),
+                'targetChips': 2,
+                'missingChips': max(0, 2 - len(ports)),
+                'connectedChips': connected,
+                'status': 'pronto para 2 chips' if len(ports) >= 2 else 'adicionar 1 chip SDR',
+                'routingRule': 'lead antigo mantém chip; lead novo distribui só dentro dos chips do SDR',
+            })
+        elif role == 'comunicador':
+            communicators.append({
+                'ownerUid': uid,
+                'name': u.get('name') or uid,
+                'ports': ports,
+                'portsLabel': ', '.join(str(p) for p in ports) or 'sem chip',
+                'connectedChips': sum(1 for p in ports if (bridge_by_port.get(p) or {}).get('connected')),
+                'status': 'separado da régua comercial',
+                'rule': 'não entra no pool SDR; usar só operação institucional/warmup até retirada',
+            })
+
+    chip_rows = []
+    for b in bridges or []:
+        port = int(b.get('port') or 0) if str(b.get('port') or '').isdigit() else b.get('port')
+        meta = PORTS.get(port, {}) if isinstance(port, int) else {}
+        role = meta.get('role') or b.get('role') or ''
+        owner = meta.get('owner') or ''
+        chip_rows.append({
+            'port': port,
+            'label': b.get('label') or meta.get('label') or str(port),
+            'role': role,
+            'owner': owner,
+            'connected': bool(b.get('connected')),
+            'needsQR': bool(b.get('needsQR')),
+            'originUse': 'origem SDR' if role == 'sdr' else 'comunicador separado',
+            'destinationUse': 'leads do próprio SDR' if role == 'sdr' else 'não usar para régua SDR',
+            'status': 'conectado' if b.get('connected') and not b.get('needsQR') else ('precisa QR' if b.get('needsQR') else 'atenção'),
+        })
+
+    ws = (whatsapp_centralizer or {}).get('summary') or {}
+    gs = (cron_governance or {}).get('summary') or {}
+    w = my_work or {}
+    e = execution or {}
+    bot_rows = [
+        {'bot': 'Qualificador MQL', 'owns': 'entrada do lead, MQL/Não-MQL e diagnóstico', 'status': 'ativo', 'handoff': 'gera envio por sender centralizado'},
+        {'bot': 'Orquestrador de envio', 'owns': 'natureza, quota, origem/destino, ledger e roteamento', 'status': f"{ws.get('sendersWithEnvelope',0)}/{ws.get('sendersTotal',0)} senders", 'handoff': 'bloqueia regressão por contrato/testes'},
+        {'bot': 'Régua F1–F4', 'owns': 'follow-up e primeiro contato por SDR', 'status': f"{e.get('ready',0)} prontos · {e.get('sentToday',0)} enviados hoje", 'handoff': 'usar chips SDR; comunicadores fora da régua'},
+        {'bot': 'Escuta operacional', 'owns': 'respostas de conversas iniciadas pelo sistema', 'status': f"{w.get('waitingCount',0)} pendências · {w.get('escalatedCount',0)} escaladas", 'handoff': 'não escuta pessoal nem chip↔chip'},
+        {'bot': 'Quota manager', 'owns': 'capacidade por classe de mensagem', 'status': 'shadow', 'handoff': 'próximo passo: enforcement gradual'},
+    ]
+    sequence_rows = [
+        {'stage': 'Entrada', 'bot': 'Qualificador MQL', 'sender': 'process_gate_once / active_mql', 'chipOrigin': 'SDR dono ou diagnóstico', 'destination': 'lead MQL', 'listen': 'sim, se conversa operacional', 'state': 'central'},
+        {'stage': 'Não-MQL', 'bot': 'Tratativa legítima', 'sender': 'non_mql_legit_outreach', 'chipOrigin': 'comunicador autorizado hoje', 'destination': 'lead Não-MQL', 'listen': 'sim, se disparo registrado', 'state': 'central'},
+        {'stage': 'Primeiro contato / F1–F4', 'bot': 'Régua SDR', 'sender': 'cadencia_primeiro_contato', 'chipOrigin': 'chips do SDR', 'destination': 'lead do SDR', 'listen': 'sim, follow-through do agente', 'state': 'central'},
+        {'stage': 'Agenda / no-show', 'bot': 'Agenda', 'sender': 'agenda_queue_sender / monitor_diagnostico', 'chipOrigin': 'chip da conversa', 'destination': 'lead agendado', 'listen': 'sim, agenda/levantada escala', 'state': 'central'},
+        {'stage': 'Escuta', 'bot': 'Listener', 'sender': 'zydon_incoming_response_alert', 'chipOrigin': 'todos os chips operacionais', 'destination': 'fila agente ou Rafael', 'listen': 'somente iniciado pelo sistema', 'state': 'escopo central'},
+    ]
+    guardrail_rows = [
+        {'rule': 'Escuta', 'contract': 'só conversa iniciada por automação/disparo/manual operacional', 'visible': 'pendências e escaladas aparecem em Conversas/Ajuda', 'gap': 'fila de resposta autônoma ainda precisa virar worker'},
+        {'rule': 'Chip origem', 'contract': 'SDR envia por seus próprios chips; lead antigo preserva afinidade', 'visible': 'mapa SDR → chips nesta tela', 'gap': 'adicionar 1 chip por SDR amanhã'},
+        {'rule': 'Chip destino', 'contract': 'sempre lead/carteira; nunca chip↔chip como lead', 'visible': 'coluna destino por sequência', 'gap': 'parar comunicadores na régua comercial'},
+        {'rule': 'Quota', 'contract': 'contagem por mensagem lógica e classe de envio', 'visible': 'shadow no centralizador', 'gap': 'ligar enforcement gradual'},
+    ]
+    return {
+        'summary': {
+            'sdrs': len(sdrs),
+            'sdrChips': sum(x.get('currentChips') or 0 for x in sdrs),
+            'targetSdrChips': sum(x.get('targetChips') or 0 for x in sdrs),
+            'missingSdrChips': sum(x.get('missingChips') or 0 for x in sdrs),
+            'communicators': len(communicators),
+            'connectedChips': sum(1 for b in bridges or [] if b.get('connected')),
+            'commercialCronsCentralized': gs.get('commercialCentralized', 0),
+            'commercialCronsTotal': gs.get('commercialTotal', 0),
+        },
+        'sdrs': sorted(sdrs, key=lambda x: x.get('name') or ''),
+        'communicators': sorted(communicators, key=lambda x: x.get('name') or ''),
+        'chips': sorted(chip_rows, key=lambda x: int(x.get('port') or 0)),
+        'bots': bot_rows,
+        'sequences': sequence_rows,
+        'guardrails': guardrail_rows,
+    }
+
+
+
+def _rotinas_ops_integrity_status(crons=None):
+    """Acompanhamento executivo de Backup Drive, GitHub e deploy seguro.
+
+    Read-only: só verifica pré-requisitos, arquivos e estado local. Não roda sync,
+    não cria commit, não faz push e não promove produção.
+    """
+    crons = crons or []
+    def exists(path):
+        try:
+            p = Path(path)
+            st = p.stat()
+            return {'exists': True, 'path': str(p), 'ageSeconds': max(0, int(time.time() - st.st_mtime)), 'size': st.st_size}
+        except Exception:
+            return {'exists': False, 'path': str(path), 'ageSeconds': None, 'size': None}
+    def run(cmd, cwd=None, timeout=4):
+        try:
+            out = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=timeout)
+            return {'ok': out.returncode == 0, 'code': out.returncode, 'out': (out.stdout or '').strip()[:800], 'err': (out.stderr or '').strip()[:800]}
+        except Exception as e:
+            return {'ok': False, 'code': -1, 'out': '', 'err': type(e).__name__ + ': ' + str(e)[:300]}
+    def related_crons(*needles):
+        ns = [str(n).lower() for n in needles]
+        rows = []
+        for c in crons:
+            blob = ' '.join(str(c.get(k) or '') for k in ('name','script','promptPreview')).lower()
+            if any(n in blob for n in ns):
+                rows.append({k: c.get(k) for k in ('id','name','enabled','state','scheduleDisplay','lastRunAt','lastStatus','nextRunAt','script')})
+        return rows[:8]
+    def card(key, title, status, summary, checks, next_steps, crons_rows=None):
+        attention = sum(1 for x in checks if x.get('state') != 'ok')
+        return {'key': key, 'title': title, 'status': status, 'summary': summary, 'attention': attention, 'checks': checks, 'nextSteps': next_steps, 'crons': crons_rows or []}
+
+    rclone_bin = run(['bash','-lc','command -v rclone || true'])
+    rclone_path = rclone_bin['out'] if rclone_bin['out'] else ''
+    rclone_conf = exists('/root/.config/rclone/rclone.conf')
+    remotes = run(['rclone','listremotes'], timeout=5) if rclone_path else {'ok': False, 'out': '', 'err': 'rclone não instalado'}
+    has_gdrive = 'gdrive:' in (remotes.get('out') or '')
+    sync_script = exists('/root/.hermes/scripts/sync_drive.sh')
+    project_status = exists(PROJECT / 'BACKUP_STATUS.md')
+    failed_flags = []
+    try:
+        failed_flags = sorted(PROJECT.glob('controle/releases/channel-v2/*/logs/BACKUP_FAILED.flag'), key=lambda x: x.stat().st_mtime, reverse=True)[:5]
+    except Exception:
+        failed_flags = []
+    backup_checks = [
+        {'label': 'rclone instalado', 'state': 'ok' if bool(rclone_path) else 'attention', 'detail': rclone_path or 'instalar rclone'},
+        {'label': 'credencial Drive', 'state': 'ok' if rclone_conf['exists'] and has_gdrive else 'attention', 'detail': 'gdrive: configurado' if has_gdrive else 'falta /root/.config/rclone/rclone.conf com remote gdrive:'},
+        {'label': 'script de sync', 'state': 'ok' if sync_script['exists'] else 'attention', 'detail': sync_script['path']},
+        {'label': 'status de backup', 'state': 'ok' if project_status['exists'] else 'attention', 'detail': 'BACKUP_STATUS.md existe' if project_status['exists'] else 'sem status consolidado'},
+        {'label': 'falha recente', 'state': 'attention' if failed_flags else 'ok', 'detail': str(failed_flags[0]) if failed_flags else 'nenhuma flag de falha em releases recentes'},
+    ]
+    backup_status = 'attention' if any(x['state'] != 'ok' for x in backup_checks) else 'ok'
+
+    git_dir = exists(PROJECT / '.git')
+    git_status = run(['git','status','--short'], cwd=PROJECT) if git_dir['exists'] else {'ok': False, 'out': '', 'err': 'não é repositório git'}
+    git_branch = run(['git','branch','--show-current'], cwd=PROJECT) if git_dir['exists'] else {'ok': False, 'out': '', 'err': ''}
+    git_remote = run(['git','remote','-v'], cwd=PROJECT) if git_dir['exists'] else {'ok': False, 'out': '', 'err': ''}
+    gh_path = run(['bash','-lc','command -v gh || true'])
+    git_checks = [
+        {'label': 'repositório local', 'state': 'ok' if git_dir['exists'] else 'attention', 'detail': '.git encontrado' if git_dir['exists'] else 'inicializar repo/remote'},
+        {'label': 'branch', 'state': 'ok' if (git_branch.get('out') or '').strip() else 'attention', 'detail': (git_branch.get('out') or 'sem branch')},
+        {'label': 'remote', 'state': 'ok' if (git_remote.get('out') or '').strip() else 'attention', 'detail': (git_remote.get('out') or 'sem remote configurado')[:220]},
+        {'label': 'alterações locais', 'state': 'attention' if (git_status.get('out') or '').strip() else ('ok' if git_dir['exists'] else 'attention'), 'detail': (git_status.get('out') or 'árvore limpa' if git_dir['exists'] else 'sem git')[:220]},
+        {'label': 'GitHub CLI', 'state': 'ok' if (gh_path.get('out') or '').strip() else 'attention', 'detail': gh_path.get('out') or 'gh não instalado/autenticado'},
+    ]
+    git_status_label = 'attention' if any(x['state'] != 'ok' for x in git_checks) else 'ok'
+
+    gate = exists(PROJECT / 'scripts/channel_v2_release_gate.sh')
+    safe_deploy = exists(PROJECT / 'scripts/channel_v2_safe_deploy.sh')
+    releases = []
+    try:
+        releases = sorted((PROJECT / 'controle/releases/channel-v2').glob('*'), key=lambda x: x.stat().st_mtime, reverse=True)[:5]
+    except Exception:
+        releases = []
+    latest_release = releases[0] if releases else None
+    deploy_checks = [
+        {'label': 'release gate', 'state': 'ok' if gate['exists'] else 'attention', 'detail': gate['path']},
+        {'label': 'safe deploy', 'state': 'ok' if safe_deploy['exists'] else 'attention', 'detail': safe_deploy['path']},
+        {'label': 'último release', 'state': 'ok' if latest_release else 'attention', 'detail': str(latest_release) if latest_release else 'sem release candidate'},
+        {'label': 'stage privado', 'state': 'ok', 'detail': 'validar em 8891 antes de qualquer promoção'},
+    ]
+
+    cards = [
+        card('backup_drive', 'Backup Drive', backup_status, 'Garante cópia externa dos dados/arquivos operacionais.', backup_checks, [
+            'Manter rclone instalado e remote gdrive: autorizado.',
+            'Sync deve incluir controle/, uploads/PDFs e whatsapp-extra/channel_data.',
+            'Resolver qualquer BACKUP_FAILED.flag antes de considerar operação segura.',
+        ], related_crons('drive', 'backup', 'rclone')),
+        card('github', 'GitHub / histórico de mudança', git_status_label, 'Mostra se existe repositório, remote e alterações não salvas.', git_checks, [
+            'Inicializar/conectar remote privado antes de depender de histórico externo.',
+            'Commit só depois de teste e stage aprovados; push só com credencial/remote configurados.',
+            'Não confundir backup Drive com versionamento de código.',
+        ], related_crons('git', 'github', 'commit')),
+        card('deploy', 'Deploy seguro / rollback', 'ok' if all(x['state']=='ok' for x in deploy_checks[:2]) else 'attention', 'Mantém mudança em candidate/stage antes da produção.', deploy_checks, [
+            'Rodar release_gate e safe_deploy stage para cada mudança de painel.',
+            'Promover produção só após candidate 8891 validado.',
+            'Rollback fica pelo safe_deploy; não matar 8280 manualmente.',
+        ], related_crons('channel-v2', 'deploy', 'watchdog', 'performance')),
+    ]
+    return {'status': 'attention' if any(c['status'] != 'ok' for c in cards) else 'ok', 'attention': sum(c.get('attention',0) for c in cards), 'cards': cards}
+
+def rotinas_summary(uid):
+    if not rotinas_access_allowed(uid):
+        return {'ok': False, 'error': 'rotinas_forbidden'}
+    bridges = _rotinas_bridge_rows()
+    scripts = _rotinas_script_rows()
+    watchdogs = _rotinas_watchdog_rows()
+    processes = _rotinas_process_rows()
+    cfg = rotinas_config()
+    journeys = _rotinas_journey_rows(scripts, watchdogs, cfg)
+    modules = _rotinas_centralized_modules(uid)
+    intelligence = _rotinas_intelligence_rows(journeys, modules, bridges, watchdogs, scripts, processes, cfg)
+    simplification = _rotinas_simplification_rows(journeys, modules, bridges, watchdogs, scripts, processes, cfg)
+    approvals = _rotinas_escalated_dependencies()
+    dexter_crons = _dexter_load_crons()
+    cron_folders = _rotinas_cron_folders(dexter_crons)
+    execution = _rotinas_followup_execution_health(dexter_crons)
+    whatsapp_centralizer = _rotinas_whatsapp_centralizer_status()
+    dispatch_queue = _rotinas_dispatch_queue_status()
+    cron_governance = _rotinas_cron_governance(dexter_crons, whatsapp_centralizer)
+    automation_audit = _rotinas_automation_audit(dexter_crons, approvals, execution)
+    lead_intake = _rotinas_lead_intake_summary()
+    my_work = _rotinas_my_work(approvals, automation_audit)
+    omni_architecture = _rotinas_omnichannel_architecture(bridges, dexter_crons, whatsapp_centralizer, cron_governance, execution, my_work)
+    ops_integrity = _rotinas_ops_integrity_status(dexter_crons)
+    visible_config = _rotinas_visible_config_rows(cfg, journeys, modules)
+    headline = _rotinas_headline(journeys, modules, bridges, watchdogs, processes, cfg, approvals, execution, automation_audit)
+    # O headline deve refletir a fila filtrada do Rafael, não o bruto técnico de
+    # respostas classificadas. Preço, agenda, negativa e resposta curta são
+    # operacionais e não entram como "precisa de Rafael".
+    if isinstance(headline, dict):
+        att = [x for x in (headline.get('attention') or []) if not (isinstance(x, dict) and x.get('area') == 'Respostas')]
+        try:
+            esc_count = int(my_work.get('escalatedCount') or 0)
+        except Exception:
+            esc_count = 0
+        if esc_count:
+            att.append({'area': 'Respostas', 'text': f'{_pt_plural(esc_count, "resposta")} com áudio/imagem para revisar', 'severity': 'alta'})
+        headline['attention'] = att
+    warnings = []
+    bad_bridges = [b for b in bridges if not b.get('ok')]
+    if bad_bridges:
+        warnings.append(f'{len(bad_bridges)} bridge(s) com atenção')
+    missing_watchdogs = [w for w in watchdogs if not w.get('scriptExists')]
+    if missing_watchdogs:
+        warnings.append(f'{len(missing_watchdogs)} watchdog(s) sem wrapper')
+    disabled = [j for j in journeys if not j.get('enabled')]
+    if disabled:
+        warnings.append(f'{len(disabled)} jornada(s) desativada(s)')
+    if (ops_integrity.get('attention') or 0):
+        warnings.append(f"{ops_integrity.get('attention')} ponto(s) em Backup/Git/Deploy")
+    return {'ok': True, 'readOnly': False, 'safeActionsOnly': True, 'scope': 'Somente Rafael', 'generatedAt': datetime.now(timezone.utc).isoformat(), 'headline': headline, 'summary': {'bridgesOk': len(bridges)-len(bad_bridges), 'bridgesTotal': len(bridges), 'watchdogs': len(watchdogs), 'scripts': len(scripts), 'processes': len(processes), 'journeys': len(journeys), 'modules': len(modules), 'intelligence': len(intelligence), 'simplification': len(simplification), 'approvals': approvals.get('pending', 0), 'automationFailures': (automation_audit.get('summary') or {}).get('failure', 0), 'automationPending': (automation_audit.get('summary') or {}).get('pending', 0) + (automation_audit.get('summary') or {}).get('escalated', 0), 'opsAttention': ops_integrity.get('attention', 0), 'warnings': warnings}, 'config': cfg, 'visibleConfig': visible_config, 'leadIntake': lead_intake, 'myWork': my_work, 'automationAudit': automation_audit, 'approvals': approvals, 'executionHealth': execution, 'whatsappCentralizer': whatsapp_centralizer, 'dispatchQueue': dispatch_queue, 'cronGovernance': cron_governance, 'opsIntegrity': ops_integrity, 'omniArchitecture': omni_architecture, 'cronFolders': cron_folders, 'modules': modules, 'intelligence': intelligence, 'simplification': simplification, 'journeys': journeys, 'bridges': bridges, 'watchdogs': watchdogs, 'processes': processes, 'scripts': scripts}
+
+
+# --- FOLLOWUPS: cockpit Rafael-only de qualificação / execução --------------
+# Read-only. Centraliza o que Dexter usa para MQL, diagnóstico e régua F1-F4.
+# Não envia WhatsApp, não escreve HubSpot, não edita cron/configuração.
+FOLLOWUPS_ALLOWED_USER_IDS = {'rafael'}
+FOLLOWUPS_MANIFEST_FILE = PROJECT / 'controle' / 'followup_textos_aprovados_rafael_20260630.json'
+FOLLOWUPS_QUEUE_FILE = PROJECT / 'controle' / 'sdr_followup_queue_status.json'
+
+
+def followups_access_allowed(uid):
+    # Rafael-only por produto. Admin só entra se for o próprio Rafael.
+    return uid in FOLLOWUPS_ALLOWED_USER_IDS
+
+
+def _followups_json_file(path, default=None):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default
+        return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return default
+
+
+def _followups_latest_matrix():
+    base = PROJECT / 'docs' / 'followup-research'
+    try:
+        files = sorted(base.glob('*/lead-match-matrix.json'), reverse=True)
+    except Exception:
+        files = []
+    for f in files:
+        data = _followups_json_file(f, {}) or {}
+        leads = data.get('leads') if isinstance(data, dict) else None
+        if isinstance(leads, list):
+            return f, data
+    return None, {'leads': []}
+
+
+def _followups_phase_from_row(r):
+    for k in ('next_attempt', 'attempt_number', 'attempt', 'followup_attempt'):
+        try:
+            n = int(r.get(k) or 0)
+            if 1 <= n <= 4:
+                return f'F{n}'
+        except Exception:
+            pass
+    blob = json.dumps(r, ensure_ascii=False).lower()
+    for n in (1, 2, 3, 4):
+        if f'followup{n}' in blob or f'follow-up {n}' in blob or f'follow_{n}' in blob:
+            return f'F{n}'
+    if 'diagnostico' in blob or 'diagnóstico' in blob:
+        return 'Diagnóstico'
+    if 'nao_mql' in blob or 'não_mql' in blob:
+        return 'Não-MQL'
+    if 'mql' in blob:
+        return 'MQL'
+    return 'Operação'
+
+
+def _followups_latest_dispatch_by_deal():
+    out = {}
+    for r in _wpp_envios_rows():
+        if not isinstance(r, dict) or _wpp_envio_group_only_notice(r):
+            continue
+        deal = str(r.get('deal_id') or r.get('deal') or '').strip()
+        if not deal:
+            continue
+        ts = _parse_wpp_envio_ts(r)
+        dt = datetime.fromtimestamp(ts, timezone.utc) if ts else None
+        cur = out.get(deal)
+        if cur and cur.get('_ts', 0) >= ts:
+            continue
+        port = r.get('bridge_port') or r.get('gateway') or r.get('port') or ''
+        chat = _wpp_envio_lead_chat(r)
+        conv = f'{port}::{chat}' if port and chat else ''
+        out[deal] = {
+            '_ts': ts,
+            'sentAt': dt.astimezone(BRT_TZ).isoformat() if dt else '',
+            'phase': _followups_phase_from_row(r),
+            'status': r.get('status') or '',
+            'sdr': r.get('sdr') or r.get('owner_name') or r.get('sender_name') or '',
+            'messagePreview': str(r.get('text') or r.get('message') or r.get('body') or '')[:220],
+            'conversationUrl': f'/conversas?conv={urllib.parse.quote(conv)}' if conv else '',
+            'hubspotDealUrl': f'https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-3/{deal}' if deal.isdigit() else '',
+        }
+    return out
+
+
+def _followups_manifest_status():
+    data = _followups_json_file(FOLLOWUPS_MANIFEST_FILE, {}) or {}
+    texts = data.get('texts') or {}
+    declared = data.get('sha256') or {}
+    rows = []
+    ok = True
+    for key in ('follow1', 'follow2', 'follow3', 'follow4'):
+        txt = str(texts.get(key) or '')
+        calc = hashlib.sha256(txt.encode('utf-8')).hexdigest() if txt else ''
+        match = bool(txt and declared.get(key) == calc)
+        ok = ok and match
+        rows.append({'key': key.upper().replace('FOLLOW', 'F'), 'chars': len(txt), 'sha256': declared.get(key) or '', 'hashOk': match, 'preview': txt[:180]})
+    return {'ok': ok, 'path': str(FOLLOWUPS_MANIFEST_FILE), 'rows': rows}
+
+
+def followups_dashboard(uid, limit=160):
+    if not followups_access_allowed(uid):
+        return {'ok': False, 'error': 'followups_forbidden'}
+    try:
+        limit = max(20, min(int(limit), 300))
+    except Exception:
+        limit = 160
+    queue = _followups_json_file(FOLLOWUPS_QUEUE_FILE, {}) or {}
+    matrix_path, matrix = _followups_latest_matrix()
+    dispatch_by_deal = _followups_latest_dispatch_by_deal()
+    leads = []
+    counts = Counter()
+    for item in (matrix.get('leads') or [])[:limit]:
+        if not isinstance(item, dict):
+            continue
+        deal = str(item.get('deal_id') or '').strip()
+        q = item.get('quality_gate') or {}
+        latest = dispatch_by_deal.get(deal) or {}
+        need_analysis = bool(item.get('block_reason') or not (q.get('has_source') and q.get('has_buyer') and q.get('not_generic')))
+        status = 'Precisa análise' if need_analysis else 'Liberado com pesquisa'
+        if latest:
+            status = 'Executado / enviado' if not need_analysis else 'Enviado, revisar pesquisa'
+        phase = f"F{int(item.get('next_attempt') or 1)}" if str(item.get('next_attempt') or '').isdigit() else 'F?'
+        counts[status] += 1; counts[phase] += 1
+        leads.append({
+            'dealId': deal,
+            'empresa': item.get('empresa') or 'Lead',
+            'sdr': item.get('sdr') or '',
+            'phase': phase,
+            'mqlStatus': 'MQL/fit provável' if (q.get('has_buyer') and q.get('not_generic')) else 'Precisa análise',
+            'status': status,
+            'segmentMatch': item.get('segment_match') or '',
+            'buyerProfile': item.get('buyer_profile') or '',
+            'diagnostic': item.get('zydon_fit_reason') or item.get('message_angle') or '',
+            'portal': item.get('portal_recommendation') or '',
+            'blockReason': item.get('block_reason') or '',
+            'qualityGate': q,
+            'lastSentAt': latest.get('sentAt') or '',
+            'lastSentPhase': latest.get('phase') or '',
+            'lastMessagePreview': latest.get('messagePreview') or '',
+            'conversationUrl': latest.get('conversationUrl') or '',
+            'hubspotDealUrl': latest.get('hubspotDealUrl') or (f'https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-3/{deal}' if deal.isdigit() else ''),
+        })
+    envios = [r for r in _wpp_envios_rows() if isinstance(r, dict) and not _wpp_envio_group_only_notice(r)]
+    envios_sorted = sorted(envios, key=lambda r: _parse_wpp_envio_ts(r), reverse=True)[:80]
+    logs = []
+    for r in envios_sorted:
+        deal = str(r.get('deal_id') or r.get('deal') or '')
+        port = r.get('bridge_port') or r.get('gateway') or r.get('port') or ''
+        chat = _wpp_envio_lead_chat(r)
+        conv = f'{port}::{chat}' if port and chat else ''
+        ts = _parse_wpp_envio_ts(r)
+        dt = datetime.fromtimestamp(ts, timezone.utc) if ts else None
+        logs.append({'at': dt.astimezone(BRT_TZ).isoformat() if dt else '', 'empresa': r.get('empresa') or r.get('lead_name') or '', 'sdr': r.get('sdr') or r.get('sender_name') or '', 'phase': _followups_phase_from_row(r), 'status': r.get('status') or '', 'messagePreview': str(r.get('text') or r.get('message') or r.get('body') or '')[:220], 'conversationUrl': f'/conversas?conv={urllib.parse.quote(conv)}' if conv else '', 'hubspotDealUrl': f'https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-3/{deal}' if deal.isdigit() else ''})
+    manifest = _followups_manifest_status()
+    qsum = queue.get('summary') if isinstance(queue.get('summary'), dict) else {}
+    rot = rotinas_summary(uid) if rotinas_access_allowed(uid) else {'ok': False}
+    config = {
+        'janelaOperacional': '06:00–19:59 BRT (sexta até 17:59)',
+        'requireResearch': True,
+        'scanMaxDeals': 160,
+        'manifesto': str(FOLLOWUPS_MANIFEST_FILE),
+        'matrizPesquisa': str(matrix_path or ''),
+        'modo': 'read-only nesta versão; inputs visuais para centralizar configuração do Dexter',
+    }
+    return {'ok': True, 'readOnly': True, 'scope': 'Somente Rafael', 'generatedAt': datetime.now(BRT_TZ).isoformat(), 'summary': {'pendingTotal': qsum.get('pending_total', len(leads)), 'readyTotal': qsum.get('ready_total', sum(1 for l in leads if l['status'] != 'Precisa análise')), 'blockedResearchTotal': qsum.get('blocked_research_total', sum(1 for l in leads if l['status'] == 'Precisa análise')), 'sentTodayTotal': qsum.get('sent_today_total', 0), 'matrixLeads': len(matrix.get('leads') or []), 'visibleLeads': len(leads), 'manifestOk': manifest.get('ok'), 'rotinasWarnings': ((rot.get('summary') or {}).get('warnings') or [])}, 'queue': queue, 'manifest': manifest, 'leads': leads, 'logs': logs, 'config': config, 'rotinas': {'summary': rot.get('summary'), 'watchdogs': (rot.get('watchdogs') or [])[:8], 'processes': (rot.get('processes') or [])[:8]}, 'counts': dict(counts)}
+
+
 # --- CH: Gestão SDR / Orquestrador (somente leitura) -------------------------
 # Visão de gestão (Rafael/Dexter) derivada de pipeline_focus, que já é HubSpot
 # read-only com cache + snapshot/stale como degradação. Esta camada NÃO escreve
@@ -5528,7 +8800,7 @@ def _ops_file_state(label, path, max_age_seconds=None):
         return {'label': label, 'ok': False, 'exists': False, 'ageSeconds': None, 'size': 0, 'error': type(e).__name__}
 
 
-def _ops_watchdog_state(max_age_seconds=15*60):
+def _ops_watchdog_state(max_age_seconds=OPS_SHORT_FRESHNESS_SEC):
     try:
         p=Path(OPS_WATCHDOG_STATE_FILE)
         if not p.exists():
@@ -5560,7 +8832,7 @@ def ops_health_summary(uid='rafael'):
     pipe_path=_pipeline_focus_snapshot_path(uid)
     dispatch_path=_dispatch_stats_snapshot_path(uid, 14)
     files=[
-        _ops_file_state('Conversas', CONVERSATIONS_PREWARM_FILE, 15*60),
+        _ops_file_state('Conversas', CONVERSATIONS_PREWARM_FILE, OPS_SHORT_FRESHNESS_SEC),
         _ops_file_state('Foco SDR', pipe_path, 2*3600),
         _ops_file_state('Performance comercial', dispatch_path, 30*60),
         _ops_file_state('Envios operacionais', WPP_ENVIOS_FILE, 10*60),
@@ -5595,6 +8867,186 @@ def ops_health_summary(uid='rafael'):
         'signals': signals,
         'warnings': warnings[:6],
         'safety': 'Somente leitura: nada é enviado, fechado ou alterado por esta visão.',
+    }
+
+
+PROATIVIDADE_CONFIG_DEFAULTS = {
+    'reviewWindowHours': 24,
+    'groupAlertCooldownMin': 15,
+    'historyStaleMin': 15,
+    'crmDedupeMin': 30,
+    'autonomyMode': 'equilibrado',
+    'operatorNote': '',
+}
+
+
+def proatividade_config():
+    cfg = dict(PROATIVIDADE_CONFIG_DEFAULTS)
+    try:
+        if PROATIVIDADE_CONFIG_FILE.exists():
+            raw = json.loads(PROATIVIDADE_CONFIG_FILE.read_text(encoding='utf-8') or '{}')
+            if isinstance(raw, dict):
+                cfg.update({k: raw.get(k) for k in PROATIVIDADE_CONFIG_DEFAULTS if raw.get(k) is not None})
+    except Exception:
+        pass
+    for k in ('reviewWindowHours','groupAlertCooldownMin','historyStaleMin','crmDedupeMin'):
+        try: cfg[k] = max(1, min(10080, int(cfg.get(k) or PROATIVIDADE_CONFIG_DEFAULTS[k])))
+        except Exception: cfg[k] = PROATIVIDADE_CONFIG_DEFAULTS[k]
+    if cfg.get('autonomyMode') not in ('conservador','equilibrado','autonomo'):
+        cfg['autonomyMode'] = 'equilibrado'
+    cfg['operatorNote'] = str(cfg.get('operatorNote') or '')[:1000]
+    return cfg
+
+
+def save_proatividade_config(data):
+    cfg = proatividade_config()
+    if isinstance(data, dict):
+        for k in PROATIVIDADE_CONFIG_DEFAULTS:
+            if k in data:
+                cfg[k] = data.get(k)
+    # revalida antes de persistir
+    old_exists = PROATIVIDADE_CONFIG_FILE.exists()
+    PROATIVIDADE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PROATIVIDADE_CONFIG_FILE.with_suffix('.json.tmp')
+    normalized = dict(PROATIVIDADE_CONFIG_DEFAULTS)
+    normalized.update(cfg)
+    for k in ('reviewWindowHours','groupAlertCooldownMin','historyStaleMin','crmDedupeMin'):
+        try: normalized[k] = max(1, min(10080, int(normalized.get(k) or PROATIVIDADE_CONFIG_DEFAULTS[k])))
+        except Exception: normalized[k] = PROATIVIDADE_CONFIG_DEFAULTS[k]
+    if normalized.get('autonomyMode') not in ('conservador','equilibrado','autonomo'):
+        normalized['autonomyMode'] = 'equilibrado'
+    normalized['operatorNote'] = str(normalized.get('operatorNote') or '')[:1000]
+    tmp.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding='utf-8')
+    try: os.chmod(tmp, 0o600)
+    except Exception: pass
+    tmp.replace(PROATIVIDADE_CONFIG_FILE)
+    try: os.chmod(PROATIVIDADE_CONFIG_FILE, 0o600)
+    except Exception: pass
+    return normalized
+
+
+def _short_text(v, n=220):
+    v = re.sub(r'\s+', ' ', str(v or '')).strip()
+    return v[:n] + ('…' if len(v) > n else '')
+
+
+def _jsonl_tail(path, limit=80):
+    try:
+        p=Path(path)
+        if not p.exists(): return []
+        lines=p.read_text(encoding='utf-8', errors='replace').splitlines()[-max(limit*3, limit):]
+    except Exception:
+        return []
+    out=[]
+    for line in lines:
+        line=line.strip()
+        if not line: continue
+        try:
+            obj=json.loads(line)
+            if isinstance(obj, dict): out.append(obj)
+        except Exception:
+            continue
+    return out[-limit:]
+
+
+def _proatividade_decision_row(r):
+    return {
+        'ts': r.get('ts') or r.get('timestamp') or r.get('incoming_at') or r.get('createdAt') or '',
+        'chip': r.get('chip') or r.get('chip_name') or r.get('sender_name') or '',
+        'port': r.get('port') or r.get('bridge_port') or r.get('gateway') or '',
+        'lead': r.get('lead') or r.get('lead_name') or r.get('empresa') or r.get('company') or r.get('name') or '',
+        'chat': r.get('chat') or r.get('jid') or r.get('contact') or r.get('phone') or '',
+        'classification': r.get('classification') or r.get('classificacao') or r.get('type') or '',
+        'action': r.get('action') or r.get('state') or r.get('decision') or '',
+        'auto_reason': r.get('auto_reason') or r.get('reason') or '',
+        'auto_message_id': r.get('auto_message_id') or r.get('messageId') or '',
+        'crm_result': r.get('crm_result') or r.get('crm') or '',
+        'wa_group_note': r.get('wa_group_note') or r.get('group_note') or '',
+        'incoming_text': _short_text(r.get('incoming_text') or r.get('text') or r.get('body') or r.get('message') or '', 260),
+    }
+
+
+def _proatividade_execution_row(r):
+    resp = r.get('response') or r.get('send_response') or r.get('bridge_response') or {}
+    mid = r.get('messageId') or r.get('bridgeMessageId') or (resp.get('messageId') if isinstance(resp, dict) else '') or ''
+    return {
+        'date': r.get('date_tz') or r.get('date') or r.get('timestamp') or '',
+        'status': r.get('status') or '',
+        'msg_type': r.get('msg_type') or r.get('type') or '',
+        'lead': r.get('empresa') or r.get('company') or r.get('dealname') or r.get('deal_name') or r.get('lead_name') or '',
+        'contact': r.get('contact') or r.get('email') or r.get('to') or r.get('jid') or '',
+        'port': r.get('bridge_port') or r.get('dispatch_port') or r.get('port') or '',
+        'text': _short_text(r.get('text') or r.get('message') or r.get('group_summary') or '', 240),
+        'messageId': mid,
+    }
+
+
+def _proatividade_cron_rows(limit=80):
+    try:
+        data=json.loads(HERMES_CRON_JOBS_FILE.read_text(encoding='utf-8') or '[]') if HERMES_CRON_JOBS_FILE.exists() else []
+    except Exception:
+        data=[]
+    if isinstance(data, dict):
+        rows=list(data.get('jobs') or data.values())
+    elif isinstance(data, list):
+        rows=data
+    else:
+        rows=[]
+    keep=[]
+    pat=re.compile(r'(zydon|channel|sdr|mql|whatsapp|funnel)', re.I)
+    for j in rows:
+        if not isinstance(j, dict): continue
+        name=str(j.get('name') or j.get('id') or '')
+        script=str(j.get('script') or '')
+        if not pat.search(name+' '+script): continue
+        keep.append({
+            'name': name,
+            'enabled': bool(j.get('enabled', not j.get('paused', False))),
+            'schedule': j.get('schedule') or j.get('cron') or '',
+            'next_run_at': j.get('next_run_at') or j.get('nextRunAt') or j.get('next') or '',
+            'last_run_at': j.get('last_run_at') or j.get('lastRunAt') or '',
+            'last_status': j.get('last_status') or j.get('lastStatus') or j.get('status') or '',
+            'script': os.path.basename(script) if script else '',
+            'deliver': j.get('deliver') or '',
+        })
+    return keep[:limit]
+
+
+def proatividade_summary(uid='rafael'):
+    decisions=[_proatividade_decision_row(r) for r in _jsonl_tail(INCOMING_DECISIONS_FILE, 80)]
+    executions=[_proatividade_execution_row(r) for r in (_wpp_envios_rows() or [])[-80:]]
+    crons=_proatividade_cron_rows()
+    try: ops=ops_health_summary(uid)
+    except Exception as e: ops={'ok':False,'risk':'attention','warnings':[type(e).__name__]}
+    try: hyg=task_hygiene_preview(uid)
+    except Exception as e: hyg={'ok':False,'error':type(e).__name__}
+    attention=[]
+    for w in (ops.get('warnings') or [])[:5]:
+        attention.append({'level':'atenção','area':'Saúde operacional','text':str(w)})
+    safe=((hyg.get('safeToCloseAfterApproval') or {}).get('count') if isinstance(hyg.get('safeToCloseAfterApproval'), dict) else hyg.get('safeToCloseAfterApproval')) or 0
+    review=((hyg.get('reviewBeforeAction') or {}).get('count') if isinstance(hyg.get('reviewBeforeAction'), dict) else hyg.get('reviewBeforeAction')) or 0
+    if review: attention.append({'level':'atenção','area':'CRM','text':f'{review} tarefas antigas precisam revisão antes de ação.'})
+    if safe: attention.append({'level':'ok','area':'CRM','text':f'{safe} tarefas parecem seguras para fechar após autorização.'})
+    for c in crons:
+        st=str(c.get('last_status') or '').lower()
+        if any(x in st for x in ('error','fail','timeout')) or not c.get('enabled'):
+            attention.append({'level':'atenção','area':'Cron', 'text': f"{c.get('name')}: {c.get('last_status') or ('pausado' if not c.get('enabled') else 'verificar')}"})
+    for d in decisions[-20:]:
+        blob=' '.join(str(d.get(k) or '') for k in ('classification','action','crm_result','wa_group_note')).lower()
+        if any(x in blob for x in ('media_sem_texto','sem texto','missing','error','falha','skipped_missing')):
+            attention.append({'level':'atenção','area':'Decisão recente','text': f"{d.get('lead') or d.get('chat') or 'lead'} · {d.get('classification') or d.get('action') or 'verificar'}"})
+    knowledge=[
+        {'label':'Incoming rígido: policy fixa', 'path':'zydon-whatsapp-personalizacao/references/incoming-rigido-policy-fixa-auditoria-2026-06-30.md'},
+        {'label':'Orquestração rígida: CRM, saúde e rate-limit', 'path':'zydon-whatsapp-personalizacao/references/incoming-orquestracao-rigida-crm-health-rate-limit-2026-06-30.md'},
+        {'label':'Retorno Contato: interação efetiva e SLA SDR', 'path':'zydon-whatsapp-personalizacao/references/retorno-contato-interacao-efetiva-sla-sdr-2026-06-29.md'},
+        {'label':'Requisitos do painel orquestrador SDR', 'path':'zydon-channel-ui/references/requisitos-painel-orquestrador-sdr-foco-gestao-2026-06-29.md'},
+    ]
+    return {
+        'ok': True, 'mutates': False, 'generatedAt': datetime.now(BRT_TZ).isoformat(),
+        'config': proatividade_config(), 'decisions': decisions, 'executions': executions,
+        'crons': crons, 'opsHealth': ops, 'taskHygiene': hyg, 'attention': attention[:30],
+        'knowledge': knowledge,
+        'shortcuts': [{'label':'Foco SDR','route':'/foco'}, {'label':'Gestão','route':'/gestao'}, {'label':'Agendas','route':'/agendas'}, {'label':'Conversas','route':'/conversas'}],
     }
 
 
@@ -6301,7 +9753,7 @@ a{color:var(--accent);text-decoration:none}
 .live-refresh:active{transform:scale(.96)}
 @keyframes livePulse{0%,100%{opacity:1}50%{opacity:.4}}
 @media(max-width:760px){.live-ago{display:none}.refresh-strip small{display:none}.refresh-conv{font-size:11px}}
-.filter-toggle{margin-left:auto;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:9px;padding:5px 9px;font-size:11.5px;font-weight:650}.filter-toggle.on{background:var(--accent-dim);color:var(--accent);border-color:var(--line-strong)}.filterbar{display:none;gap:7px;padding:8px 12px;border-bottom:1px solid var(--line-soft);overflow-x:auto;scrollbar-width:none}.filterbar.open{display:flex}.filterbar::-webkit-scrollbar{display:none}.wfilter{flex:0 0 auto;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:999px;padding:6px 10px;font-size:12px;font-weight:600;white-space:nowrap}.wfilter.on{background:var(--accent-dim);border-color:var(--line-strong);color:var(--accent)}.wfilter select{border:0;background:transparent;color:inherit;font:inherit;outline:0;max-width:150px}.wfilter.clear{color:var(--danger);background:var(--danger-soft)}
+.filter-toggle{margin-left:6px;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:9px;padding:5px 9px;font-size:11.5px;font-weight:650}.filter-toggle.on{background:var(--accent-dim);color:var(--accent);border-color:var(--line-strong)}.new-conv-btn{border:1px solid rgba(31,61,43,.18);background:linear-gradient(180deg,#FFFFFF,#F7F8F2);color:var(--zydon-green);border-radius:999px;padding:7px 12px;font-size:11.5px;font-weight:850;letter-spacing:-.01em;box-shadow:0 1px 0 rgba(255,255,255,.9) inset,0 6px 16px rgba(20,28,20,.055);white-space:nowrap;display:inline-flex;align-items:center;gap:6px;transition:background .14s ease,border-color .14s ease,color .14s ease,box-shadow .14s ease,transform .14s ease}.new-conv-btn:hover{background:linear-gradient(180deg,#FFFFFF,#EEF2DF);border-color:rgba(31,61,43,.28);box-shadow:0 1px 0 rgba(255,255,255,.95) inset,0 8px 18px rgba(20,28,20,.075);transform:translateY(-1px)}.new-conv-btn:active{transform:translateY(0);box-shadow:0 1px 0 rgba(255,255,255,.85) inset,0 3px 10px rgba(20,28,20,.06)}[data-theme="dark"] .new-conv-btn{background:rgba(205,235,0,.08);border-color:rgba(205,235,0,.22);color:var(--zydon-lime);box-shadow:0 0 0 1px rgba(0,0,0,.14) inset,0 8px 20px rgba(0,0,0,.18)}[data-theme="dark"] .new-conv-btn:hover{background:rgba(205,235,0,.13);border-color:rgba(205,235,0,.34);box-shadow:0 0 0 1px rgba(0,0,0,.16) inset,0 10px 24px rgba(0,0,0,.22)}.filterbar{display:none;gap:7px;padding:8px 12px;border-bottom:1px solid var(--line-soft);overflow-x:auto;scrollbar-width:none}.filterbar.open{display:flex}.filterbar::-webkit-scrollbar{display:none}.wfilter{flex:0 0 auto;border:1px solid var(--line);background:var(--surface);color:var(--txt-2);border-radius:999px;padding:6px 10px;font-size:12px;font-weight:600;white-space:nowrap}.wfilter.on{background:var(--accent-dim);border-color:var(--line-strong);color:var(--accent)}.wfilter select{border:0;background:transparent;color:inherit;font:inherit;outline:0;max-width:150px}.wfilter.clear{color:var(--danger);background:var(--danger-soft)}
 
 .seg{display:flex;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:2px;gap:2px}
 .seg button{border:0;background:none;color:var(--txt-2);font-size:11.5px;font-weight:600;padding:4px 9px;border-radius:7px;transition:.12s}
@@ -6474,7 +9926,121 @@ a{color:var(--accent);text-decoration:none}
 @media(max-width:1180px){.app.analytics-mode .mgmt-grid,.app.analytics-mode .focus-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.cad-stage-grid{grid-template-columns:1fr}.cad-edge-grid{grid-template-columns:1fr}.pipe-filterbar{grid-template-columns:1fr}}
 @media(max-width:760px){.app.analytics-mode{grid-template-columns:1fr}.app.analytics-mode .sidebar{display:none}.app.analytics-mode .cards{padding:10px 12px 88px}.app.analytics-mode .mgmt-grid,.app.analytics-mode .focus-grid{grid-template-columns:1fr}.cad-board-head{flex-direction:column}.cad-board-head button{width:100%;justify-content:center}}
 
+.ag-panel{display:flex;flex-direction:column;gap:14px}
+.ag-head-row{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.ag-title h2{margin:0;font-size:19px;font-weight:850;letter-spacing:.04em;color:var(--txt)}
+.ag-title span{display:block;margin-top:2px;font-size:12.5px;color:var(--muted)}
+.ag-scope{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:var(--surface);border:1px solid var(--line-soft);border-radius:999px;padding:5px 11px}
+.ag-banner{border:1px dashed var(--line-strong);background:var(--surface);border-radius:13px;padding:11px 13px;font-size:12.5px;color:var(--txt-2)}
+.ag-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}
+.ag-kpi{border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:12px 13px;display:flex;flex-direction:column;gap:4px}
+.ag-kpi b{font-size:21px;line-height:1.05;color:var(--txt);font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ag-kpi span{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.ag-kpi.ag-kpi-warn{border-color:rgba(217,72,15,.35);background:rgba(217,72,15,.07)}
+.ag-kpi.ag-kpi-warn b{color:#D9480F}
+.ag-filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:12px 13px}
+.ag-filters label{display:flex;flex-direction:column;gap:4px;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700}
+.ag-filters select,.ag-filters input{border:1px solid var(--line);background:var(--panel);color:var(--txt);border-radius:9px;padding:7px 9px;font-size:12.5px;font-weight:600;min-width:120px}
+.ag-filters .ag-search-field{flex:1 1 200px}
+.ag-filters .ag-search-field input{min-width:160px;width:100%}
+.ag-filter-actions{display:flex;gap:8px;margin-left:auto;align-items:flex-end}
+.ag-btn{border:1px solid var(--btn-lime-line);background:var(--btn-ink);color:var(--btn-lime);border-radius:999px;padding:8px 14px;font-size:12px;font-weight:750;cursor:pointer;transition:transform .14s,opacity .14s}
+.ag-btn:hover{transform:translateY(-1px)}.ag-btn:active{transform:scale(.98)}.ag-btn[disabled]{opacity:.55;cursor:default;transform:none}
+.ag-btn.ghost{background:var(--surface-2);color:var(--txt-2);border-color:var(--line-soft)}
+.ag-grid{border:1px solid var(--line-soft);background:var(--surface);border-radius:16px;overflow-x:auto}
+.ag-row{display:grid;grid-template-columns:130px 110px 130px minmax(190px,1.3fr) 120px 130px minmax(220px,1.5fr) 110px;gap:10px;align-items:start;padding:11px 14px;border-top:1px solid var(--line-soft);min-width:1080px;font-size:12.5px}
+.ag-row.head,.ag-row.ag-head{position:sticky;top:0;z-index:1;border-top:0;background:var(--surface-2);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:750}
+.ag-rows .ag-row:hover{background:var(--surface-2)}
+.ag-col{min-width:0;display:flex;flex-direction:column;gap:2px}
+.ag-col::before{display:none;content:attr(data-label);font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:850;margin-bottom:1px}
+.ag-col b{color:var(--txt);font-weight:700;font-size:12.5px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ag-c-lead b{white-space:normal}
+.ag-lead{font-size:11.5px;color:var(--txt-2)}
+.ag-phone{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.ag-mid{font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.ag-chip-mini{font-size:10.5px;color:var(--muted)}
+.ag-chip{display:inline-flex;align-items:center;align-self:flex-start;font-size:10.5px;font-weight:750;border-radius:999px;padding:3px 9px;border:1px solid var(--line-soft);white-space:nowrap}
+.ag-k-confirm{background:rgba(205,235,0,.12);color:var(--accent);border-color:rgba(205,235,0,.28)}
+.ag-k-lembrete{background:rgba(56,132,255,.12);color:#3884FF;border-color:rgba(56,132,255,.3)}
+.ag-k-grupo{background:rgba(168,120,255,.12);color:#A878FF;border-color:rgba(168,120,255,.3)}
+.ag-k-agenda{background:rgba(120,200,160,.12);color:#46B873;border-color:rgba(120,200,160,.3)}
+.ag-k-diag{background:rgba(255,176,32,.12);color:#E69500;border-color:rgba(255,176,32,.3)}
+.ag-k-compl{background:var(--surface-2);color:var(--txt-2);border-color:var(--line-soft)}
+.ag-s-ok{background:rgba(70,184,115,.12);color:#46B873;border-color:rgba(70,184,115,.3)}
+.ag-s-group{background:rgba(168,120,255,.1);color:#A878FF;border-color:rgba(168,120,255,.28)}
+.ag-s-wait{background:rgba(255,176,32,.12);color:#E69500;border-color:rgba(255,176,32,.3)}
+.ag-s-fail{background:rgba(217,72,15,.12);color:#D9480F;border-color:rgba(217,72,15,.32)}
+.ag-flag{display:inline-block;margin-top:3px;font-size:10px;font-weight:700;color:#D9480F;background:rgba(217,72,15,.08);border:1px solid rgba(217,72,15,.25);border-radius:6px;padding:1px 6px}
+.ag-msg{font-size:12px;color:var(--txt-2);line-height:1.4;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.ag-link{font-size:11.5px;font-weight:700;color:var(--accent);border:1px solid rgba(205,235,0,.28);background:rgba(205,235,0,.08);border-radius:8px;padding:5px 9px;white-space:nowrap;align-self:flex-start}
+.ag-dash{color:var(--muted)}
+.ag-grid-foot{padding:10px 14px;font-size:11.5px;color:var(--muted);border-top:1px solid var(--line-soft);position:sticky;left:0}
+.ag-state{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:46px 18px;text-align:center;color:var(--muted)}
+.ag-state b{color:var(--txt);font-size:14px}.ag-state span{font-size:12px}
+.ag-state-err b{color:#D9480F}
+.ag-spin{width:22px;height:22px;border-radius:50%;border:2.5px solid var(--line);border-top-color:var(--accent);animation:agspin .8s linear infinite}
+@keyframes agspin{to{transform:rotate(360deg)}}
+@media(max-width:1180px){.ag-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.ag-panel{gap:11px}.ag-head-row{align-items:flex-start}.ag-title h2{font-size:17px;letter-spacing:.01em}.ag-title span{font-size:12px;line-height:1.35}.ag-scope{align-self:flex-start}.ag-kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.ag-kpi{padding:10px}.ag-kpi b{font-size:18px}.ag-filters{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:10px}.ag-filters label{min-width:0}.ag-filters select,.ag-filters input{width:100%;min-width:0;box-sizing:border-box}.ag-filters .ag-search-field{grid-column:1 / -1;flex:auto}.ag-filters .ag-filter-actions{grid-column:1 / -1;margin-left:0;width:100%;display:grid;grid-template-columns:1fr 1fr}.ag-filters .ag-btn{width:100%;justify-content:center}.ag-row{grid-template-columns:1fr 1fr;gap:8px 12px;min-width:0;border-radius:14px;border:1px solid var(--line-soft);margin:9px 0;padding:12px;background:var(--surface);box-shadow:0 8px 24px rgba(0,0,0,.04)}.ag-row.head,.ag-row.ag-head{display:none}.ag-grid{border:0;background:transparent;overflow:visible}.ag-rows{display:flex;flex-direction:column;gap:0}.ag-col::before{display:block}.ag-c-lead{grid-column:1 / -1;order:-2}.ag-c-when{order:-1}.ag-c-meeting{order:0}.ag-c-msg{grid-column:1 / -1}.ag-c-action{grid-column:1 / -1}.ag-c-action .ag-link{width:100%;box-sizing:border-box;text-align:center;justify-content:center;display:flex}.ag-msg{-webkit-line-clamp:5}.ag-grid-foot{margin:0;padding:10px 2px;border-top:0}}
+@media(max-width:420px){.ag-kpis,.ag-filters{grid-template-columns:1fr}.ag-filters .ag-search-field,.ag-filters .ag-filter-actions{grid-column:1}.ag-filters .ag-filter-actions{grid-template-columns:1fr}.ag-row{grid-template-columns:1fr}.ag-c-lead,.ag-c-msg,.ag-c-action{grid-column:1}.ag-chip{white-space:normal}}
+/* Centralizador Dexter (/agendas): subtabs + crons + contextos, visual dark premium reusando o sistema .ag-* */
+.dx-panel{display:flex;flex-direction:column;gap:14px}
+.dx-subtabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:7px;border:1px solid var(--line-soft);background:var(--surface);border-radius:16px}
+.dx-subtab{appearance:none;-webkit-appearance:none;text-align:left;border:1px solid var(--line-soft);border-radius:12px;background:var(--surface-2);color:var(--txt-2);padding:9px 12px;display:flex;flex-direction:column;gap:2px;cursor:pointer;transition:.14s;min-width:0}
+.dx-subtab b{font-size:12.5px;color:var(--txt);font-weight:800}
+.dx-subtab span{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dx-subtab:hover{border-color:var(--line-strong);transform:translateY(-1px)}
+.dx-subtab.on{background:var(--btn-ink);border-color:var(--btn-lime-line)}
+.dx-subtab.on b{color:var(--btn-lime)}
+.dx-overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.dx-ocard{border:1px solid var(--line-soft);background:var(--surface);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.dx-ocard h4{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.dx-ostat{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.dx-ostat b{font-size:26px;font-weight:850;color:var(--txt);line-height:1}
+.dx-ostat span{font-size:11.5px;color:var(--muted)}
+.dx-ochips{display:flex;flex-wrap:wrap;gap:6px}
+.dx-mini{font-size:11px;font-weight:700;border-radius:999px;padding:3px 9px;border:1px solid var(--line-soft);background:var(--surface-2);color:var(--txt-2)}
+.dx-mini.ok{background:rgba(70,184,115,.12);color:#46B873;border-color:rgba(70,184,115,.3)}
+.dx-mini.warn{background:rgba(255,176,32,.12);color:#E69500;border-color:rgba(255,176,32,.3)}
+.dx-mini.err{background:rgba(217,72,15,.12);color:#D9480F;border-color:rgba(217,72,15,.32)}
+.dx-olist{display:flex;flex-direction:column;gap:7px}
+.dx-oitem{display:flex;flex-direction:column;gap:2px;padding:8px 0;border-top:1px solid var(--line-soft)}
+.dx-oitem:first-child{border-top:0}
+.dx-oitem b{font-size:12px;color:var(--txt);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dx-oitem span{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dx-cron-row{display:grid;grid-template-columns:minmax(180px,1.4fr) 120px 130px 130px minmax(150px,1fr) 110px;gap:10px;align-items:start;padding:11px 14px;border-top:1px solid var(--line-soft);min-width:980px;font-size:12.5px}
+.dx-cron-row.head{position:sticky;top:0;z-index:1;border-top:0;background:var(--surface-2);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:750}
+.dx-rows .dx-cron-row:hover{background:var(--surface-2)}
+.dx-cron-row.paused{opacity:.72}
+.dx-cron-row.paused .dx-cname b{color:var(--txt-2)}
+.dx-cname b{display:block;color:var(--txt);font-weight:750;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dx-cname small{display:block;font-size:10.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.dx-mono{font-variant-numeric:tabular-nums;font-size:11.5px;color:var(--txt-2)}
+.dx-sub{font-size:10.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dx-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.dx-tag{font-size:10px;font-weight:700;border-radius:6px;padding:1px 6px;border:1px solid var(--line-soft);background:var(--surface-2);color:var(--txt-2)}
+.dx-detail{margin-top:6px;border-top:1px dashed var(--line-soft);padding-top:8px;font-size:11.5px;color:var(--txt-2);line-height:1.45;grid-column:1 / -1}
+.dx-detail b{color:var(--txt)}
+.dx-detbtn{background:none;border:0;color:var(--accent);font-size:11px;font-weight:750;cursor:pointer;padding:2px 0;text-align:left}
+.dx-ctx-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.dx-ctx-card{border:1px solid var(--line-soft);background:var(--surface);border-radius:15px;padding:13px;display:flex;flex-direction:column;gap:8px}
+.dx-ctx-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.dx-ctx-head b{font-size:13px;color:var(--txt);font-weight:800;line-height:1.3}
+.dx-ctx-meta{display:flex;flex-wrap:wrap;gap:6px;font-size:10.5px;color:var(--muted)}
+.dx-ctx-prev{font-size:11.5px;color:var(--txt-2);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;border-left:2px solid var(--line-strong);padding-left:8px}
+.dx-ctx-crons{display:flex;flex-wrap:wrap;gap:5px}
+.dx-ctx-cron{font-size:10px;font-weight:700;border-radius:999px;padding:2px 8px;background:rgba(205,235,0,.1);color:var(--accent);border:1px solid rgba(205,235,0,.26)}
+@media(max-width:980px){.dx-overview-grid{grid-template-columns:1fr}.dx-ctx-grid{grid-template-columns:1fr}.dx-cron-row{min-width:760px}}
+@media(max-width:760px){.dx-subtabs{grid-template-columns:repeat(2,minmax(0,1fr))}.dx-subtab span{white-space:normal}}
 .mgmt-panel{padding:14px;display:flex;flex-direction:column;gap:12px}.mgmt-title{display:flex;align-items:center;justify-content:space-between}.mgmt-title b{font-size:15px}.mgmt-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.mgmt-card{border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:12px}.mgmt-card b{font-size:22px;color:var(--txt);display:block;line-height:1}.mgmt-card span{font-size:11px;color:var(--muted)}.mgmt-section{border:1px solid var(--line-soft);background:var(--surface);border-radius:14px;padding:12px}.mgmt-section h4{margin:0 0 9px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}.mgmt-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--line-soft);font-size:12.5px}.mgmt-row:first-of-type{border-top:0}.mgmt-row .bar{height:6px;background:var(--accent);border-radius:99px;min-width:4px}.mgmt-row em{margin-left:auto;font-style:normal;color:var(--txt-2);font-weight:700}.focus-panel{padding:14px;display:flex;flex-direction:column;gap:12px}.focus-hero{border:1px solid rgba(31,61,43,.12);background:linear-gradient(180deg,rgba(31,61,43,.045),rgba(205,235,0,.035));border-radius:16px;padding:13px}.focus-hero b{display:block;font-size:15px;margin-bottom:4px}.focus-hero span{font-size:12px;color:var(--muted);line-height:1.45}.focus-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.focus-card{border:1px solid var(--line-soft);background:var(--surface);border-radius:15px;padding:12px;display:flex;flex-direction:column;gap:8px}.focus-card b{font-size:22px;line-height:1}.focus-card span{font-size:11.5px;color:var(--muted)}.focus-card button,.focus-row button{align-self:flex-start;border:1px solid rgba(31,61,43,.14);background:var(--surface-2);border-radius:999px;padding:6px 10px;font-size:11.5px;font-weight:650;color:var(--txt-2)}.focus-card button.primary,.focus-row button.primary{background:var(--btn-ink);color:var(--btn-lime);border-color:var(--btn-lime-line)}.focus-section{border:1px solid var(--line-soft);background:var(--surface);border-radius:15px;padding:12px}.focus-section h4{margin:0 0 9px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}.focus-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 0;border-top:1px solid var(--line-soft)}.focus-row:first-of-type{border-top:0}.focus-row .fn{font-weight:700;font-size:13px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.focus-row .fm{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.focus-row .fa{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.focus-safe{border:1px dashed rgba(31,61,43,.2);background:rgba(31,61,43,.035);border-radius:13px;padding:10px;font-size:12px;color:var(--txt-2);line-height:1.45}.focus-safe b{color:var(--txt)}.mode-toggle{margin-left:auto;display:inline-flex;gap:4px;background:var(--surface);border:1px solid var(--line-soft);border-radius:999px;padding:3px}.mode-toggle button{border:0;background:transparent;border-radius:999px;padding:5px 9px;font-size:11.5px;font-weight:650;color:var(--muted)}.mode-toggle button.on{background:var(--btn-ink);color:var(--btn-lime)}.mgmt-hero{border:1px solid var(--line-soft);background:linear-gradient(180deg,rgba(31,61,43,.05),rgba(31,61,43,.02));border-radius:16px;padding:13px}.mgmt-hero b{display:block;font-size:15px;margin-bottom:4px}.mgmt-hero span{font-size:12px;color:var(--muted);line-height:1.45}.mgmt-subhead{display:flex;align-items:center;justify-content:space-between;margin-top:2px}.mgmt-subhead b{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}.mgmt-subhead span{font-size:11px;color:var(--muted)}.pipe-compact{border:1px solid var(--line-soft);background:var(--surface);border-radius:13px;padding:4px 12px}.pipe-compact>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 0;font-size:12px}.pipe-compact>summary::-webkit-details-marker{display:none}.pipe-compact .pc-k{font-weight:700;color:var(--txt-2)}.pipe-compact .pc-v{font-weight:700;color:var(--txt);background:var(--surface-2);border:1px solid var(--line-soft);border-radius:999px;padding:1px 9px}.pipe-compact .pc-hint{font-size:10.5px;color:var(--muted);margin-left:auto}.pipe-compact .pc-rows{display:flex;flex-wrap:wrap;gap:6px;padding:2px 0 10px}.pipe-compact .pc-row{font-size:11.5px;color:var(--txt-2);background:var(--surface-2);border:1px solid var(--line-soft);border-radius:8px;padding:3px 8px}.pipe-compact .pc-row b{color:var(--txt);font-weight:700}
+.rot-hero{border:1px solid var(--line-soft);border-radius:18px;padding:15px 16px;display:flex;align-items:center;gap:14px;background:linear-gradient(180deg,rgba(34,197,94,.07),rgba(34,197,94,.02))}.rot-hero.attn{background:linear-gradient(180deg,rgba(245,158,11,.09),rgba(245,158,11,.025));border-color:rgba(245,158,11,.22)}.rot-hero .dot{width:14px;height:14px;border-radius:999px;background:#22C55E;box-shadow:0 0 0 4px rgba(34,197,94,.15);flex:none}.rot-hero.attn .dot{background:#F59E0B;box-shadow:0 0 0 4px rgba(245,158,11,.16)}.rot-hero b{display:block;font-size:16px;color:var(--txt);line-height:1.2}.rot-hero span{display:block;font-size:12.5px;color:var(--muted);margin-top:3px;line-height:1.4}
+.rot-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.rot-cards-single{grid-template-columns:minmax(0,1fr)}.rot-card{border:1px solid var(--line-soft);background:var(--surface);border-radius:15px;padding:13px;display:flex;flex-direction:column;gap:8px;min-width:0}.rot-card.attn{border-color:rgba(245,158,11,.28);background:linear-gradient(180deg,rgba(245,158,11,.05),var(--surface))}.rot-card>.h{display:flex;align-items:center;justify-content:space-between;gap:8px}.rot-card>.h b{font-size:12.5px;color:var(--txt);text-transform:uppercase;letter-spacing:.05em}.rot-card>.h .pill{font-size:11px;font-weight:800;border-radius:999px;padding:2px 9px;background:var(--surface-2);color:var(--txt-2)}.rot-card>.h .pill.ok{background:rgba(34,197,94,.13);color:#15803D}.rot-card>.h .pill.warn{background:rgba(245,158,11,.16);color:#B45309}.rot-card ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.rot-card li{font-size:12.5px;color:var(--txt-2);line-height:1.4;display:flex;gap:9px;align-items:flex-start}.rot-dot{width:8px;height:8px;border-radius:999px;display:inline-block;flex:none;margin-top:.45em;background:var(--accent);box-shadow:0 0 0 3px rgba(205,235,0,.08)}.rot-dot.ok{background:#22C55E;box-shadow:0 0 0 3px rgba(34,197,94,.10)}.rot-dot.warn{background:#F59E0B;box-shadow:0 0 0 3px rgba(245,158,11,.12)}.rot-dot.agenda{background:#60A5FA;box-shadow:0 0 0 3px rgba(96,165,250,.10)}.rot-dot.auto,.rot-dot.cfg{background:#C084FC;box-shadow:0 0 0 3px rgba(192,132,252,.10)}.rot-card li .sev{flex:none;font-size:10px;font-weight:800;border-radius:999px;padding:1px 7px;text-transform:uppercase;letter-spacing:.04em}.rot-card li .sev.alta{background:rgba(239,68,68,.14);color:#B91C1C}.rot-card li .sev.media,.rot-card li .sev.média{background:rgba(245,158,11,.15);color:#B45309}.rot-subline{border-top:1px solid var(--line-soft);padding-top:8px;font-size:11.5px;color:var(--muted);line-height:1.4}.rot-subline b{color:var(--txt-2)}.rot-card button.linkish{align-self:flex-start;border:1px solid var(--line-soft);background:var(--surface-2);border-radius:999px;padding:6px 11px;font-size:11.5px;font-weight:700;color:var(--txt-2);cursor:pointer}.rot-card button.linkish:hover{border-color:var(--accent);color:var(--accent)}
+[data-theme="dark"] .rot-card>.h .pill.ok{color:#86EFAC}[data-theme="dark"] .rot-card>.h .pill.warn{color:#FCD34D}[data-theme="dark"] .rot-card li .sev.alta{color:#FCA5A5}[data-theme="dark"] .rot-card li .sev.media,[data-theme="dark"] .rot-card li .sev.média{color:#FCD34D}
+.rot-metro{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:4px 0;scroll-snap-type:x proximity}.rot-metro .stop{flex:1;min-width:120px;position:relative;padding:10px 12px 10px 14px;display:flex;flex-direction:column;gap:3px;scroll-snap-align:start}.rot-metro .stop:not(:last-child)::after{content:'';position:absolute;right:-1px;top:22px;width:2px;height:calc(100% - 22px)}.rot-metro .stop .node{display:flex;align-items:center;gap:8px}.rot-metro .stop .node i{width:11px;height:11px;border-radius:999px;background:var(--accent);flex:none;box-shadow:0 0 0 3px rgba(205,235,0,.12)}.rot-metro .stop.off .node i{background:#94A3B8;box-shadow:0 0 0 3px rgba(148,163,184,.14)}.rot-metro .stop b{font-size:12.5px;color:var(--txt)}.rot-metro .stop span{font-size:11px;color:var(--muted);line-height:1.35}.rot-metro .stop small{font-size:10.5px;color:var(--txt-2);font-weight:700}.rot-metro .arrow{align-self:center;color:var(--muted);font-size:13px;flex:none;padding:0 2px}
+.rot-exec-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.rot-exec-card{border:1px solid var(--line-soft);background:var(--surface-2);border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:6px;min-width:0}.rot-exec-card span{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:800}.rot-exec-card b{font-size:13.5px;color:var(--txt);line-height:1.25}.rot-exec-card p{margin:0;font-size:12px;line-height:1.45;color:var(--txt-2)}.rot-exec-card small{color:#5c6a62;font-weight:800;text-transform:uppercase;letter-spacing:.06em;font-size:10px}.rot-approvals .focus-row.pending,.rot-execution.attn .rot-card{border-color:rgba(245,158,11,.34);background:linear-gradient(180deg,rgba(245,158,11,.075),var(--surface))}.rot-why{margin:8px 0 0;padding-left:18px;color:var(--txt-2);font-size:12px;line-height:1.45}.rot-why li{margin:3px 0}.rot-approval details,.rot-execution details,.rot-automation-audit details,.rot-my-work details{margin-top:9px;color:var(--txt-2);font-size:12px}.rot-approval summary,.rot-execution summary,.rot-automation-audit summary,.rot-my-work summary{cursor:pointer;font-weight:800;color:var(--txt)}.rot-audit-event.failure,.rot-audit-event.error,.rot-audit-event.escalated,.rot-my-row.pending,.rot-my-row.candidate,.rot-my-row.escalated,.rot-my-row.failure{border-color:rgba(245,158,11,.34);background:linear-gradient(180deg,rgba(245,158,11,.075),var(--surface))}.rot-my-work>details{border:1px solid var(--line-soft);border-radius:14px;background:var(--surface);padding:10px 12px}.rot-history-line{display:grid;grid-template-columns:minmax(95px,.7fr) minmax(90px,.6fr) minmax(0,2fr);gap:8px;padding:7px 0;border-top:1px solid var(--line-soft);font-size:12px}.rot-history-line b{color:var(--txt);font-weight:800}.rot-history-line span{color:var(--accent);font-weight:800}.rot-history-line em{font-style:normal;color:var(--txt-2)}[data-theme="dark"] .rotinas-panel .focus-row,[data-theme="dark"] .rotinas-panel .rot-exec-card,[data-theme="dark"] .rotinas-panel .orch-auto-strip>div{background:rgba(12,27,18,.82)!important;border-color:rgba(205,235,0,.10)!important;color:var(--txt)!important}[data-theme="dark"] .rotinas-panel .rot-audit-event.failure,[data-theme="dark"] .rotinas-panel .rot-audit-event.error,[data-theme="dark"] .rotinas-panel .rot-audit-event.escalated,[data-theme="dark"] .rotinas-panel .rot-my-row.pending,[data-theme="dark"] .rotinas-panel .rot-my-row.candidate,[data-theme="dark"] .rotinas-panel .rot-my-row.escalated,[data-theme="dark"] .rotinas-panel .rot-my-row.failure,[data-theme="dark"] .rotinas-panel .rot-approvals .focus-row.pending,[data-theme="dark"] .rotinas-panel .rot-execution.attn .rot-card{background:linear-gradient(180deg,rgba(245,158,11,.13),rgba(12,27,18,.92))!important;border-color:rgba(245,158,11,.36)!important}[data-theme="dark"] .rotinas-panel .fn,[data-theme="dark"] .rotinas-panel h4,[data-theme="dark"] .rotinas-panel summary,[data-theme="dark"] .rotinas-panel .rot-exec-card b{color:#F6F8F2!important}[data-theme="dark"] .rotinas-panel .fm,[data-theme="dark"] .rotinas-panel .mini-hint,[data-theme="dark"] .rotinas-panel .rot-why,[data-theme="dark"] .rotinas-panel .rot-exec-card p,[data-theme="dark"] .rotinas-panel .rot-history-line em{color:#B9C4BA!important}[data-theme="dark"] .rotinas-panel .rot-exec-card small,[data-theme="dark"] .rotinas-panel .rot-exec-card span{color:#8FA08F!important}[data-theme="dark"] .rotinas-panel .version-pill.warn{background:rgba(245,158,11,.16)!important;color:#FCD34D!important;border-color:rgba(245,158,11,.32)!important}[data-theme="dark"] .rotinas-panel .version-pill.ok{background:rgba(34,197,94,.14)!important;color:#86EFAC!important;border-color:rgba(34,197,94,.28)!important}
+.rotinas-panel{max-width:1480px;margin:0 auto}.rotinas-panel.compact{gap:10px!important;padding:10px 14px 18px!important}.rotinas-v3{background:#F6F7F2!important;color:#162017}.rotinas-v3 .rot-command-head{display:flex;align-items:center;justify-content:space-between;gap:16px;background:#fff;border:1px solid #E6E6E6;border-radius:22px;padding:18px 20px;box-shadow:0 10px 30px rgba(0,0,0,.035)}.rotinas-v3 .rot-command-head b{display:block;font-size:24px;line-height:1.1;color:#0B0F0C}.rotinas-v3 .rot-command-head span{display:block;margin-top:6px;color:#667066;font-size:14px}.rotinas-v3 .rot-compact-hero{background:#0B0F0C!important;color:#F6F7F2;border:1px solid rgba(205,235,0,.35);box-shadow:none}.rotinas-v3 .rot-compact-status b,.rotinas-v3 .rot-kpi b{color:#fff!important}.rotinas-v3 .rot-compact-status span,.rotinas-v3 .rot-kpi span{color:#C3C3C6!important}.rotinas-v3 .rot-tabs{border-bottom:1px solid #E1E4D8;padding-bottom:10px}.rotinas-v3 .rot-tab{background:#fff;border:1px solid #DDE2D4;color:#243024;box-shadow:none}.rotinas-v3 .rot-tab.active{background:#CDEB00;border-color:#CDEB00;color:#000}.rotinas-v3 .rot-tab em{color:inherit;opacity:.75}.rotinas-v3 .rot-tab-panel{display:flex;flex-direction:column;gap:14px}.rotinas-v3 .rot-tab-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:14px}.rotinas-v3 .rot-compact-card,.rotinas-v3 .rot-explain-card,.rotinas-v3 .rot-cron-folder{background:#fff!important;border:1px solid #E0E4D8!important;border-radius:18px;box-shadow:0 6px 20px rgba(0,0,0,.035);color:#162017}.rotinas-v3 .rot-compact-card h4{color:#0B0F0C;font-size:13px;letter-spacing:.09em;text-transform:uppercase}.rotinas-v3 .rot-explain-kpis>div{background:#F6F7F2;border:1px solid #E0E4D8;border-radius:14px}.rotinas-v3 .rot-explain-kpis b{color:#0B0F0C}.rotinas-v3 .rot-explain-kpis span{color:#667066}.rotinas-v3 .rot-datagrid{border:1px solid #E1E4D8;border-radius:14px;overflow:auto;background:#fff}.rotinas-v3 .rot-dg-row{display:grid;grid-template-columns:var(--rot-cols);border-bottom:1px solid #EEF0EA;min-width:900px}.rotinas-v3 .rot-dg-row:last-child{border-bottom:0}.rotinas-v3 .rot-dg-row>div{padding:10px 12px;color:#243024;font-size:12.5px;line-height:1.35}.rotinas-v3 .rot-dg-row.head>div{background:#F6F7F2;color:#667066;font-size:10.5px;font-weight:900;letter-spacing:.07em;text-transform:uppercase}.rotinas-v3 .rot-actions{display:flex;gap:6px;flex-wrap:wrap}.rotinas-v3 .rot-actions button{border:1px solid #DDE2D4;background:#fff;color:#162017;border-radius:999px;padding:6px 10px;font-size:11px;font-weight:800}.rotinas-v3 .rot-actions button:hover{border-color:#CDEB00;background:#F7FFD4}.rotinas-panel.compact .pipe-simple-head{padding:6px 2px 8px;border-bottom:1px solid rgba(205,235,0,.12)}.rotinas-panel.compact .pipe-simple-head b{font-size:20px}.rotinas-panel.compact .pipe-simple-head span{font-size:12.5px;line-height:1.35;max-width:760px}.rot-topline{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}.rot-live{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:6px 10px;white-space:nowrap}.rotinas-panel .rot-compact-card,.rotinas-panel .rot-explain-card,.rotinas-panel .rot-cron-folder{background:#FFFFFF!important;color:#17201A!important;border:1px solid #E1E5DC!important;box-shadow:0 10px 28px rgba(0,0,0,.035)}.rotinas-panel .rot-compact-card h4,.rotinas-panel .rot-cron-folder summary b{color:#17201A!important}.rotinas-panel .rot-compact-card h4{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#5D665F!important}.rotinas-panel .rot-tab-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.rotinas-panel .rot-tab-grid .rot-compact-card:only-child,.rotinas-panel .rot-tab-panel>.rot-compact-card{grid-column:1/-1}.rotinas-panel .rot-explain-card{border-radius:18px;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:14px}.rotinas-panel .rot-explain-card.attn{border-color:rgba(217,72,15,.32)!important;background:#FFF8F3!important}.rotinas-panel .rot-explain-card b{display:block;font-size:17px}.rotinas-panel .rot-explain-card span{display:block;color:#657066;font-size:12.5px;line-height:1.4;margin-top:2px}.rotinas-panel .rot-explain-kpis{display:grid;grid-template-columns:repeat(4,minmax(110px,1fr));gap:8px;min-width:520px}.rotinas-panel .rot-explain-kpis div,.rotinas-panel .rot-chip-stat{border:1px solid #E4E8DE;background:#F8FAF5;border-radius:13px;padding:9px 10px}.rotinas-panel .rot-explain-kpis b,.rotinas-panel .rot-chip-stat b{display:block;font-size:20px;line-height:1;color:#17201A}.rotinas-panel .rot-explain-kpis span,.rotinas-panel .rot-chip-stat span{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:#7A837B}.rot-datagrid{border:1px solid #E1E5DC;border-radius:14px;overflow:auto;background:#fff}.rot-dg-row{display:grid;grid-template-columns:var(--rot-cols);gap:10px;min-width:900px;border-top:1px solid #EEF1EA;padding:10px 12px;align-items:center;font-size:12.2px;color:#202820}.rot-dg-row.head{position:sticky;top:0;z-index:1;border-top:0;background:#F4F6F0;color:#6A736C;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;font-weight:850}.rot-dg-row:hover{background:#FBFCF8}.rot-dg-row>div{min-width:0;overflow:hidden;text-overflow:ellipsis}.rot-actions{display:flex;gap:6px;flex-wrap:wrap}.rot-actions button{border:1px solid #D7DDCE;background:#F8FAF5;color:#17201A;border-radius:999px;padding:6px 9px;font-size:11px;font-weight:800;cursor:pointer}.rot-actions button:hover{border-color:#CDEB00;background:#F2FBD3}.rot-cron-folders{display:flex;flex-direction:column;gap:12px}.rot-cron-folder{border-radius:16px;overflow:hidden}.rot-cron-folder summary{cursor:pointer;display:flex;justify-content:space-between;gap:12px;padding:13px 15px;background:#F6F8F2;border-bottom:1px solid #E1E5DC}.rot-cron-folder summary span{font-size:12px;color:#6C756E}.rotinas-panel .tag{display:inline-flex;align-items:center;border-radius:999px;border:1px solid #DDE3D7;background:#F8FAF5;color:#344036;padding:4px 8px;font-size:11px;font-weight:850}.rotinas-panel .tag.warn{border-color:#F2C078;background:#FFF6E7;color:#9A5A00}.rotinas-panel .rot-mini-row{background:#F8FAF5!important;border-color:#E4E8DE!important;color:#17201A!important}.rotinas-panel .rot-mini-row strong{color:#17201A!important}.rotinas-panel .rot-mini-row small{color:#68736D!important}
+@media(max-width:760px){.rotinas-panel{padding:10px;gap:10px}.rotinas-panel .pipe-simple-head{align-items:flex-start;gap:8px}.rotinas-panel .pipe-simple-head .stamp{align-self:flex-start}.rot-hero{padding:13px;align-items:flex-start}.rot-hero b{font-size:15px}.rot-hero span{font-size:12px}.rot-cards,.rot-exec-grid{grid-template-columns:1fr}.rot-card{padding:12px}.rot-metro{display:grid;grid-template-columns:1fr;overflow:visible;gap:8px}.rot-metro .arrow{display:none}.rot-metro .stop{min-width:0;border:1px solid var(--line-soft);border-radius:12px;background:var(--surface-2);padding:10px 11px}.rot-metro .stop:not(:last-child)::after{display:none}.rotinas-panel details.mgmt-section{padding:10px}.rotinas-panel .focus-split{grid-template-columns:1fr}.rotinas-panel .proact-actions{flex-direction:column;align-items:stretch}.rotinas-panel .proact-actions button{width:100%}}
+@media(max-width:520px){.rotinas-panel{padding:8px}.rot-hero{border-radius:14px}.rot-card>.h{align-items:flex-start;flex-direction:column}.rot-card li{font-size:12px}.rot-exec-card{padding:11px}.rotinas-panel .focus-row{align-items:flex-start;flex-direction:column}.rotinas-panel .focus-row .fa{margin-left:0}.rotinas-panel .orch-auto-strip{grid-template-columns:1fr}.rotinas-panel .orch-hyg-grid{grid-template-columns:1fr}.rotinas-panel summary{line-height:1.35}}
 .cad-block .pc-v.warn{color:#9A3412;background:rgba(217,72,15,.08);border-color:rgba(217,72,15,.25)}
 .cad-block .cad-stale{font-size:10.5px;font-weight:700;color:#9A3412;background:rgba(217,72,15,.08);border:1px solid rgba(217,72,15,.25);border-radius:999px;padding:1px 8px}
 .cad-warn{font-size:11.5px;color:#9A3412;background:rgba(217,72,15,.06);border:1px solid rgba(217,72,15,.2);border-radius:10px;padding:8px 10px;margin:4px 0;line-height:1.4}
@@ -6613,6 +10179,7 @@ span.cad-chip.cad-dec{color:#6a3c9c}
 .modal-head{display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--line-soft)}
 .modal-head b{font-size:15px;font-weight:650}.modal-head .modal-sub{font-size:12px;color:var(--muted)}.modal-head .spacer{flex:1}
 .modal-body{padding:14px 18px;overflow-y:auto}
+.new-conv-modal-card{width:min(560px,calc(100vw - 28px))}.new-conv-form{display:flex;flex-direction:column;gap:12px}.new-conv-form label{display:flex;flex-direction:column;gap:6px;font-size:12px;font-weight:800;color:var(--txt-2)}.new-conv-form input,.new-conv-form select,.new-conv-form textarea{border:1px solid var(--line-soft);background:var(--surface);color:var(--txt);border-radius:12px;padding:10px 11px;font:inherit;font-size:14px;outline:0}.new-conv-form textarea{resize:vertical;min-height:120px}.new-conv-actions{display:flex;justify-content:flex-end;gap:8px}.new-conv-actions button{border:1px solid var(--line);background:var(--surface);color:var(--txt);border-radius:999px;padding:9px 12px;font-weight:850}.new-conv-actions button.primary{background:var(--accent);border-color:var(--accent);color:#111}.new-conv-actions button:disabled{opacity:.55}.new-conv-hint{font-size:11.5px;color:var(--muted);line-height:1.4}
 .modal-foot{padding:11px 18px;border-top:1px solid var(--line-soft);font-size:11.5px;color:var(--muted)}
 .conn-group{margin-bottom:18px}
 .cg-head{display:flex;align-items:center;gap:9px;margin-bottom:9px}
@@ -6634,6 +10201,13 @@ span.cad-chip.cad-dec{color:#6a3c9c}
 .rec-ok{background:var(--success-soft);color:var(--success)}.rec-warn{background:var(--warning-soft);color:var(--warning)}.rec-bad{background:var(--danger-soft);color:var(--danger)}
 .cc-foot .spacer{flex:1}.cc-foot .none{font-size:11.5px;color:var(--muted)}
 .login{max-width:460px;margin:12vh auto;background:var(--panel);padding:24px;border:1px solid var(--line);border-radius:20px}
+
+/* Proatividade — central do Dexter */
+.proact-wrap{padding:18px;display:flex;flex-direction:column;gap:16px;background:#07100B;min-height:100%;color:var(--txt)}
+.proact-hero{border:1px solid rgba(205,235,0,.12);background:radial-gradient(circle at 18% 0%,rgba(205,235,0,.12),transparent 30%),linear-gradient(135deg,rgba(16,25,19,.96),rgba(7,16,11,.98));border-radius:24px;padding:22px;display:flex;justify-content:space-between;gap:16px;box-shadow:0 24px 70px rgba(0,0,0,.24)}
+.proact-hero h1{margin:0;font-size:30px;letter-spacing:-.04em}.proact-hero p{margin:8px 0 0;color:var(--txt-2);max-width:780px;line-height:1.45}.proact-status{align-self:flex-start;border:1px solid rgba(205,235,0,.2);background:rgba(205,235,0,.08);color:var(--accent);border-radius:999px;padding:8px 12px;font-size:12px;font-weight:800;white-space:nowrap}
+.proact-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}.proact-kpi{border:1px solid var(--line-soft);background:var(--surface);border-radius:18px;padding:14px}.proact-kpi b{display:block;font-size:26px;line-height:1}.proact-kpi span{display:block;margin-top:6px;color:var(--muted);font-size:12px}.proact-grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(330px,.9fr);gap:14px}.proact-panel{border:1px solid var(--line-soft);background:var(--surface);border-radius:20px;overflow:hidden}.proact-panel h3{margin:0;padding:14px 16px;border-bottom:1px solid var(--line-soft);font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:flex;justify-content:space-between}.proact-body{padding:14px 16px}.proact-table{display:grid;gap:6px}.proact-row{display:grid;grid-template-columns:112px 1.1fr .9fr .9fr .9fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--line-soft);border-radius:12px;background:rgba(255,255,255,.018);font-size:12px}.proact-row.head{background:transparent;color:var(--muted);font-weight:800;text-transform:uppercase;font-size:10.5px}.proact-row b{display:block;font-size:12.5px}.proact-row small{display:block;color:var(--muted);margin-top:2px;line-height:1.35}.proact-stack{display:grid;gap:8px}.proact-item{border:1px solid var(--line-soft);background:rgba(255,255,255,.02);border-radius:12px;padding:10px}.proact-item b{display:block;font-size:12.5px}.proact-item span{display:block;color:var(--muted);font-size:11.5px;margin-top:3px}.proact-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.proact-form label{display:grid;gap:5px;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em}.proact-form input,.proact-form select,.proact-form textarea{border:1px solid var(--line);background:rgba(7,16,11,.72);border-radius:10px;color:var(--txt);padding:9px 10px;outline:0}.proact-form textarea{grid-column:1/-1;min-height:76px;resize:vertical}.proact-actions{display:flex;align-items:center;gap:10px;margin-top:10px}.proact-actions button{border:1px solid var(--btn-lime-line);background:var(--btn-ink);color:var(--btn-lime);border-radius:999px;padding:9px 13px;font-size:12px;font-weight:800}.proact-note{font-size:11.5px;color:var(--muted);line-height:1.45}@media(max-width:1100px){.proact-grid,.proact-kpis{grid-template-columns:1fr}.proact-row{grid-template-columns:1fr}.proact-hero{flex-direction:column}.proact-form{grid-template-columns:1fr}}
+
 /* responsive */
 .scrim{display:none}
 @media (max-width:1320px){
@@ -6729,16 +10303,17 @@ span.cad-chip.cad-dec{color:#6a3c9c}
   .context{bottom:72px;height:auto!important}
   .mobile-tabbar{
     position:fixed;left:max(10px,env(safe-area-inset-left));right:max(10px,env(safe-area-inset-right));
-    bottom:calc(6px + env(safe-area-inset-bottom));height:60px;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;
+    bottom:calc(6px + env(safe-area-inset-bottom));height:60px;display:flex;gap:4px;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x proximity;scrollbar-width:none;
     padding:5px;border:1px solid rgba(255,255,255,.56);border-radius:22px;
     background:linear-gradient(180deg,rgba(255,255,255,.82),rgba(246,247,242,.68));
     box-shadow:0 18px 50px rgba(20,28,20,.18),0 6px 18px rgba(20,28,20,.10),inset 0 1px 0 rgba(255,255,255,.92);
     z-index:60;backdrop-filter:saturate(180%) blur(24px);-webkit-backdrop-filter:saturate(180%) blur(24px);
   }
+  .mobile-tabbar::-webkit-scrollbar{display:none}
   .mobile-tabbar::before{content:"";position:absolute;inset:3px;border-radius:19px;pointer-events:none;background:radial-gradient(circle at 50% 0%,rgba(255,255,255,.72),transparent 55%)}
   [data-theme="dark"] .mobile-tabbar{border-color:rgba(255,255,255,.10);background:linear-gradient(180deg,rgba(21,27,23,.78),rgba(7,16,11,.68));box-shadow:0 18px 54px rgba(0,0,0,.42),0 6px 18px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.08)}
   [data-theme="dark"] .mobile-tabbar::before{background:radial-gradient(circle at 50% 0%,rgba(255,255,255,.12),transparent 58%)}
-  .mobile-tabbar button{position:relative;z-index:1;border:0;background:transparent;color:var(--muted);border-radius:18px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:10px;font-weight:760;letter-spacing:-.12px;line-height:1;min-width:0;transition:transform .16s cubic-bezier(.2,.9,.2,1),color .16s,background .16s,box-shadow .16s}
+  .mobile-tabbar button{position:relative;z-index:1;border:0;background:transparent;color:var(--muted);border-radius:18px;display:flex;flex:0 0 76px;scroll-snap-align:center;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:10px;font-weight:760;letter-spacing:-.12px;line-height:1;min-width:0;transition:transform .16s cubic-bezier(.2,.9,.2,1),color .16s,background .16s,box-shadow .16s}
   .mobile-tabbar button:active{transform:scale(.96)}
   .mobile-tabbar button .ico{width:24px;height:24px;border-radius:999px;display:grid;place-items:center;line-height:1;color:currentColor;transition:.18s cubic-bezier(.2,.9,.2,1)}
   .mobile-tabbar button .ico svg{width:18px;height:18px;display:block;stroke:currentColor;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round}
@@ -6760,14 +10335,64 @@ span.cad-chip.cad-dec{color:#6a3c9c}
 #connModal .modal-head b{font-size:17px}.modal-head .modal-sub{line-height:1.35}
 .team-tabs{display:flex;gap:8px;margin:0 0 14px;position:sticky;top:-16px;background:var(--panel);z-index:2;padding:0 0 10px}.team-tabs button{border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:9px 14px;font-size:12px;font-weight:850;color:var(--muted);cursor:pointer;white-space:nowrap}.team-tabs button.on{background:var(--btn-ink);color:var(--btn-lime);border-color:var(--btn-lime-line);box-shadow:0 8px 22px rgba(11,15,12,.14)}
 .team-layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;align-items:start}.team-section{min-width:0;border:1px solid var(--line-soft);background:var(--surface);border-radius:18px;padding:14px}.team-section h3{margin:0 0 4px;font-size:14px}.team-section p{margin:0 0 12px;color:var(--muted);font-size:12px;line-height:1.45}.team-list{display:grid;gap:10px}.team-card{min-width:0;border:1px solid var(--line-soft);background:var(--panel);border-radius:16px;padding:12px;overflow:hidden}.team-card.top-sdr{border-left:4px solid #7AA2FF}.team-card.top-com{border-left:4px solid var(--accent)}.team-card .cc-head{flex-wrap:wrap;margin-bottom:8px}.team-card .cc-name{min-width:0;overflow:hidden;text-overflow:ellipsis}.team-card .cc-port{margin-left:0!important}.team-card .meta{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:7px}.pill{display:inline-flex;align-items:center;gap:5px;max-width:100%;border:1px solid var(--line-soft);border-radius:999px;padding:4px 8px;font-size:11px;color:var(--muted);background:var(--surface);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pill.good{color:#0f8f5f;border-color:rgba(32,201,151,.25);background:rgba(32,201,151,.08)}.pill.warn{color:#bd7500;border-color:rgba(247,185,85,.35);background:rgba(247,185,85,.09)}.pill.bad{color:#c23b3b;border-color:rgba(255,107,107,.25);background:rgba(255,107,107,.08)}
-.team-card .cc-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.team-card .cc-metrics>div{min-width:0}.team-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}.team-actions button,.team-actions a,.team-form button{min-height:34px;border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:7px 10px;font-size:12px;font-weight:850;color:var(--txt);text-decoration:none;cursor:pointer;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.team-actions .primary,.team-form .primary{background:var(--btn-ink);color:var(--btn-lime);border-color:var(--btn-lime-line)}.team-actions .danger{color:#c23b3b}.team-form{display:grid;gap:10px}.team-form label{display:grid;gap:5px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:850}.team-form input,.team-form select{min-width:0;border:1px solid var(--line-soft);background:var(--panel);color:var(--txt);border-radius:12px;padding:10px;font-size:13px;outline:none}.form-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.team-toast{margin:0 0 10px;padding:9px 11px;border-radius:12px;background:rgba(205,235,0,.12);border:1px solid rgba(205,235,0,.28);font-size:12px;color:var(--txt)}.team-empty{padding:16px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);font-size:12px}.confirm-inline{background:rgba(255,107,107,.10)!important;color:#c23b3b!important;border-color:rgba(255,107,107,.35)!important}
+.team-card .cc-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.team-card .cc-metrics>div{min-width:0}.team-owner-card .team-chip-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}.chip-subcard{border:1px solid var(--line-soft);background:var(--surface-2);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px}.chip-subcard .cc-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:0}.chip-subcard .cc-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.team-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}.team-actions button,.team-actions a,.team-form button{min-height:34px;border:1px solid var(--line-soft);background:var(--surface);border-radius:999px;padding:7px 10px;font-size:12px;font-weight:850;color:var(--txt);text-decoration:none;cursor:pointer;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.team-actions .primary,.team-form .primary{background:var(--btn-ink);color:var(--btn-lime);border-color:var(--btn-lime-line)}.team-actions .danger{color:#c23b3b}.team-form{display:grid;gap:10px}.team-form label{display:grid;gap:5px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:850}.team-form input,.team-form select{min-width:0;border:1px solid var(--line-soft);background:var(--panel);color:var(--txt);border-radius:12px;padding:10px;font-size:13px;outline:none}.form-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.team-toast{margin:0 0 10px;padding:9px 11px;border-radius:12px;background:rgba(205,235,0,.12);border:1px solid rgba(205,235,0,.28);font-size:12px;color:var(--txt)}.team-empty{padding:16px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);font-size:12px}.confirm-inline{background:rgba(255,107,107,.10)!important;color:#c23b3b!important;border-color:rgba(255,107,107,.35)!important}
 @media(max-width:980px){#connModal .modal-card{width:calc(100vw - 20px);max-height:94vh}.team-layout{grid-template-columns:1fr}.form-row{grid-template-columns:1fr}.team-actions{grid-template-columns:1fr 1fr}}
 @media(max-width:560px){.team-actions{grid-template-columns:1fr}.team-card .cc-metrics{grid-template-columns:1fr}.team-tabs{overflow-x:auto}}
 
 
+
+/* Rotinas V3 final override: evita herança de cards dark antigos. */
+.rotinas-v3{background:#F6F7F2!important;color:#162017!important}
+.rotinas-v3 .rot-command-head{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:16px!important;background:#fff!important;border:1px solid #E2E5DC!important;border-radius:22px!important;padding:18px 20px!important;box-shadow:0 8px 26px rgba(0,0,0,.04)!important}
+.rotinas-v3 .rot-command-head b{display:block!important;font-size:24px!important;line-height:1.12!important;color:#0B0F0C!important;letter-spacing:-.02em!important}
+.rotinas-v3 .rot-command-head span{display:block!important;margin-top:6px!important;color:#667066!important;font-size:14px!important;line-height:1.35!important;max-width:720px!important}
+.rotinas-v3 .rot-live{background:#F6F7F2!important;border:1px solid #DDE2D4!important;color:#6B746C!important;border-radius:999px!important;padding:7px 12px!important;font-size:10.5px!important;font-weight:800!important;letter-spacing:.08em!important;white-space:nowrap!important}
+.rotinas-v3 .rot-compact-hero{display:grid!important;grid-template-columns:minmax(280px,1fr) minmax(520px,2fr)!important;gap:14px!important;align-items:center!important;background:#0B0F0C!important;border:1px solid rgba(205,235,0,.32)!important;border-radius:18px!important;padding:15px 18px!important;box-shadow:none!important;color:#fff!important;min-height:88px!important;overflow:hidden!important}
+.rotinas-v3 .rot-compact-status{display:flex!important;align-items:center!important;gap:12px!important;min-width:0!important}
+.rotinas-v3 .rot-compact-status .dot{width:12px!important;height:12px!important;border-radius:999px!important;background:#CDEB00!important;box-shadow:0 0 0 4px rgba(205,235,0,.15)!important;flex:none!important}
+.rotinas-v3 .rot-compact-status b{display:block!important;color:#fff!important;font-size:21px!important;line-height:1.05!important;white-space:normal!important;overflow:visible!important;text-overflow:clip!important}
+.rotinas-v3 .rot-compact-status span{display:block!important;color:#C3C3C6!important;font-size:13px!important;line-height:1.35!important;margin-top:4px!important}
+.rotinas-v3 .rot-kpi-row{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:10px!important;min-width:0!important}
+.rotinas-v3 .rot-kpi{background:rgba(255,255,255,.06)!important;border:1px solid rgba(205,235,0,.22)!important;border-radius:14px!important;padding:12px 13px!important;min-width:0!important}
+.rotinas-v3 .rot-kpi b{display:block!important;color:#fff!important;font-size:25px!important;line-height:1!important}
+.rotinas-v3 .rot-kpi span{display:block!important;color:#C3C3C6!important;font-size:11.5px!important;margin-top:6px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}
+.rotinas-v3 .rot-tabs{display:flex!important;gap:8px!important;overflow-x:auto!important;padding:2px 0 12px!important;border-bottom:1px solid #E1E4D8!important}
+.rotinas-v3 .rot-tab{border:1px solid #DDE2D4!important;background:#fff!important;color:#263126!important;border-radius:999px!important;padding:10px 16px!important;font-size:13px!important;font-weight:850!important;box-shadow:none!important}
+.rotinas-v3 .rot-tab.active{background:#CDEB00!important;border-color:#CDEB00!important;color:#000!important}
+.rotinas-v3 .rot-tab em{font-style:normal!important;margin-left:6px!important;color:inherit!important;opacity:.72!important}
+.rotinas-v3 .rot-tab-panel{display:flex!important;flex-direction:column!important;gap:14px!important}
+.rotinas-v3 .rot-tab-grid{display:grid!important;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr)!important;gap:14px!important}
+.rotinas-v3 .rot-compact-card,.rotinas-v3 .rot-explain-card,.rotinas-v3 .rot-cron-folder{background:#fff!important;color:#162017!important;border:1px solid #E0E4D8!important;border-radius:18px!important;box-shadow:0 6px 20px rgba(0,0,0,.035)!important}
+.rotinas-v3 .rot-compact-card{padding:15px!important}
+.rotinas-v3 .rot-compact-card h4{margin:0 0 12px!important;color:#0B0F0C!important;font-size:13px!important;letter-spacing:.08em!important;text-transform:uppercase!important}
+.rotinas-v3 .rot-explain-card{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:18px!important;padding:16px!important}
+.rotinas-v3 .rot-explain-card b{color:#0B0F0C!important;font-size:18px!important}.rotinas-v3 .rot-explain-card span{color:#667066!important}
+.rotinas-v3 .rot-explain-kpis{display:grid!important;grid-template-columns:repeat(4,minmax(110px,1fr))!important;gap:9px!important;min-width:520px!important}
+.rotinas-v3 .rot-explain-kpis>div{background:#F6F7F2!important;border:1px solid #E0E4D8!important;border-radius:14px!important;padding:10px 12px!important}
+.rotinas-v3 .rot-explain-kpis b{color:#0B0F0C!important;font-size:22px!important}.rotinas-v3 .rot-explain-kpis span{color:#667066!important;font-size:10.5px!important;text-transform:uppercase!important;letter-spacing:.06em!important}
+.rotinas-v3 .rot-datagrid{border:1px solid #E1E4D8!important;border-radius:14px!important;overflow:auto!important;background:#fff!important}
+.rotinas-v3 .rot-dg-row{display:grid!important;grid-template-columns:var(--rot-cols)!important;gap:0!important;min-width:900px!important;border-top:0!important;border-bottom:1px solid #EEF0EA!important;padding:0!important;background:#fff!important}
+.rotinas-v3 .rot-dg-row>div{padding:10px 12px!important;color:#243024!important;font-size:12.5px!important;line-height:1.35!important;white-space:normal!important;overflow:visible!important;text-overflow:clip!important}
+.rotinas-v3 .rot-dg-row.head>div{background:#F6F7F2!important;color:#667066!important;font-size:10.5px!important;font-weight:900!important;letter-spacing:.07em!important;text-transform:uppercase!important}
+.rotinas-v3 .rot-plain-note{display:flex!important;align-items:flex-start!important;gap:10px!important;background:#F6F7F2!important;border:1px solid #E0E4D8!important;border-radius:14px!important;padding:10px 12px!important;color:#4D584F!important;line-height:1.4!important;font-size:12.5px!important}.rotinas-v3 .rot-plain-note b{color:#0B0F0C!important;font-size:12.5px!important;line-height:1.4!important;white-space:nowrap!important}.rotinas-v3 .rot-plain-note span{display:block!important;min-width:0!important}.rotinas-v3 .rot-journey{display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr))!important;gap:10px!important;margin:6px 0 10px!important}.rotinas-v3 .rot-journey>div{background:#F6F7F2!important;border:1px solid #E0E4D8!important;border-radius:14px!important;padding:11px 12px!important;min-width:0!important}.rotinas-v3 .rot-journey b{width:24px!important;height:24px!important;border-radius:999px!important;display:grid!important;place-items:center!important;background:#0B0F0C!important;color:#CDEB00!important;font-size:12px!important;margin-bottom:7px!important}.rotinas-v3 .rot-journey span{display:block!important;color:#0B0F0C!important;font-weight:900!important;font-size:13px!important;line-height:1.15!important}.rotinas-v3 .rot-journey small{display:block!important;color:#667066!important;font-size:11.5px!important;line-height:1.35!important;margin-top:5px!important}
+/* ZYDON_FIX_20260701_ANALYTICS_RENDER: telas analíticas não herdam busca/nova conversa e rolam dentro da área principal. */
+.app.analytics-mode .zone-head{display:none!important}
+.app.analytics-mode .list-sub{height:56px!important;flex:0 0 56px!important;padding:0 22px!important;background:#fff!important;border-bottom:1px solid var(--line-soft)!important}
+.app.analytics-mode .list-sub .filter-toggle,.app.analytics-mode .list-sub .new-conv-btn{display:none!important}
+.app.analytics-mode #refreshStrip,.app.analytics-mode #filterbar,.app.analytics-mode #pullRefresh{display:none!important}
+.app.analytics-mode .list{height:100vh!important;overflow:hidden!important;min-height:0!important;display:flex!important;flex-direction:column!important;background:var(--bg)!important}
+.app.analytics-mode .list>.scroll{flex:1 1 auto!important;min-height:0!important;overflow:auto!important;-webkit-overflow-scrolling:touch!important}
+.app.analytics-mode .cards{height:auto!important;min-height:100%!important;overflow:visible!important;padding:16px 22px 32px!important;max-width:1440px!important;width:100%!important;margin:0 auto!important;box-sizing:border-box!important}
+.app.analytics-mode .rotinas-panel{height:auto!important;min-height:0!important;overflow:visible!important}
+@media(max-width:820px){.app.analytics-mode .list{height:100dvh!important}.app.analytics-mode .list>.scroll{padding-bottom:86px!important;box-sizing:border-box!important}.app.analytics-mode .cards{padding-bottom:108px!important}}
+@media (min-width:821px){.mobile-tabbar{display:none!important;visibility:hidden!important;pointer-events:none!important}.app{padding-bottom:0!important}.sidebar{display:flex!important}.conversation{position:relative!important;transform:none!important;bottom:auto!important}}
+@media (min-width:1321px){.context{position:relative!important;transform:none!important;bottom:auto!important;height:100vh!important;max-width:none!important;box-shadow:none!important}.scrim{display:none!important}}
+.context .section{padding:15px 16px!important}.context .kv{display:grid!important;grid-template-columns:minmax(88px,.78fr) minmax(0,1.35fr)!important;align-items:start!important;gap:8px!important;padding:6px 0!important;font-size:12.5px!important;line-height:1.35!important}.context .kv .k{display:block!important;color:var(--muted)!important;min-width:0!important}.context .kv .v{display:block!important;text-align:left!important;white-space:normal!important;overflow:visible!important;text-overflow:clip!important;min-width:0!important;word-break:break-word!important}.context .ctx-id .tags{display:flex!important;flex-wrap:wrap!important;gap:6px!important;margin-top:9px!important}.context .ctx-id .tag{display:inline-flex!important;margin:0!important}.context .section h5{line-height:1.25!important;margin:0 0 10px!important}.context .readonly-banner{line-height:1.45!important;word-break:normal!important}.context .top .nm{min-width:0!important;overflow:hidden!important}.context .top .nm b{white-space:normal!important;line-height:1.2!important}
+@media(max-width:900px){.rotinas-v3 .rot-compact-hero{grid-template-columns:1fr!important}.rotinas-v3 .rot-kpi-row,.rotinas-v3 .rot-explain-kpis{grid-template-columns:repeat(2,minmax(0,1fr))!important;min-width:0!important}.rotinas-v3 .rot-tab-grid{grid-template-columns:1fr!important}.rotinas-v3 .rot-command-head{align-items:flex-start!important;flex-direction:column!important}.rotinas-v3 .rot-journey{grid-template-columns:1fr!important}.rotinas-v3 .rot-plain-note{flex-direction:column!important;gap:4px!important}.rotinas-v3 .rot-plain-note b{white-space:normal!important}}
 </style></head><body><div id="root"></div>
 <script>
 const qs=new URLSearchParams(location.search), user=qs.get('u')||'', token=qs.get('t')||'', deepConv=qs.get('conv')||'';
+const INBOX_COPY=Object.freeze({communicatorBadge:'Comunicador:', leadOwnerChip:'Lead do SDR:', leadOwnerBadge:'Proprietário SDR:', readonlyTitle:'Somente leitura:', readonlyExplainer:(sender,owner)=>`contexto de envio feito por ${sender} para lead do SDR ${owner}. Para responder, abra a conversa/carteira do SDR responsável.`});
 const auth=`u=${encodeURIComponent(user)}&t=${encodeURIComponent(token)}`;
 let deepConvOpened=false;
 let convs=[], active=null, msgs=[], msgsConvId=null, me=null, portMeta={};
@@ -6776,12 +10401,24 @@ let hubspotFilter=false; // WhatsApp mode: mostra todas as conversas reais do Wh
 let managerOverview=null, managerOverviewLoading=false;
 let pipelineFocus=null, pipelineFocusLoading=false;
 let dispatchStats=null, dispatchStatsLoading=false, dispatchSelectedChip='', dispatchSelectedDay='', dispatchSelectedType='';
+// Controle de agendas (/agendas): estado read-only carregado de /api/agendas.
+let agendasData=null, agendasLoading=false, agendasError='';
+let agendasFilters={days:7, sdr:'all', kind:'all', status:'all', search:'', limit:200};
+const AGENDA_KIND_OPTIONS=[{key:'confirmacao',label:'Confirmação'},{key:'lembrete',label:'Lembrete'},{key:'grupo',label:'Aviso ao time'},{key:'agenda',label:'Convite de agenda'},{key:'diagnostico',label:'Diagnóstico'},{key:'complemento',label:'Complemento de link'}];
+// Dexter Center é fonte técnica para Rotinas; Gestão/Foco não carregam configuração/orquestração.
+// Followups/Proatividade convergem para Rotinas; Agendas fica como raiz de preparo SDR.
+let dexterTab='overview', dexterData=null, dexterLoading=false, dexterError='';
+let dexterFilters={days:14, search:'', limit:80};
+let dexterExpanded={};
 let pipeCallFilter='all', pipeWhatsFilter='all', pipeBucketFilter='all', pipeSampleBucket='1';
 let focusOwnerFilter='all', focusStageFilter='all', focusTaskFilter='open';
 let cadenciaPreview=null, cadenciaLoading=false;
 // Gestão SDR (subaba do Foco): visão de gestão somente leitura. Os dados vêm de
 // /api/sdr-orchestrator-summary e /api/task-hygiene-preview (HubSpot read-only).
 let sdrOrch=null, sdrOrchLoading=false, sdrOrchError='', focusSubtab='dia';
+let rotinasData=null, rotinasLoading=false, rotinasError='', rotinasSaving=false, rotinasNotice='', rotinasTab='arquitetura';
+let followupsData=null, followupsLoading=false, followupsError='', followupsTab='overview', followupsSearch='';
+let proatividadeData=null, proatividadeLoading=false, proatividadeError='', proatividadeSaveMsg='';
 // CH-026/CH-010: seleção em massa (ids). O estado de triagem (status/nota) é
 // persistido no backend via /api/state e chega em cada conversa (localStatus,
 // localNote, localUpdatedAt). Mutamos a conversa em memória de forma otimista e
@@ -6925,12 +10562,14 @@ function setListLoading(on){
 
 /* ---- Tema Zydon: Light/Dark seguindo paleta da marca. Toggle no perfil. ---- */
 function currentTheme(){ try{return localStorage.getItem('zydon-theme')||'light'}catch{return 'light'} }
-function analyticsModeActive(){return viewMode==='foco'||viewMode==='gestao'||['/foco','/gestao'].includes(window.location.pathname||'')}
+function analyticsModeActive(){return viewMode==='foco'||viewMode==='gestao'||viewMode==='agendas'||viewMode==='rotinas'||['/foco','/gestao','/agendas','/followups','/rotinas','/proatividade'].includes(window.location.pathname||'')}
+function dashboardDarkModeActive(){return viewMode==='foco'||viewMode==='gestao'||['/foco','/gestao'].includes(window.location.pathname||'')}
 function applyTheme(t, opts={}){
   t=(t||currentTheme()); if(t!=='dark') t='light';
-  // Gestão/Foco são superfícies analíticas premium: sempre dark na tela inteira.
+  // Apenas dashboards analíticos ficam forçados no dark. Agendas e Rotinas são
+  // cockpit operacional/read-only e ficam em WHITE MODE para leitura longa.
   // Não gravar essa imposição em localStorage, para Conversas continuar respeitando o toggle do usuário.
-  const visualTheme=analyticsModeActive()?'dark':t;
+  const visualTheme=dashboardDarkModeActive()?'dark':(viewMode==='agendas'||viewMode==='rotinas'||['/agendas','/followups','/rotinas','/proatividade'].includes(window.location.pathname||'')?'light':t);
   document.documentElement.setAttribute('data-theme',visualTheme);
   if(!opts.visualOnly){ try{localStorage.setItem('zydon-theme',t)}catch(e){} }
   const logo=document.getElementById('brandLogo'); if(logo) logo.src=(visualTheme==='dark'?'/logo-dark.png':'/logo.png');
@@ -7133,6 +10772,8 @@ function renderShell(){
         <button id="modeConv" data-view="conversas" class="on" onclick="setViewMode('conversas')" title="Conversas"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7.5A4.5 4.5 0 0 1 9.5 3h5A4.5 4.5 0 0 1 19 7.5v3A4.5 4.5 0 0 1 14.5 15H11l-4.5 3v-3.2A4.5 4.5 0 0 1 5 10.5v-3Z"/><path d="M9 8h6M9 11h4"/></svg></span><span class="lbl">Conversas</span></button>
         <button id="modeFocus" data-view="foco" onclick="setViewMode('foco')" title="Foco SDR"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3 6 13h5l-1 8 8-11h-5l0-7Z"/></svg></span><span class="lbl">Foco SDR</span></button>
         <button id="modeMgmt" data-view="gestao" onclick="setViewMode('gestao')" title="Gestão"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16v-5"/><path d="M12 16V8"/><path d="M16 16v-3"/></svg></span><span class="lbl">Gestão</span></button>
+        <button id="modeAgendas" data-view="agendas" onclick="setViewMode('agendas')" title="Preparo para diagnóstico"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 9.5h17"/><path d="M8 3v4M16 3v4"/><path d="M7.5 13h3M7.5 16.5h6"/></svg></span><span class="lbl">Agendas</span></button>
+        <button id="modeRotinas" data-view="rotinas" onclick="setViewMode('rotinas')" title="Rotinas"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><path d="M7 5v4M12 10v4M17 15v4"/></svg></span><span class="lbl">Rotinas</span></button>
       </div>
       <nav class="nav"><div class="nav-label">Conversas</div><div id="queues"></div></nav>
       <div class="conn-foot"><button class="conn-btn" id="connBtn" onclick="openConnections()"><span class="st off"></span><span class="cl-label">WhatsApp e equipe</span></button></div>
@@ -7140,8 +10781,8 @@ function renderShell(){
     </aside>
     <section class="col list">
       <div class="zone-head"><div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input id="search" placeholder="Buscar empresa, contato, telefone…"><kbd>/</kbd></div></div>
-      <div class="list-sub"><span class="title" id="queueTitle">Conversas</span><span class="n" id="queueCount"></span><span class="live-status" id="liveStatus" title="A inbox atualiza sozinha"><span class="live-dot"></span><span class="live-txt">ao vivo</span><span class="live-ago"></span></span><span class="spacer"></span><button class="filter-toggle" id="filterToggle" onclick="toggleFilters()">Filtros</button></div>
-      <div class="refresh-strip"><button class="refresh-conv" onclick="refreshInboxNewOnly()" title="Atualizar a lista de conversas sem recarregar a página inteira">↻ ATUALIZAR CONVERSAS</button><small>Busca novas mensagens sem perder sua posição</small></div>
+      <div class="list-sub"><span class="title" id="queueTitle">Conversas</span><span class="n" id="queueCount"></span><span class="live-status" id="liveStatus" title="A inbox atualiza sozinha"><span class="live-dot"></span><span class="live-txt">ao vivo</span><span class="live-ago"></span></span><span class="spacer"></span><button class="new-conv-btn" onclick="openNewConversation()">+ Nova conversa</button><button class="filter-toggle" id="filterToggle" onclick="toggleFilters()">Filtros</button></div>
+      <div id="refreshStrip" class="refresh-strip"><button class="refresh-conv" onclick="refreshInboxNewOnly()" title="Atualizar a lista de conversas sem recarregar a página inteira">↻ ATUALIZAR CONVERSAS</button><small>Busca novas mensagens sem perder sua posição</small></div>
       <div class="filterbar" id="filterbar"></div>
       <div class="pull-refresh" id="pullRefresh" aria-hidden="true"><div class="pr-card"><span class="pr-spinner"></span><span class="pr-txt">Puxe para atualizar</span></div></div>
       <div class="scroll"><div class="cards" id="cards"></div></div>
@@ -7177,6 +10818,8 @@ function renderShell(){
       <button data-view="conversas" class="on" onclick="setViewMode('conversas')"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7.5A4.5 4.5 0 0 1 9.5 3h5A4.5 4.5 0 0 1 19 7.5v4A4.5 4.5 0 0 1 14.5 16H11l-4.5 3v-3.4A4.5 4.5 0 0 1 5 12V7.5Z"/><path d="M9 8h6M9 11h4"/></svg></span><span class="lbl">Conversas</span></button>
       <button data-view="foco" onclick="setViewMode('foco')"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 5 13h6l-1 9 9-13h-6l0-7Z"/></svg></span><span class="lbl">Foco SDR</span></button>
       <button data-view="gestao" onclick="setViewMode('gestao')"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16v-5"/><path d="M12 16V8"/><path d="M16 16v-3"/></svg></span><span class="lbl">Gestão</span></button>
+      <button data-view="agendas" onclick="setViewMode('agendas')"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 9.5h17"/><path d="M8 3v4M16 3v4"/><path d="M7.5 13h3M7.5 16.5h6"/></svg></span><span class="lbl">Agendas</span></button>
+      <button data-view="rotinas" onclick="setViewMode('rotinas')"><span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/><path d="M7 5v4M12 10v4M17 15v4"/></svg></span><span class="lbl">Rotinas</span></button>
     </nav>
     <div class="modal file-modal" id="fileModal" hidden>
       <div class="modal-scrim" onclick="closeFilePreview()"></div>
@@ -7217,6 +10860,14 @@ function renderShell(){
         <div class="modal-foot">Lista somente leitura dos envios reais. Abrir conversa leva direto para o chat correspondente.</div>
       </div>
     </div>
+    <div class="modal" id="newConvModal" hidden>
+      <div class="modal-scrim" onclick="closeNewConversation()"></div>
+      <div class="modal-card new-conv-modal-card">
+        <div class="modal-head"><b>Nova conversa</b><span class="modal-sub">Enviar primeira mensagem por um chip permitido</span><span class="spacer"></span><button class="icon-btn" onclick="closeNewConversation()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
+        <div class="modal-body" id="newConvBody"></div>
+        <div class="modal-foot">Não cria conversa vazia: só aparece na lista após envio real pela bridge.</div>
+      </div>
+    </div>
     <div id="dispatchTooltip" class="dispatch-tooltip" hidden></div>
     <div class="modal wizard-modal" id="bulkWizard" hidden>
       <div class="modal-scrim" onclick="closeBulkWizard()"></div>
@@ -7233,7 +10884,7 @@ function renderShell(){
   s.oninput=()=>{setSearchBusy(true); debouncedSearch();};
   const listScroller=getListScroller();
   if(listScroller) listScroller.addEventListener('scroll',()=>{ clearTimeout(listScrollTimer); listScrollTimer=setTimeout(saveListScroll,120); }, {passive:true});
-  document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='TEXTAREA'){e.preventDefault();s.focus()}if(e.key==='Escape'){ if(connOpen) closeConnections(); closePipeModal(); }});
+  document.addEventListener('keydown',e=>{if(e.key==='/'&&document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='TEXTAREA'){e.preventDefault();s.focus()}if(e.key==='Escape'){ if(connOpen) closeConnections(); closePipeModal(); closeNewConversation(); }});
   const ta=document.getElementById('composer');
   ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(160,ta.scrollHeight)+'px'});
   ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendReply()}});
@@ -7283,33 +10934,54 @@ function installPullToReload(){
   scroller.addEventListener('touchcancel',reset, {passive:true});
 }
 
-function routeForViewMode(mode){return mode==='foco'?'/foco':(mode==='gestao'?'/gestao':'/conversas')}
+function routeForViewMode(mode){return mode==='foco'?'/foco':(mode==='gestao'?'/gestao':(mode==='agendas'?'/agendas':(mode==='rotinas'||mode==='followups'||mode==='proatividade'?'/rotinas':'/conversas')))}
+function canUseRotinas(){ return !!(me && me.id==='rafael'); }
+function normalizeViewModeForUser(mode){
+  mode=mode||'conversas';
+  if(mode==='rotinas' && me && !canUseRotinas()) return 'conversas';
+  return mode;
+}
+function updateNavigationAccess(){
+  const allowRotinas=canUseRotinas();
+  document.querySelectorAll('[data-view="rotinas"]').forEach(btn=>{
+    btn.hidden=!allowRotinas;
+    btn.style.display=allowRotinas?'':'none';
+    btn.setAttribute('aria-hidden', allowRotinas?'false':'true');
+  });
+}
 function initialViewModeFromPath(){
   const p=window.location.pathname||'/';
   if(p==='/foco') return 'foco';
   if(p==='/gestao') return 'gestao';
+  if(p==='/agendas') return 'agendas';
+  if(p==='/followups'||p==='/proatividade'||p==='/rotinas') return 'rotinas';
   return 'conversas';
 }
 function setViewMode(mode, opts={}){
-  viewMode=mode||'conversas';
+  viewMode=normalizeViewModeForUser(mode);
   if(!opts.skipHistory){
     const target=routeForViewMode(viewMode);
     if(window.location.pathname!==target) history.pushState({viewMode},'',target);
   }
   document.querySelectorAll('[data-view]').forEach(btn=>btn.classList.toggle('on', btn.dataset.view===viewMode));
   const app=document.getElementById('app');
-  const analyticsMode=(viewMode==='foco'||viewMode==='gestao');
+  const analyticsMode=(viewMode==='foco'||viewMode==='gestao'||viewMode==='agendas'||viewMode==='rotinas');
   if(app) app.classList.toggle('analytics-mode', analyticsMode);
-  // Gestão/Foco são dashboards analíticos; manter visual dark mesmo se a preferência salva for White.
+  // Gestão/Foco/Agendas são superfícies de trabalho/análise; Rotinas é a central privada de configuração/orquestração.
   applyTheme(currentTheme(), {visualOnly:true});
   const ft=document.getElementById('filterToggle');
   if(ft) ft.style.display=(viewMode==='conversas')?'':'none';
+  // O strip "ATUALIZAR CONVERSAS" é da inbox; fora de Conversas ele só confunde.
+  const rs=document.getElementById('refreshStrip');
+  if(rs) rs.style.display=(viewMode==='conversas')?'':'none';
   const fb=document.getElementById('filterbar');
   if(fb && viewMode!=='conversas'){ fb.classList.remove('open'); fb.innerHTML=''; }
   if(viewMode==='foco'||viewMode==='gestao'){
     if(!pipelineFocus && !pipelineFocusLoading) loadPipelineFocus();
     if(viewMode==='gestao' && !dispatchStats && !dispatchStatsLoading) loadDispatchStats();
   }
+  if(viewMode==='agendas' && !agendasData && !agendasLoading) loadAgendas();
+  if(viewMode==='rotinas' && me && canUseRotinas() && !rotinasData && !rotinasLoading) loadRotinas();
   drawCards();
 }
 
@@ -7483,33 +11155,50 @@ function renderTeamCard(portMeta, kind){
   const qrHref=`/qr?port=${portMeta.port}&${auth}`;
   const needsQr=(c.needsQR || !c.connected);
   const confirm=pendingDisconnectPort===portMeta.port;
-  return `<div class="team-card ${isSdr?'top-sdr':'top-com'}">
-    <div class="cc-head"><span class="cg-av" style="background:${colorFor(portMeta.label)}">${esc(initials(portMeta.label))}</span><span class="cc-name">${esc(portMeta.label)}</span><span class="cc-status">${roleLabel(portMeta.role)}</span><span class="cc-port">porta ${portMeta.port}</span></div>
-    <div class="meta">${online}<span class="pill">usuário: ${esc(portMeta.owner)}</span>${hs}${isSdr?emails:''}</div>
-    ${c.port?`<div class="cc-metrics" style="margin-top:10px"><div><span class="m-l">Hoje</span><span class="m-v">${c.volumeToday||0}<small>/${c.suggestedLimit||30}</small></span></div><div><span class="m-l">Saúde</span><span class="m-v ${(c.healthScore||0)<50?'risk-high':((c.healthScore||0)<75?'risk-med':'risk-low')}">${c.healthScore??'—'}<small>/100</small></span></div><div><span class="m-l">Risco</span><span class="m-v ${riskMeta(c.risk).cls}">${riskMeta(c.risk).label}</span></div></div>`:''}
+  const destructive = (me&&me.admin) ? `<button class="${confirm?'confirm-inline':'danger'}" onclick="${confirm?`adminDisconnectPort(${portMeta.port})`:`askDisconnect(${portMeta.port})`}">${confirm?'Confirmar desconexão':'Desconectar'}</button>${(!isSdr && portMeta.port>=4608)?`<button class="danger" onclick="adminDeletePort(${portMeta.port})">Remover porta</button>`:''}` : '';
+  return `<div class="chip-subcard">
+    <div class="cc-head"><span class="cc-name">${esc(portMeta.label)}</span><span class="cc-port">porta ${portMeta.port}</span>${online}</div>
+    ${c.port?`<div class="cc-metrics"><div><span class="m-l">Hoje</span><span class="m-v">${c.volumeToday||0}<small>/${c.suggestedLimit||30}</small></span></div><div><span class="m-l">Saúde</span><span class="m-v ${(c.healthScore||0)<50?'risk-high':((c.healthScore||0)<75?'risk-med':'risk-low')}">${c.healthScore??'—'}<small>/100</small></span></div><div><span class="m-l">Risco</span><span class="m-v ${riskMeta(c.risk).cls}">${riskMeta(c.risk).label}</span></div></div>`:''}
     <div class="team-actions">
       <a class="primary" target="_blank" rel="noopener" href="${qrHref}">${needsQr?'Vincular / QR':'Ver conexão'}</a>
       <button onclick="adminStartPort(${portMeta.port})">Subir bridge</button>
       <button onclick="adminRegenQR(${portMeta.port})">Gerar QR novo</button>
-      <button class="${confirm?'confirm-inline':'danger'}" onclick="${confirm?`adminDisconnectPort(${portMeta.port})`:`askDisconnect(${portMeta.port})`}">${confirm?'Confirmar desconexão':'Desconectar'}</button>
-      ${(!isSdr && portMeta.port>=4608)?`<button class="danger" onclick="adminDeletePort(${portMeta.port})">Remover porta</button>`:''}
+      ${destructive}
     </div>
   </div>`;
 }
+function renderOwnerTeamCard(owner, portsForOwner){
+  const u=userForOwner(owner)||{};
+  const first=portsForOwner[0]||{};
+  const chips=portsForOwner.map(p=>renderTeamCard(p,p.role==='sdr'?'sdr':'comunicador')).join('');
+  const hs=(u.hubspotOwnerId||u.hubspot_owner_id)?`<span class="pill good">HubSpot owner ${esc(u.hubspotOwnerId||u.hubspot_owner_id)}</span>`:'<span class="pill bad">sem owner HubSpot</span>';
+  const emails=(u.emails||[]).length?`<span class="pill">${esc((u.emails||[]).join(', '))}</span>`:'<span class="pill warn">sem e-mail Google</span>';
+  return `<div class="team-card top-sdr team-owner-card"><div class="cc-head"><span class="cg-av" style="background:${colorFor(first.label||u.name||owner)}">${esc(initials(u.name||first.label||owner))}</span><span class="cc-name">${esc(u.name||first.label||owner)}</span><span class="cc-status">${esc(first.role==='sdr'?'SDR':'Comunicador')}</span><span class="cc-port">${portsForOwner.length} chip(s)</span></div><div class="meta"><span class="pill">usuário: ${esc(owner)}</span>${first.role==='sdr'?hs:''}${first.role==='sdr'?emails:''}<span class="pill good">regra: manter conversa no mesmo chip; novos leads sortidos</span></div><div class="team-chip-list">${chips}</div></div>`;
+}
 function teamForm(kind){
   const isSdr=kind==='sdr';
-  return `<div class="team-section"><h3>${isSdr?'Adicionar SDR':'Adicionar comunicador'}</h3>
-    <p>${isSdr?'SDR precisa de usuário Google, owner do HubSpot e porta/chip próprio.':'Comunicador ganha uma porta exclusiva e entra na régua institucional usada por Rafael, Mariana e Lucas Resende.'}</p>
+  const sdrs=(adminUsers||[]).filter(u=>u.role==='sdr').sort((a,b)=>String(a.name||a.id).localeCompare(String(b.name||b.id)));
+  if(isSdr){
+    return `<div class="team-section"><h3>Adicionar chip de SDR</h3>
+      <p>Escolha o SDR dono e dê um nome para o chip. Porta, auth e HubSpot owner vêm automáticos.</p>
+      <div class="team-form">
+        <label>SDR<select id="${kind}Owner"><option value="">Selecione o SDR</option>${sdrs.map(u=>`<option value="${esc(u.id)}">${esc(u.name||u.id)} · ${esc((u.ports||[]).join(', ')||'sem chip')}</option>`).join('')}</select></label>
+        <label>Nome do chip<input id="${kind}Name" placeholder="Ex: Sarah chip 2"></label>
+        <button class="primary" onclick="saveTeamPort('${kind}')">Adicionar chip ao SDR</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="team-section"><h3>Adicionar comunicador</h3>
+    <p>Comunicador ganha uma porta exclusiva e entra na régua institucional.</p>
     <div class="team-form">
-      <label>Nome<input id="${kind}Name" placeholder="${isSdr?'Ex: Amanda SDR':'Ex: João Pedro'}"></label>
+      <label>Nome<input id="${kind}Name" placeholder="Ex: João Pedro"></label>
       <div class="form-row"><label>Porta<input id="${kind}Port" placeholder="auto" inputmode="numeric"></label><label>Auth dir<input id="${kind}Auth" placeholder="auto"></label></div>
-      ${isSdr?`<label>HubSpot owner ID<input id="${kind}Hs" placeholder="ex: 86265630"></label><label>E-mail Google do SDR<input id="${kind}Email" placeholder="nome@zydon.com.br"></label>`:''}
       <button class="primary" onclick="saveTeamPort('${kind}')">Criar porta exclusiva + vínculo</button>
     </div>
   </div>`;
 }
 function renderConnections(){
-  const all=(me&&me.admin&&adminPorts.length?adminPorts:(chips||[])).slice().sort((a,b)=>a.port-b.port);
+  const all=((adminPorts&&adminPorts.length)?adminPorts:(chips||[])).slice().sort((a,b)=>a.port-b.port);
   const online=all.filter(p=>{const c=chipForPort(p.port); return c.connected && !c.needsQR}).length;
   const qr=all.filter(p=>{const c=chipForPort(p.port); return c.needsQR || (!c.connected && c.port)}).length;
   const paused=all.filter(p=>{const c=chipForPort(p.port); return c.paused || p.paused}).length;
@@ -7517,12 +11206,20 @@ function renderConnections(){
   const sdrs=all.filter(p=>p.role==='sdr');
   const comms=all.filter(p=>p.role!=='sdr');
   const current=connTab==='comunicadores'?comms:sdrs;
-  const cards=current.map(p=>renderTeamCard(p, p.role==='sdr'?'sdr':'comunicador')).join('') || '<div class="team-empty">Nenhuma porta neste bloco.</div>';
-  const adminPanel=(me&&me.admin)?teamForm(connTab==='comunicadores'?'comunicador':'sdr'):'<div class="team-section"><h3>Somente admin</h3><p>Peça ao Rafael para cadastrar ou desconectar chips.</p></div>';
+  let cards='';
+  if(connTab==='sdr'){
+    const byOwner={};
+    for(const p of sdrs){ (byOwner[p.owner] ||= []).push(p); }
+    cards=Object.keys(byOwner).sort((a,b)=>String((userForOwner(a)||{}).name||a).localeCompare(String((userForOwner(b)||{}).name||b))).map(owner=>renderOwnerTeamCard(owner, byOwner[owner].sort((a,b)=>a.port-b.port))).join('');
+  }else{
+    cards=current.map(p=>renderOwnerTeamCard(p.owner, [p])).join('');
+  }
+  cards = cards || '<div class="team-empty">Nenhuma porta neste bloco.</div>';
+  const adminPanel=teamForm(connTab==='comunicadores'?'comunicador':'sdr');
   document.getElementById('connBody').innerHTML=`<div id="teamToast"></div><div class="team-tabs"><button class="${connTab==='sdr'?'on':''}" onclick="connTab='sdr';renderConnections()">SDRs (${sdrs.length})</button><button class="${connTab==='comunicadores'?'on':''}" onclick="connTab='comunicadores';renderConnections()">Comunicadores (${comms.length})</button></div><div class="team-layout"><div class="team-section"><h3>${connTab==='sdr'?'SDRs vinculados ao HubSpot':'Comunicadores / régua institucional'}</h3><p>${connTab==='sdr'?'Cada SDR deve ter owner do HubSpot + usuário Google + chip próprio para responder a carteira dele.':'Cada comunicador tem porta exclusiva e pode ser usado pelos serviços de disparo institucional.'}</p><div class="team-list">${cards}</div></div>${adminPanel}</div>`;
 }
 function teamMsg(txt, bad=false){ const el=document.getElementById('teamToast'); if(el) el.innerHTML=`<div class="team-toast" style="${bad?'border-color:rgba(255,107,107,.35);background:rgba(255,107,107,.08)':''}">${esc(txt)}</div>`; }
-function openConnections(){ connOpen=true; document.getElementById('connModal').hidden=false; renderConnections(); loadChips(); if(me&&me.admin) loadAdminUsers(); }
+function openConnections(){ connOpen=true; document.getElementById('connModal').hidden=false; renderConnections(); loadChips(); loadAdminUsers(); }
 function closeConnections(){ connOpen=false; document.getElementById('connModal').hidden=true; pendingDisconnectPort=null; }
 
 /* ---- CH-014/064: admin de equipe/chips (sem token e sem prompt/confirm nativo) ---- */
@@ -7537,16 +11234,14 @@ async function saveTeamPort(kind){
   if(!name) return teamMsg('Informe o nome.', true);
   const port=(document.getElementById(kind+'Port')?.value||'').trim();
   const authDir=(document.getElementById(kind+'Auth')?.value||'').trim();
-  const hs=(document.getElementById(kind+'Hs')?.value||'').trim();
-  const email=(document.getElementById(kind+'Email')?.value||'').trim();
-  const owner=slugUid(name);
+  const selectedOwner=(document.getElementById(kind+'Owner')?.value||'').trim();
+  const selectedUser=selectedOwner?userForOwner(selectedOwner):{};
+  if(kind==='sdr' && !selectedOwner) return teamMsg('Escolha o SDR dono do chip.', true);
+  const owner=selectedOwner || slugUid(name);
   const payload={action:'create',label:name,owner,role:kind==='sdr'?'sdr':'comunicador',port:port||'auto',auth:authDir||'',start:true};
-  if(kind==='sdr') payload.hubspotOwnerId=hs;
+  if(kind==='sdr') payload.hubspotOwnerId=selectedUser.hubspotOwnerId || selectedUser.hubspot_owner_id || '';
   try{
     const r=await api('/api/admin/ports',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    if(kind==='sdr' && email){
-      await api('/api/admin/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'upsert',id:owner,name,role:'sdr',hubspotOwnerId:hs,emails:[email],ports:[r.port],admin:false})});
-    }
     teamMsg(`${name} criado na porta ${r.port}. Clique em Vincular / QR para parear.`);
     await loadAdminUsers(); await loadChips(); connTab=kind==='sdr'?'sdr':'comunicadores'; renderConnections();
   }catch(e){ teamMsg('Falha ao criar: '+e.message, true); }
@@ -8591,6 +12286,7 @@ function sdrOrchestratorBlock(){
 }
 
 
+
 function filteredCards(){
   const q=(document.getElementById('search')?.value||'');
   let list=[...convs];
@@ -8606,22 +12302,516 @@ function filteredCards(){
   list.sort((a,b)=>(+(b.inboxSortTime||b.lastTime)||0)-(+(a.inboxSortTime||a.lastTime)||0));
   return list;
 }
+
+async function loadProatividade(force=false){
+  if(proatividadeLoading && !force) return;
+  proatividadeLoading=true; proatividadeError='';
+  if(viewMode==='proatividade') drawProatividade();
+  try{
+    proatividadeData=await api('/api/proatividade-summary'+(force?'?force=1':''),{timeoutMs:15000});
+  }catch(e){ proatividadeError=String((e&&e.message)||e); }
+  finally{ proatividadeLoading=false; }
+  if(viewMode==='proatividade') drawProatividade();
+}
+function proactTime(v){ if(!v) return '—'; try{return new Date(v).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}catch{return String(v).slice(0,16)} }
+function proactKpis(d){
+  const dec=d.decisions||[], exe=d.executions||[], att=d.attention||[], cr=(d.crons||[]).filter(c=>c.enabled);
+  const auto=dec.filter(x=>String(x.action||'').toLowerCase().includes('auto')||x.auto_message_id).length;
+  const crm=dec.filter(x=>String(x.crm_result||'').toLowerCase().includes('task')||String(x.crm_result||'').toLowerCase().includes('retorno')).length;
+  return `<div class="proact-kpis"><div class="proact-kpi"><b>${dec.length}</b><span>decisões recentes</span></div><div class="proact-kpi"><b>${auto}</b><span>respostas automáticas</span></div><div class="proact-kpi"><b>${crm}</b><span>ações CRM sinalizadas</span></div><div class="proact-kpi"><b>${att.length}</b><span>pontos de atenção</span></div><div class="proact-kpi"><b>${cr.length}</b><span>crons ativos</span></div></div>`;
+}
+function proactDecisionRows(rows){
+  const head='<div class="proact-row head"><div>Hora</div><div>Lead</div><div>Classificação</div><div>Ação</div><div>CRM / próximo passo</div></div>';
+  const body=(rows||[]).slice().reverse().slice(0,40).map(r=>`<div class="proact-row"><div>${esc(proactTime(r.ts))}<small>${esc(r.chip||('porta '+(r.port||'')))}</small></div><div><b>${esc(r.lead||r.chat||'Lead')}</b><small>${esc(r.incoming_text||'')}</small></div><div>${esc(r.classification||'—')}</div><div>${esc(r.action||r.auto_reason||'—')}<small>${esc(r.auto_message_id||'')}</small></div><div>${esc(typeof r.crm_result==='string'?r.crm_result:JSON.stringify(r.crm_result||{})).slice(0,160)}<small>${esc(r.wa_group_note||'')}</small></div></div>`).join('')||'<div class="mini-empty">Ainda sem decisões recentes registradas.</div>';
+  return `<div class="proact-table">${head}${body}</div>`;
+}
+function proactExecutions(rows){return `<div class="proact-stack">${(rows||[]).slice().reverse().slice(0,12).map(r=>`<div class="proact-item"><b>${esc(r.lead||r.contact||'Execução')}</b><span>${esc(proactTime(r.date))} · ${esc(r.status||'')} · ${esc(r.msg_type||'')} · porta ${esc(r.port||'')}</span><span>${esc(r.text||'')}</span></div>`).join('')||'<div class="mini-empty">Sem execuções recentes.</div>'}</div>`}
+function proactAttention(rows){return `<div class="proact-stack">${(rows||[]).slice(0,12).map(r=>`<div class="proact-item"><b>${esc(r.area||'Atenção')} · ${esc(r.level||'')}</b><span>${esc(r.text||'')}</span></div>`).join('')||'<div class="mini-empty">Nenhum ponto crítico agora.</div>'}</div>`}
+function proactCrons(rows){return `<div class="proact-stack">${(rows||[]).slice(0,16).map(r=>`<div class="proact-item"><b>${esc(r.name||'Cron')}</b><span>${r.enabled?'ativo':'pausado'} · ${esc(r.schedule||'')} · ${esc(r.last_status||'sem status')}</span></div>`).join('')||'<div class="mini-empty">Nenhum cron Zydon encontrado.</div>'}</div>`}
+function proactKnowledge(rows){return `<div class="proact-stack">${(rows||[]).map(r=>`<div class="proact-item"><b>${esc(r.label)}</b><span>${esc(r.path)}</span></div>`).join('')}</div>`}
+function proactConfigForm(cfg){cfg=cfg||{}; return `<div class="proact-form"><label>Janela de revisão (h)<input id="paReview" type="number" min="1" max="168" value="${esc(cfg.reviewWindowHours||24)}"></label><label>Cooldown alertas (min)<input id="paCooldown" type="number" min="1" max="240" value="${esc(cfg.groupAlertCooldownMin||15)}"></label><label>History stale (min)<input id="paStale" type="number" min="1" max="240" value="${esc(cfg.historyStaleMin||15)}"></label><label>Dedupe CRM (min)<input id="paCrm" type="number" min="1" max="240" value="${esc(cfg.crmDedupeMin||30)}"></label><label>Autonomia<select id="paMode"><option value="conservador" ${cfg.autonomyMode==='conservador'?'selected':''}>Conservador</option><option value="equilibrado" ${cfg.autonomyMode==='equilibrado'?'selected':''}>Equilibrado</option><option value="autonomo" ${cfg.autonomyMode==='autonomo'?'selected':''}>Autônomo</option></select></label><textarea id="paNote" placeholder="Observação do operador">${esc(cfg.operatorNote||'')}</textarea></div><div class="proact-actions"><button onclick="saveProatividadeConfig()">Salvar rascunho</button><span class="proact-note">${esc(proatividadeSaveMsg||'Salva a configuração central da tela. Scripts/crons só mudam quando forem conectados explicitamente.')}</span></div>`}
+async function saveProatividadeConfig(){
+  proatividadeSaveMsg='salvando…'; drawProatividade();
+  const payload={reviewWindowHours:document.getElementById('paReview')?.value,groupAlertCooldownMin:document.getElementById('paCooldown')?.value,historyStaleMin:document.getElementById('paStale')?.value,crmDedupeMin:document.getElementById('paCrm')?.value,autonomyMode:document.getElementById('paMode')?.value,operatorNote:document.getElementById('paNote')?.value};
+  try{ const res=await api('/api/proatividade-config',{method:'POST',body:JSON.stringify(payload),headers:{'Content-Type':'application/json'},timeoutMs:8000}); proatividadeSaveMsg='rascunho salvo'; if(proatividadeData) proatividadeData.config=res.config||payload; }
+  catch(e){ proatividadeSaveMsg='não foi possível salvar: '+String((e&&e.message)||e); }
+  drawProatividade();
+}
+function drawProatividade(){
+  const el=document.getElementById('cards'); if(!el) return;
+  document.getElementById('queueTitle').textContent='Proatividade';
+  document.getElementById('queueCount').textContent='central do Dexter';
+  const ft=document.getElementById('filterbar'); if(ft) ft.innerHTML='';
+  if(proatividadeLoading && !proatividadeData){el.innerHTML='<div class="proact-wrap"><div class="proact-hero"><div><h1>Proatividade</h1><p>Carregando decisões, execução, saúde e configuração do Dexter…</p></div></div></div>'; return;}
+  if(proatividadeError){el.innerHTML=`<div class="proact-wrap"><div class="proact-hero"><div><h1>Proatividade</h1><p>${esc(proatividadeError)}</p></div><button class="proact-status" onclick="loadProatividade(true)">Tentar de novo</button></div></div>`; return;}
+  const d=proatividadeData||{decisions:[],executions:[],attention:[],crons:[],config:{},knowledge:[]};
+  el.innerHTML=`<div class="proact-wrap"><div class="proact-hero"><div><h1>Proatividade</h1><p>Central do Dexter: decisões, execução, saúde, crons, base de conhecimento e configuração operacional em um só lugar.</p></div><button class="proact-status" onclick="loadProatividade(true)">Atualizar</button></div>${proactKpis(d)}<div class="proact-grid"><div class="proact-panel"><h3>Últimas decisões <span>${(d.decisions||[]).length}</span></h3><div class="proact-body">${proactDecisionRows(d.decisions||[])}</div></div><div class="proact-stack"><div class="proact-panel"><h3>Próximas ações / escalar</h3><div class="proact-body">${proactAttention(d.attention||[])}</div></div><div class="proact-panel"><h3>Integridade CRM</h3><div class="proact-body"><div class="proact-item"><b>${esc(((d.opsHealth||{}).headline)||'Saúde operacional')}</b><span>risco: ${esc(((d.opsHealth||{}).risk)||'ok')}</span></div><div class="proact-item"><b>Higiene de tarefas</b><span>revisar: ${esc((((d.taskHygiene||{}).reviewBeforeAction||{}).count)||0)} · fechar com aprovação: ${esc((((d.taskHygiene||{}).safeToCloseAfterApproval||{}).count)||0)}</span></div></div></div></div></div><div class="proact-grid"><div class="proact-panel"><h3>Últimas execuções</h3><div class="proact-body">${proactExecutions(d.executions||[])}</div></div><div class="proact-panel"><h3>Crons e contextos</h3><div class="proact-body">${proactCrons(d.crons||[])}</div></div></div><div class="proact-grid"><div class="proact-panel"><h3>Configuração do Dexter</h3><div class="proact-body">${proactConfigForm(d.config||{})}</div></div><div class="proact-panel"><h3>Base de conhecimento</h3><div class="proact-body">${proactKnowledge(d.knowledge||[])}</div></div></div></div>`;
+}
+
+async function loadFollowups(force=false){
+  if(followupsLoading) return;
+  followupsLoading=true; followupsError='';
+  if(viewMode==='followups') drawFollowups();
+  try{ followupsData=await api('/api/followups-dashboard?limit=220'+(force?'&force=1':''),{timeoutMs:15000}); }
+  catch(e){ followupsError=String((e&&e.message)||e); }
+  finally{ followupsLoading=false; }
+  if(viewMode==='followups') drawFollowups();
+}
+function followupsKpis(d){
+  const s=(d&&d.summary)||{};
+  return `<div class="follow-kpis"><div><b>${s.readyTotal||0}</b><span>prontos</span><small>com pesquisa e gate</small></div><div><b>${s.blockedResearchTotal||0}</b><span>precisam análise</span><small>bloqueados por segurança</small></div><div><b>${s.sentTodayTotal||0}</b><span>enviados hoje</span><small>ledger local</small></div><div><b>${s.manifestOk?'OK':'Ver'}</b><span>textos fixos</span><small>hash do manifesto</small></div></div>`;
+}
+function followupsTabs(){
+  const tabs=[['overview','Visão geral'],['leads','Leads'],['logs','Logs'],['config','Configuração']];
+  return `<div class="focus-subtabs">${tabs.map(([k,l])=>`<button class="focus-subtab ${followupsTab===k?'on':''}" onclick="followupsTab='${k}';drawFollowups()">${l}</button>`).join('')}</div>`;
+}
+function followupsLeadRows(rows){
+  const q=normText(followupsSearch);
+  rows=(rows||[]).filter(r=>!q||normText([r.empresa,r.sdr,r.phase,r.status,r.mqlStatus,r.buyerProfile,r.blockReason].join(' ')).includes(q));
+  return `<div class="ag-grid followups-grid"><div class="ag-head"><span>Lead</span><span>Fase/status</span><span>Pesquisa e diagnóstico</span><span>Links</span></div><div class="ag-rows">${rows.slice(0,120).map(r=>`<div class="ag-row"><div><b>${esc(r.empresa)}</b><small>${esc(r.sdr||'sem SDR')} · ${esc(r.dealId||'')}</small></div><div><b>${esc(r.phase)} · ${esc(r.status)}</b><small>${esc(r.mqlStatus||'')} · match ${esc(r.segmentMatch||'')}</small></div><div><b>${esc((r.buyerProfile||'').slice(0,120))}</b><small>${esc(r.blockReason||r.diagnostic||'sem bloqueio')}</small></div><div class="fa">${r.conversationUrl?`<a target="_blank" href="${esc(r.conversationUrl)}">Conversa</a>`:''}${r.hubspotDealUrl?` <a target="_blank" href="${esc(r.hubspotDealUrl)}">HubSpot</a>`:''}</div></div>`).join('')||'<div class="mini-empty">Nenhum lead neste filtro.</div>'}</div></div>`;
+}
+function followupsLogRows(rows){
+  return `<div class="focus-section"><h4>Últimos eventos de envio/diagnóstico <em>${(rows||[]).length}</em></h4>${(rows||[]).slice(0,80).map(r=>`<div class="focus-row"><div><div class="fn">${esc(r.empresa||'Lead')} <span class="version-pill">${esc(r.phase||'operação')}</span></div><div class="fm">${esc(r.at||'')} · ${esc(r.sdr||'')} · ${esc(r.status||'')}</div><div class="mini-hint">${esc(r.messagePreview||'')}</div></div><div class="fa">${r.conversationUrl?`<a target="_blank" href="${esc(r.conversationUrl)}">Conversa</a>`:''}${r.hubspotDealUrl?` <a target="_blank" href="${esc(r.hubspotDealUrl)}">HubSpot</a>`:''}</div></div>`).join('')||'<div class="mini-empty">Sem log recente.</div>'}</div>`;
+}
+function followupsConfig(d){
+  const c=(d&&d.config)||{}, m=(d&&d.manifest)||{};
+  const rows=(m.rows||[]).map(x=>`<div class="focus-row"><div><div class="fn">${esc(x.key)} · ${x.hashOk?'hash OK':'hash divergente'}</div><div class="mini-hint">${esc(x.preview||'')}</div></div></div>`).join('');
+  return `<div class="focus-split"><div class="focus-section"><h4>Variáveis centrais do Dexter</h4>${Object.entries(c).map(([k,v])=>`<label class="pb-form"><span>${esc(k)}</span><input value="${esc(String(v))}" disabled></label>`).join('')}<div class="focus-safe">Inputs materializados em modo read-only. A próxima versão pode salvar com aprovação e log.</div></div><div class="focus-section"><h4>Manifesto de textos aprovados</h4>${rows}</div></div>`;
+}
+function followupsOverview(d){
+  const w=(((d.rotinas||{}).watchdogs)||[]).map(x=>`<div class="focus-row"><div><div class="fn">${esc(x.label)}</div><div class="fm">${x.ok?'OK':'Atenção'} · ${esc(x.stateAge||'')}</div></div></div>`).join('');
+  return `${followupsKpis(d)}<div class="focus-safe"><b>Centralizador FOLLOWUPS:</b> qualificação MQL/Não-MQL, diagnóstico, textos fixos, pesquisa Claude, execução WhatsApp e crons em um lugar. Somente leitura nesta versão.</div><div class="focus-split"><div class="focus-section"><h4>Próximos leads auditáveis</h4>${followupsLeadRows((d.leads||[]).slice(0,12))}</div><div class="focus-section"><h4>Crons e contexto</h4>${w||'<div class="mini-empty">Sem watchdogs.</div>'}</div></div>`;
+}
+function drawFollowups(){
+  const el=document.getElementById('cards'); if(!el) return;
+  document.getElementById('queueTitle').textContent='FOLLOWUPS';
+  document.getElementById('queueCount').textContent='central Rafael · MQL, diagnóstico e execução';
+  const ft=document.getElementById('filterbar'); if(ft) ft.innerHTML='';
+  if(followupsLoading && !followupsData){el.innerHTML='<div class="dispatch-board"><div class="dispatch-head"><div><b>Carregando FOLLOWUPS…</b><span>Consolidando fila, textos, pesquisa Claude, envios e rotinas.</span></div></div></div>';return;}
+  if(followupsError){el.innerHTML=`<div class="dispatch-board"><div class="dispatch-head"><div><b>FOLLOWUPS indisponível</b><span>${esc(followupsError)}</span></div><button class="dispatch-total" onclick="loadFollowups(true)">Tentar de novo</button></div></div>`;return;}
+  const d=followupsData;
+  if(!d){el.innerHTML='<div class="dispatch-board"><div class="dispatch-head"><div><b>FOLLOWUPS</b><span>Carregando central de auditoria diária…</span></div></div></div>';return;}
+  if(d.ok===false){el.innerHTML='<div class="dispatch-board"><div class="dispatch-head"><div><b>Acesso restrito</b><span>Esta tela é somente do Rafael.</span></div></div></div>';return;}
+  const search=`<div class="search" style="max-width:460px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input value="${esc(followupsSearch)}" oninput="followupsSearch=this.value;drawFollowups()" placeholder="Filtrar lead, SDR, status…"></div>`;
+  let body='';
+  if(followupsTab==='leads') body=search+followupsLeadRows(d.leads||[]);
+  else if(followupsTab==='logs') body=followupsLogRows(d.logs||[]);
+  else if(followupsTab==='config') body=followupsConfig(d);
+  else body=followupsOverview(d);
+  el.innerHTML=`<div class="mgmt-panel followups-panel"><div class="pipe-simple-head"><div><b>FOLLOWUPS</b><span>Auditoria diária de MQL/Não-MQL, diagnóstico, mensagens enviadas, textos aprovados e crons do Dexter.</span></div><button class="dispatch-total" onclick="loadFollowups(true)">Atualizar</button></div>${followupsTabs()}${body}</div>`;
+}
+
+async function loadRotinas(force=false){
+  if(rotinasLoading) return;
+  rotinasLoading=true; if(!rotinasData) rotinasError='';
+  if(viewMode==='rotinas') drawRotinas();
+  try{
+    rotinasData=await api('/api/rotinas/summary'+(force?'?force=1':''),{timeoutMs:30000});
+    rotinasError='';
+  }catch(e){
+    // /rotinas é cockpit: não apagar a última visão boa por timeout momentâneo.
+    rotinasError=rotinasData?'':String((e&&e.message)||e);
+    if(rotinasData) rotinasNotice='Atualização demorou; mantendo último snapshot carregado.';
+  }finally{ rotinasLoading=false; }
+  if(viewMode==='rotinas') drawRotinas();
+}
+function yesNo(ok){return ok?'OK':'Atenção'}
+function rotinasKpis(d){
+  const s=(d&&d.summary)||{};
+  return `<div class="follow-kpis rotinas-kpis"><div><b>${s.bridgesOk||0}/${s.bridgesTotal||0}</b><span>bridges OK</span><small>conectados e sem QR</small></div><div><b>${s.journeys||0}</b><span>jornadas</span><small>rotinas agrupadas</small></div><div><b>${s.scripts||0}</b><span>rotinas mapeadas</span><small>sem duplicar na visão principal</small></div><div><b>${s.processes||0}</b><span>processos vivos</span><small>Channel, bridges e painéis</small></div></div>`;
+}
+function rotinasBridgeRows(rows){
+  return (rows||[]).map(b=>`<div class="focus-row"><div><div class="fn">${esc(b.label||('Chip '+b.port))} <span class="version-pill">${esc(String(b.port))}</span></div><div class="fm">${esc(b.role||'chip')} · conectado: ${yesNo(b.connected)} · QR: ${b.needsQR?'sim':'não'} · auth: ${yesNo(b.authExists)}</div></div><div class="fa"><span class="orch-status ${b.ok?'st-ok':'st-int'}">${b.ok?'OK':'Atenção'}</span></div></div>`).join('')||'<div class="mini-empty">Nenhum bridge mapeado.</div>';
+}
+function rotinasWatchdogRows(rows){
+  return (rows||[]).map(w=>`<div class="focus-row"><div><div class="fn">${esc(w.label)}</div><div class="fm">wrapper: ${yesNo(w.scriptExists)}${w.state?` · estado: ${w.stateExists?'OK':'sem sinal'} · ${esc(w.stateAge||'')}`:''}</div><div class="mini-hint">${esc(w.script||'')}</div></div><div class="fa"><span class="orch-status ${w.ok?'st-ok':'st-attn'}">${w.ok?'OK':'Ver'}</span></div></div>`).join('')||'<div class="mini-empty">Sem watchdogs cadastrados.</div>';
+}
+function rotinasProcessRows(rows){
+  return (rows||[]).slice(0,18).map(p=>`<div class="focus-row"><div><div class="fn">${esc(p.label||'Processo')} ${p.port?`<span class="version-pill">porta ${esc(p.port)}</span>`:''}</div><div class="fm">PID ${esc(String(p.pid||'—'))} · uptime ${Math.round((p.uptimeSeconds||0)/60)} min</div><div class="mini-hint">${esc(p.cmd||p.error||'')}</div></div></div>`).join('')||'<div class="mini-empty">Nenhum processo operacional localizado.</div>';
+}
+function rotinasScriptRows(rows){
+  return (rows||[]).slice(0,40).map(r=>`<div class="focus-row"><div><div class="fn">${esc(r.label||r.name)}</div><div class="fm">${esc(r.origin||'')} · modificado há ${esc(r.age||'')}</div><div class="mini-hint">${esc(r.path||'')}</div></div></div>`).join('')||'<div class="mini-empty">Nenhuma rotina encontrada.</div>';
+}
+function rotinasPolicyBlock(cfg){
+  cfg=cfg||{}; const mp=cfg.messagePolicy||{}, lp=cfg.logPolicy||{}, bp=cfg.backupPolicy||{}, gp=cfg.gitPolicy||{};
+  return `<div class="focus-section"><h4>Parâmetros globais</h4><div class="orch-hyg-grid">
+    <label class="focus-card"><span>Modo</span><select id="rotAutonomy"><option ${cfg.autonomyMode==='conservador'?'selected':''} value="conservador">Conservador</option><option ${cfg.autonomyMode==='equilibrado'?'selected':''} value="equilibrado">Equilibrado</option><option ${cfg.autonomyMode==='expansivo'?'selected':''} value="expansivo">Expansivo</option></select><small>Autonomia da orquestração.</small></label>
+    <label class="focus-card"><span>Mensagens/chip/dia</span><input id="rotDailyCap" type="number" min="1" max="80" value="${esc(mp.dailyCapPerChip||30)}"><small>Escala com segurança.</small></label>
+    <label class="focus-card"><span>Retenção</span><input id="rotRetention" type="number" min="7" max="365" value="${esc(lp.retentionDays||90)}"><small>Dias de registros.</small></label>
+    <label class="focus-card"><span>Backup min</span><input id="rotBackupMinutes" type="number" min="5" max="1440" value="${esc(bp.intervalMinutes||5)}"><small>Intervalo de backup.</small></label>
+    <label class="focus-card"><span>Linha de mudança</span><input id="rotGitBranch" value="${esc(gp.branch||'main')}"><small>Após gate validado.</small></label>
+    <label class="focus-card"><span>Fonte das mensagens</span><input id="rotMessageSource" value="${esc(mp.source||'textos_aprovados')}"><small>Evita drift de copy.</small></label>
+  </div><div class="focus-safe"><label><input id="rotNotifyOnly" type="checkbox" ${cfg.notifyOnlyExceptions?'checked':''}> Alertar só exceções</label> · <label><input id="rotRedactPhone" type="checkbox" ${lp.redactPhone?'checked':''}> Mascarar telefone</label> · <label><input id="rotGitEnabled" type="checkbox" ${gp.enabled?'checked':''}> Histórico de mudanças</label> · <label><input id="rotBackupEnabled" type="checkbox" ${bp.enabled?'checked':''}> Backup</label></div></div>`;
+}
+function rotinasJourneyRows(rows){
+  const groups={}; (rows||[]).forEach(j=>{(groups[j.group]||(groups[j.group]=[])).push(j)});
+  return Object.entries(groups).map(([g,items])=>`<div class="focus-section"><h4>${esc(g)} <em>${items.length}</em></h4>${items.map(j=>`<div class="focus-row"><div><div class="fn">${esc(j.label)} <span class="version-pill">${j.count||0} rotina${(j.count||0)===1?'':'s'}</span></div><div class="fm">${esc(j.description||'')} · dono: ${esc(j.owner||'Dexter')}</div><div class="mini-hint">${esc(j.notes||'Sem observação específica.')}</div></div><div class="fa"><label><input data-journey-enabled="${esc(j.key)}" type="checkbox" ${j.enabled!==false?'checked':''}> ativa</label></div></div>`).join('')}</div>`).join('');
+}
+function rotinasJourneyMap(rows){
+  const order=['entrada_mql','nao_mql','primeiro_contato','followup_sdr','agenda_no_show'];
+  const by={}; (rows||[]).forEach(j=>by[j.key]=j);
+  return `<div class="focus-section"><h4>Mapa da jornada comercial <em>início → introdução</em></h4><div class="orch-auto-strip journey-map">${order.map(k=>{const j=by[k]||{}; return `<div><b>${esc(j.label||k)}</b><span>${esc(j.description||'')}</span><small>${j.enabled===false?'desativada':'ativa'} · ${esc(String(j.count||0))} rotina${(j.count||0)===1?'':'s'}</small></div>`}).join('')}</div><div class="focus-safe"><b>Responsabilidade:</b> Rotinas mostra onde tudo inicia e para onde vai; Gestão mede resultado; Foco executa o trabalho principal do SDR; Agendas prepara diagnóstico/introdução.</div></div>`;
+}
+function rotinasIntelligenceRows(rows){
+  return `<div class="focus-section"><h4>Inteligência materializada <em>${(rows||[]).length}</em></h4><div class="orch-auto-strip intelligence-map">${(rows||[]).map(x=>`<div><b>${esc(String(x.value??''))}</b><span>${esc(x.label||'')}</span><small>${esc(x.description||'')}</small></div>`).join('')}</div></div>`;
+}
+function rotinasSimplificationRows(rows){
+  const items=(rows||[]);
+  return `<div class="focus-section rot-exec"><h4>Robustez, economia e escala <em>${items.length}</em></h4><div class="rot-exec-grid">${items.map(x=>`<div class="rot-exec-card"><span>${esc(x.theme||'Decisão')}</span><b>${esc(x.title||'')}</b><p>${esc(x.detail||'')}</p><small>${esc(x.gain||'')}</small></div>`).join('')||'<div class="mini-empty">Sem oportunidades novas de simplificação.</div>'}</div></div>`;
+}
+
+
+function rotinasAuditStatusClass(s){s=String(s||''); return (s==='failure'||s==='error')?'warn':((s==='success'||s==='ok'||s==='done')?'ok':(s==='escalated'||s==='approval'?'warn':''));}
+function rotinasAuditEventRows(rows, empty){
+  rows=rows||[];
+  return rows.slice(0,10).map(x=>`<div class="focus-row rot-audit-event ${esc(x.status||'')}"><div><div class="fn">${esc(x.title||'Evento')} <span class="version-pill ${rotinasAuditStatusClass(x.status)}">${esc(x.kind||'automação')}</span></div><div class="fm">${esc(x.at||'—')}${x.owner?' · '+esc(x.owner):''}${x.source?' · '+esc(x.source):''}</div><div class="mini-hint">${esc(x.detail||'')}</div></div></div>`).join('')||`<div class="mini-empty">${esc(empty||'Nada aqui agora.')}</div>`;
+}
+
+function rotinasWorkStatusClass(s){s=String(s||''); return (s==='pending'||s==='candidate'||s==='escalated'||s==='failure')?'warn':(s==='resolved'?'ok':'');}
+function rotinasWorkTimeline(hist){
+  hist=hist||[];
+  return hist.map(h=>`<div class="rot-history-line"><b>${esc(h.at||'')}</b><span>${esc(h.state||'')}</span><em>${esc(h.reason||'')}</em></div>`).join('')||'<div class="mini-empty">Sem histórico registrado.</div>';
+}
+function rotinasWorkRows(rows, empty){
+  rows=rows||[];
+  return rows.map(x=>{
+    const why=(x.why||[]).map(w=>`<li>${esc(w)}</li>`).join('');
+    const who=[x.contact,x.email,x.phoneMasked].filter(Boolean).map(esc).join(' · ');
+    const source=[x.owner,x.source].filter(Boolean).map(esc).join(' · ');
+    const steps=(x.stepsDone||[]).length?`<div class="orch-auto-strip mini">${(x.stepsDone||[]).map(st=>`<div><b>feito</b><span>${esc(st)}</span></div>`).join('')}</div>`:'';
+    return `<div class="focus-row rot-my-row ${esc(x.status||'')}"><div>
+      <div class="fn">${esc(x.title||'Pendência')} <span class="version-pill ${rotinasWorkStatusClass(x.status)}">${esc(x.statusLabel||x.status||'revisão')}</span></div>
+      <div class="fm">${esc(x.subtitle||'')} · responsável: ${esc(x.responsible||'Rafael')} · ${esc(x.at||'sem horário')}</div>
+      ${who?`<div class="mini-hint"><b>Lead:</b> ${who}</div>`:''}
+      ${source?`<div class="mini-hint"><b>Origem:</b> ${source}</div>`:''}
+      ${x.action?`<div class="mini-hint"><b>Próximo passo:</b> ${esc(x.action)}</div>`:''}
+      ${x.reason?`<div class="mini-hint"><b>Motivo:</b> ${esc(x.reason)}</div>`:''}
+      ${why?`<ul class="rot-why">${why}</ul>`:''}
+      ${steps}
+      <details><summary>Ver histórico</summary>${rotinasWorkTimeline(x.history||[])}</details>
+    </div></div>`;
+  }).join('')||`<div class="mini-empty">${esc(empty||'Nada aqui agora.')}</div>`;
+}
+function rotinasLeadDecisionClass(s){s=String(s||''); return s==='ok'?'ok':(s==='no'?'':'warn');}
+function rotinasLeadIntakeBlock(d){
+  const l=(d&&d.leadIntake)||{}, items=l.items||[], counts=l.counts||{};
+  const chips=Object.entries(counts).slice(0,5).map(([k,v])=>`<div><b>${esc(String(v))}</b><span>${esc(k)}</span></div>`).join('');
+  const rows=items.map(x=>{
+    const who=[x.contact,x.email,x.phoneMasked].filter(Boolean).map(esc).join(' · ');
+    const steps=(x.stepsDone||[]).length?`<div class="orch-auto-strip mini">${(x.stepsDone||[]).map(st=>`<div><b>feito</b><span>${esc(st)}</span></div>`).join('')}</div>`:'';
+    return `<div class="focus-row rot-lead-row ${esc(x.decisionClass||'')}"><div>
+      <div class="fn">${esc(x.company||'Lead')} <span class="version-pill ${rotinasLeadDecisionClass(x.decisionClass)}">${esc(x.decision||'sem decisão')}</span></div>
+      <div class="fm">Entrada: ${esc(x.enteredAt||'sem horário')}${x.updatedAt?' · última decisão: '+esc(x.updatedAt):''}</div>
+      ${who?`<div class="mini-hint"><b>Lead:</b> ${who}</div>`:''}
+      ${x.source?`<div class="mini-hint"><b>Origem:</b> ${esc(x.source)}</div>`:''}
+      ${x.nextAction?`<div class="mini-hint"><b>O que isso significa:</b> ${esc(x.nextAction)}</div>`:''}
+      ${x.reason?`<div class="mini-hint"><b>Por quê:</b> ${esc(x.reason)}</div>`:''}
+      ${steps}
+    </div></div>`;
+  }).join('')||'<div class="mini-empty">Nenhuma entrada recente localizada.</div>';
+  return `<div class="focus-section rot-lead-intake"><h4>Últimas entradas de leads <em>MQL / Não-MQL / pendente</em></h4>
+    <div class="focus-safe"><b>Resposta que esta tela deve te dar:</b> quem entrou por último, qual decisão o Dexter tomou, se virou MQL ou Não-MQL, e o que ainda pede acompanhamento.</div>
+    <div class="orch-auto-strip mini">${chips||'<div><b>0</b><span>sem entradas</span></div>'}</div>
+    ${rows}
+  </div>`;
+}
+
+function rotinasMyWorkBlock(d){
+  const w=(d&&d.myWork)||{}, waiting=w.waiting||[], escalated=w.escalated||[], history=w.history||[];
+  return `<div class="focus-section rot-my-work"><h4>Minhas pendências, escaladas e histórico <em>Rafael</em></h4>
+    <div class="orch-auto-strip mini"><div><b>${w.waitingCount||0}</b><span>aguardando minha decisão</span></div><div><b>${w.escalatedCount||0}</b><span>escaladas para mim</span></div><div><b>${w.historyCount||0}</b><span>no histórico</span></div></div>
+    <div class="focus-split">
+      <div class="focus-section"><h4>Aguardando minha decisão <em>${waiting.length}</em></h4>${rotinasWorkRows(waiting,'Nenhuma decisão humana pendente agora.')}</div>
+      <div class="focus-section"><h4>Escaladas para mim <em>${escalated.length}</em></h4>${rotinasWorkRows(escalated,'Nenhuma escalação aberta agora.')}</div>
+    </div>
+    <details><summary>Histórico de decisões, falhas e resoluções · ${history.length}</summary>${rotinasWorkRows(history,'Sem histórico recente.')}</details>
+    <div class="focus-safe"><b>Como usar:</b> decisões abertas ficam acima; histórico antigo só abre quando você precisar auditar a trilha.</div>
+  </div>`;
+}
+function rotinasAutomationAuditBlock(d){
+  const a=(d&&d.automationAudit)||{}, s=a.summary||{}, lanes=a.lanes||[];
+  const laneRows=lanes.map(l=>`<div class="rot-exec-card"><span>${esc(l.name||'Automação')}</span><b>${esc(String((l.failure||0)+(l.pending||0)+(l.escalated||0)))} atenção · ${esc(String(l.success||0))} sucesso</b><p>${esc(String(l.failure||0))} falha(s), ${esc(String(l.pending||0))} pendente(s), ${esc(String(l.escalated||0))} escalação(ões).</p><small>${esc(l.lastAt||'sem horário')}</small></div>`).join('');
+  return `<div class="focus-section rot-automation-audit"><h4>Auditoria de automações <em>sucesso, falha, motivo e escalação</em></h4>
+    <div class="orch-auto-strip mini"><div><b>${s.success||0}</b><span>sucessos registrados</span></div><div><b>${s.failure||0}</b><span>falhas</span></div><div><b>${s.pending||0}</b><span>pendências</span></div><div><b>${s.escalated||0}</b><span>escaladas</span></div></div>
+    <div class="rot-exec-grid">${laneRows||'<div class="mini-empty">Nenhuma automação mapeada ainda.</div>'}</div>
+    <div class="focus-split">
+      <div class="focus-section"><h4>Falhas para revisar <em>${(a.failures||[]).length}</em></h4>${rotinasAuditEventRows(a.failures,'Sem falha recente.')}</div>
+      <div class="focus-section"><h4>Pendências e escaladas <em>${(a.pending||[]).length+(a.escalated||[]).length}</em></h4>${rotinasAuditEventRows([...(a.escalated||[]),...(a.pending||[])],'Sem pendência aberta.')}</div>
+    </div>
+    <details><summary>Últimos eventos de automação</summary>${rotinasAuditEventRows(a.recent,'Sem evento recente.')}</details>
+    <div class="focus-safe"><b>Leitura operacional:</b> consolida crons, disparos WhatsApp, alertas, aprovações, diagnósticos e follows. A tela mostra motivo e estado; não dispara, não aprova e não altera HubSpot sozinha.</div>
+  </div>`;
+}
+function rotinasApprovalStatusClass(s){s=String(s||''); return s==='pending'?'warn':(s==='resolved'?'ok':'');}
+function rotinasApprovalsBlock(d){
+  const a=(d&&d.approvals)||{}, items=a.items||[];
+  const pending=+a.pending||0, resolved=+a.resolved||0, candidate=+a.candidate||0;
+  const rows=items.map(x=>{
+    const why=(x.why||[]).map(w=>`<li>${esc(w)}</li>`).join('');
+    const hist=(x.history||[]).map(h=>`<div class="mini-hint"><b>${esc(h.at||'')}</b> · ${esc(h.state||'')} — ${esc(h.reason||'')}</div>`).join('');
+    const steps=(x.stepsDone||[]).length?`<div class="orch-auto-strip mini">${(x.stepsDone||[]).map(st=>`<div><b>feito</b><span>${esc(st)}</span></div>`).join('')}</div>`:'';
+    return `<div class="focus-row rot-approval ${esc(x.status||'')}"><div>
+      <div class="fn">${esc(x.company||'Empresa')} <span class="version-pill ${rotinasApprovalStatusClass(x.status)}">${esc(x.statusLabel||'revisão')}</span></div>
+      <div class="fm">Responsável: ${esc(x.assignee||'Rafael')} · ${x.contact?esc(x.contact)+' · ':''}${esc(x.email||'')} ${x.phoneMasked?'· '+esc(x.phoneMasked):''}</div>
+      <div class="mini-hint"><b>Ação:</b> ${esc(x.action||'Revisar decisão')}</div>
+      ${why?`<ul class="rot-why">${why}</ul>`:''}
+      ${steps}
+      ${hist?`<details><summary>Ver trilha de decisão</summary>${hist}</details>`:''}
+    </div></div>`;
+  }).join('');
+  return `<div class="focus-section rot-approvals"><h4>Pendências escaladas e aprovações <em>${pending} pendente${pending===1?'':'s'}</em></h4>
+    <div class="orch-auto-strip mini"><div><b>${pending}</b><span>aguardando decisão</span></div><div><b>${candidate}</b><span>em confirmação MQL</span></div><div><b>${resolved}</b><span>aprovado/executado</span></div></div>
+    ${rows||'<div class="mini-empty">Nenhuma pendência escalada agora.</div>'}
+    <div class="focus-safe"><b>Exemplo de uso:</b> quando um lead como Solút.io fica aguardando aprovação, ele aparece aqui com motivo, responsável, ação sugerida e trilha de decisão. A tela não aprova nem dispara sozinha.</div>
+  </div>`;
+}
+function rotinasExecutionHealthBlock(d){
+  const e=(d&&d.executionHealth)||{}; const att=e.status==='attention';
+  const phases=Object.keys(e.readyByPhase||{});
+  const phaseRows=phases.map(k=>`<div><b>${esc(String((e.sentTodayByPhase||{})[k]||0))}/${esc(String((e.readyByPhase||{})[k]||0))}</b><span>${esc(k)} enviado/pronto</span></div>`).join('');
+  const crons=(e.relatedCrons||[]).map(c=>`<div class="focus-row"><div><div class="fn">${esc(c.name||'Rotina de follow-up')} <span class="version-pill ${c.enabled?'ok':'warn'}">${c.enabled?'ativa':'pausada'}</span></div><div class="fm">agenda: ${esc(c.scheduleDisplay||'—')} · última: ${esc(c.lastRunAt||'—')} · status: ${esc(c.lastStatus||'—')}</div><div class="mini-hint">${esc(c.script||'')}</div></div></div>`).join('');
+  return `<div class="focus-section rot-execution ${att?'attn':''}"><h4>Execução real das rotinas <em>${esc(e.status||'ok')}</em></h4>
+    <div class="rot-card ${att?'attn':''}"><div class="h"><b>${esc(e.title||'Follows acompanháveis')}</b><span class="pill ${att?'warn':'ok'}">${att?'atenção':'ok'}</span></div>
+      <ul><li>${rotinasIcon(att?'warn':'ok')}<span>${esc(e.problem||'Cron, fila e envios reais são comparados na mesma tela.')}</span></li><li>${rotinasIcon('follow')}<span>${esc(String(e.ready||0))} prontos · ${esc(String(e.sentToday||0))} enviados hoje · ${esc(String(e.pending||0))} pendentes</span></li><li>${rotinasIcon('cfg')}<span>Última leitura da fila: ${esc(e.generatedAt||'—')}</span></li></ul>
+    </div>
+    <div class="orch-auto-strip mini">${phaseRows||'<div><b>0</b><span>sem fases</span></div>'}</div>
+    <details><summary>Rotinas de follow-up relacionadas</summary>${crons||'<div class="mini-empty">Nenhum cron de follow-up localizado.</div>'}</details>
+  </div>`;
+}
+function rotinasVisibleConfigBlock(d){
+  const rows=(d&&d.visibleConfig)||[];
+  return `<div class="focus-section rot-config-visible"><h4>Configurações visíveis <em>${rows.length}</em></h4>${rows.map(r=>`<div class="focus-row"><div><div class="fn">${esc(r.area)} <span class="version-pill">${esc(r.value)}</span></div><div class="mini-hint">${esc(r.detail||'')}</div></div></div>`).join('')||'<div class="mini-empty">Configuração indisponível.</div>'}<div class="focus-safe"><b>Controle:</b> estes parâmetros ficam visíveis para você revisar; mudanças sensíveis continuam com trava de aprovação.</div></div>`;
+}
+function rotinasModuleRows(rows){
+  return `<div class="focus-section"><h4>Configuração centralizada <em>${(rows||[]).length}</em></h4>${(rows||[]).map(m=>`<div class="focus-row"><div><div class="fn">${esc(m.label)} <span class="version-pill">${esc(m.status||'centralizado')}</span></div><div class="fm">Origem: ${esc(m.absorbedFrom||'módulo operacional')} · Jornada: ${esc(m.journey||'')}</div><div class="mini-hint">${esc(m.description||'')}</div><div class="orch-auto-strip mini">${(m.metrics||[]).map(x=>`<div><b>${esc(String(x.value??0))}</b><span>${esc(x.label||'')}</span></div>`).join('')}</div></div></div>`).join('')||'<div class="mini-empty">Nenhum módulo pendente.</div>'}<div class="focus-safe"><b>Diretriz:</b> Followups, Proatividade, Agendas e Dexter Center entram aqui como orquestração/configuração. A fonte de parametrização é Rotinas / Configuração; a raiz Agendas pode existir só para preparar o SDR para diagnóstico/introdução; análise de resultado fica na Gestão.</div></div>`;
+}
+function rotinasCollectConfig(){
+  const old=(rotinasData&&rotinasData.config)||{}, cfg=JSON.parse(JSON.stringify(old));
+  cfg.autonomyMode=document.getElementById('rotAutonomy')?.value||'equilibrado'; cfg.notifyOnlyExceptions=!!document.getElementById('rotNotifyOnly')?.checked;
+  cfg.messagePolicy=Object.assign({}, cfg.messagePolicy||{}, {source:document.getElementById('rotMessageSource')?.value||'textos_aprovados', dailyCapPerChip:+(document.getElementById('rotDailyCap')?.value||30)});
+  cfg.logPolicy=Object.assign({}, cfg.logPolicy||{}, {retentionDays:+(document.getElementById('rotRetention')?.value||90), redactPhone:!!document.getElementById('rotRedactPhone')?.checked});
+  cfg.backupPolicy=Object.assign({}, cfg.backupPolicy||{}, {enabled:!!document.getElementById('rotBackupEnabled')?.checked, intervalMinutes:+(document.getElementById('rotBackupMinutes')?.value||5)});
+  cfg.gitPolicy=Object.assign({}, cfg.gitPolicy||{}, {enabled:!!document.getElementById('rotGitEnabled')?.checked, branch:document.getElementById('rotGitBranch')?.value||'main'});
+  cfg.journeyOverrides=cfg.journeyOverrides||{}; document.querySelectorAll('[data-journey-enabled]').forEach(el=>{const k=el.getAttribute('data-journey-enabled'); cfg.journeyOverrides[k]=Object.assign({}, cfg.journeyOverrides[k]||{}, {enabled:!!el.checked});}); return cfg;
+}
+async function saveRotinasConfig(){
+  if(rotinasSaving) return; rotinasSaving=true; rotinasNotice='Salvando parâmetros…'; drawRotinas();
+  try{const r=await api('/api/rotinas/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(rotinasCollectConfig()),timeoutMs:12000}); rotinasNotice='Parâmetros salvos com segurança.'; if(rotinasData) rotinasData.config=r.config; await loadRotinas(true);}catch(e){rotinasNotice='Não salvou: '+String((e&&e.message)||e);} finally{rotinasSaving=false; drawRotinas();}
+}
+function rotinasGovernanceBlock(d){
+  const cfg=d.config||{}; return `<div class="focus-section"><h4>Governança: mensagens, registros, backups e histórico de mudança</h4><div class="orch-auto-strip"><div><b>${cfg.messagePolicy?.dailyCapPerChip||30}</b><span>limite/chip/dia</span></div><div><b>${cfg.logPolicy?.retentionDays||90}d</b><span>histórico</span></div><div><b>${cfg.backupPolicy?.enabled?'ON':'OFF'}</b><span>backup ${esc(String(cfg.backupPolicy?.intervalMinutes||5))}min</span></div><div><b>${cfg.gitPolicy?.enabled?'ON':'OFF'}</b><span>mudanças · ${esc(cfg.gitPolicy?.branch||'main')}</span></div></div><div class="focus-safe"><b>Sem redundância:</b> cada rotina aparece em uma jornada principal. Detalhes de sustentação ficam recolhidos para revisão.</div></div>`;
+}
+function rotinasSetTab(tab){rotinasTab=tab; drawRotinas();}
+function rotinasTagClass(x){x=String(x||'').toLowerCase(); if(x.includes('não')||x.includes('nao')) return 'no'; if(x.includes('pend')||x.includes('falha')||x.includes('ignorado')||x.includes('aguard')) return 'warn'; return '';}
+function rotinasMiniRows(rows, opts={}){
+  rows=(rows||[]).slice(0, opts.limit||8);
+  return `<div class="rot-mini-list">${rows.map(x=>{
+    const title=x.title||x.company||x.name||x.label||'Item';
+    const sub=x.subtitle||x.detail||x.reason||x.action||x.source||'';
+    const meta=[x.contact,x.email,x.phoneMasked,x.owner,x.responsible,x.at].filter(Boolean).join(' · ');
+    const tag=x.statusLabel||x.decision||x.status||x.kind||'';
+    return `<div class="rot-mini-row"><div><strong>${esc(title)}</strong><small>${esc(meta||sub||'')}</small>${sub&&meta?`<small>${esc(sub)}</small>`:''}</div>${tag?`<span class="tag ${rotinasTagClass(tag)}">${esc(tag)}</span>`:''}</div>`;
+  }).join('')||`<div class="mini-empty">${esc(opts.empty||'Nada crítico aqui.')}</div>`}</div>`;
+}
+function rotinasChipStatsFromCounts(counts){
+  const entries=Object.entries(counts||{}).slice(0,8);
+  return `<div class="rot-chip-grid">${entries.map(([k,v])=>`<div class="rot-chip-stat"><b>${esc(String(v))}</b><span>${esc(k)}</span></div>`).join('')||'<div class="mini-empty">Sem dados.</div>'}</div>`;
+}
+function rotinasCompactHero(d){
+  const h=d.headline||{}, a=(d.automationAudit||{}).summary||{}, w=d.myWork||{}, li=d.leadIntake||{}, e=d.executionHealth||{};
+  const att=h.status==='attention';
+  const heroStyle='display:grid!important;grid-template-columns:minmax(280px,1fr) minmax(520px,2fr)!important;gap:14px!important;align-items:center!important;background:#0B0F0C!important;border:1px solid rgba(205,235,0,.32)!important;border-radius:18px!important;padding:15px 18px!important;color:#fff!important;min-height:88px!important;overflow:hidden!important;box-shadow:none!important';
+  const statusStyle='display:flex!important;align-items:center!important;gap:12px!important;min-width:0!important';
+  const dotStyle='width:12px!important;height:12px!important;border-radius:999px!important;background:#CDEB00!important;box-shadow:0 0 0 4px rgba(205,235,0,.15)!important;flex:none!important';
+  const kpiRowStyle='display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:10px!important;min-width:0!important';
+  const kpiStyle='background:rgba(255,255,255,.06)!important;border:1px solid rgba(205,235,0,.22)!important;border-radius:14px!important;padding:12px 13px!important;min-width:0!important';
+  const kb='display:block!important;color:#fff!important;font-size:25px!important;line-height:1!important';
+  const ks='display:block!important;color:#C3C3C6!important;font-size:11.5px!important;margin-top:6px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important';
+  return `<div class="rot-compact-hero" style="${heroStyle}"><div class="rot-compact-status ${att?'attn':''}" style="${statusStyle}"><span class="dot" style="${dotStyle}"></span><div><b style="display:block!important;color:#fff!important;font-size:21px!important;line-height:1.05!important">${esc(h.statusLabel||'Operação em leitura')}</b><span style="display:block!important;color:#C3C3C6!important;font-size:13px!important;line-height:1.35!important;margin-top:4px!important">${esc(h.statusDetail||'')}</span></div></div><div class="rot-kpi-row" style="${kpiRowStyle}"><div class="rot-kpi" style="${kpiStyle}"><b style="${kb}">${esc(String((li.items||[]).length||li.visible||0))}</b><span style="${ks}">últimos leads</span></div><div class="rot-kpi" style="${kpiStyle}"><b style="${kb}">${esc(String(e.sentToday||0))}</b><span style="${ks}">follows enviados hoje</span></div><div class="rot-kpi" style="${kpiStyle}"><b style="${kb}">${esc(String(e.ready||0))}</b><span style="${ks}">follows prontos/faltam</span></div><div class="rot-kpi" style="${kpiStyle}"><b style="${kb}">${esc(String(w.waitingCount||0))}/${esc(String(w.escalatedCount||0))}</b><span style="${ks}">decisões / conversas</span></div></div></div>`;
+}
+function rotinasTabs(d){
+  const w=d.myWork||{}, e=d.executionHealth||{}, a=(d.automationAudit||{}).summary||{}, li=d.leadIntake||{}, oa=d.omniArchitecture||{}, os=oa.summary||{};
+  const tabs=[
+    ['arquitetura','Arquitetura', os.missingSdrChips||0],
+    ['qualificacao','Qualificação', li.visible||((li.items||[]).length)],
+    ['followups','Follow-ups', e.ready||0],
+    ['conversas','Conversas/Ajuda', (w.escalatedCount||0)+(w.waitingCount||0)],
+    ['sistema','Crons e sistema', (d.summary&&d.summary.opsAttention)||(((d.cronFolders||[]).reduce((n,g)=>n+(g.count||0),0))||((a.failure||0)+(a.pending||0)))]
+  ];
+  return `<div class="rot-tabs">${tabs.map(([k,l,n])=>`<button class="rot-tab ${rotinasTab===k?'active':''}" onclick="rotinasSetTab('${k}')">${esc(l)}<em>${esc(String(n||0))}</em></button>`).join('')}</div>`;
+}
+function rotinasDataGrid(cols, rows, empty){
+  return `<div class="rot-datagrid" style="--rot-cols:${cols.map(c=>c.w||'minmax(120px,1fr)').join(' ')}"><div class="rot-dg-row head">${cols.map(c=>`<div>${esc(c.label)}</div>`).join('')}</div>${(rows||[]).map(r=>`<div class="rot-dg-row">${cols.map(c=>`<div data-label="${esc(c.label)}">${c.html?c.html(r):esc(String(r[c.key]??''))}</div>`).join('')}</div>`).join('')||`<div class="mini-empty">${esc(empty||'Sem itens agora.')}</div>`}</div>`;
+}
+function rotinasActionButtons(actions){return `<div class="rot-actions">${(actions||[]).map(a=>`<button onclick="${a.onclick||''}" ${a.disabled?'disabled':''}>${esc(a.label)}</button>`).join('')}</div>`;}
+function rotinasOverviewTab(d){return rotinasFollowupsTab(d);}
+function rotinasArquiteturaTab(d){
+  const oa=d.omniArchitecture||{}, s=oa.summary||{};
+  const sdrRows=(oa.sdrs||[]).map(r=>({name:r.name,ports:r.portsLabel,current:`${r.currentChips}/${r.targetChips}`,missing:r.missingChips,status:r.status,rule:r.routingRule,hubspot:r.hubspotOwnerId}));
+  const commRows=(oa.communicators||[]).map(r=>({name:r.name,ports:r.portsLabel,connected:r.connectedChips,status:r.status,rule:r.rule}));
+  const chipRows=(oa.chips||[]).map(r=>({port:r.port,label:r.label,role:r.role,owner:r.owner,origin:r.originUse,dest:r.destinationUse,status:r.status}));
+  const botRows=(oa.bots||[]).map(r=>({bot:r.bot,owns:r.owns,status:r.status,handoff:r.handoff}));
+  const seqRows=(oa.sequences||[]).map(r=>({stage:r.stage,bot:r.bot,sender:r.sender,origin:r.chipOrigin,dest:r.destination,listen:r.listen,state:r.state}));
+  const guardRows=(oa.guardrails||[]).map(r=>({rule:r.rule,contract:r.contract,visible:r.visible,gap:r.gap}));
+  const dq=d.dispatchQueue||{}, dqs=dq.summary||{}, cap=dq.capacity||{};
+  const dqOriginRows=(dq.origins||[]).map(r=>({origin:r.label,count:r.count}));
+  const dqRows=(dq.rows||[]).map(r=>({origin:r.origin,nature:r.nature,owner:r.owner,dest:r.destination,port:r.port,state:r.state,next:r.nextAttempt==='—'?'imediato':r.nextAttempt,attempts:r.attempts,dedupe:r.dedupe}));
+  const queueReady=(dqs.total||0)>0 || (dqs.sentToday||0)>0 || (dqs.failed||0)>0 || (dqs.blocked||0)>0;
+  const dispatchBlock=`<div class="rot-compact-card rot-dispatch-card"><h4>Fila unificada de disparos <em>${queueReady?esc(String(dqs.total||0))+' na fila':'infra preparada'}</em></h4><div class="rot-plain-note"><b>${queueReady?'Fila operacional com movimento':'Ainda não é o volume real da operação.'}</b><span>${queueReady?'Mostra intenções já enfileiradas, processadas, bloqueadas e enviadas pelo novo motor.':'A fila já existe como base do novo motor, mas os disparos reais ainda estão saindo pelos senders atuais. Próxima fase: dual-write dos senders para esta fila e worker por chip.'}</span></div><div class="rot-explain-kpis"><div><b>${esc(String(cap.dailyUniqueConversationTarget||1000))}+/dia</b><span>novas conversas únicas</span></div><div><b>${esc(String(cap.maxSimultaneousConversations||10))}</b><span>simultâneas sem sobrecarga</span></div><div><b>${esc(String(cap.requiredSdrChips||6))}</b><span>chips SDR alvo</span></div><div><b>${esc(String(cap.perChipDailyTarget||167))}/chip</b><span>meta diária segura</span></div><div><b>${esc(String(cap.perChipHourlyTarget||17))}/h</b><span>ritmo por chip</span></div><div><b>shadow</b><span>worker sem envio real ainda</span></div></div><div class="rot-explain-kpis"><div><b>${esc(String(dqs.queued||0))}</b><span>na fila</span></div><div><b>${esc(String(dqs.locked||0))}</b><span>em processamento</span></div><div><b>${esc(String(dqs.sentToday||0))}</b><span>enviados pela fila hoje</span></div><div><b>${esc(String(dqs.failed||0))}</b><span>falhas</span></div><div><b>${esc(String(dqs.blocked||0))}</b><span>bloqueados</span></div><div><b>${esc(String(dqs.throughputLastHour||0))}/h</b><span>vazão da fila</span></div></div>${rotinasDataGrid([{label:'Origem',key:'origin',w:'minmax(200px,1fr)'},{label:'Disparos',key:'count',w:'110px'}],dqOriginRows,'Nenhuma origem usando a fila nova ainda.')}${rotinasDataGrid([{label:'Origem',key:'origin',w:'160px'},{label:'Tipo',key:'nature',w:'170px'},{label:'SDR',key:'owner',w:'110px'},{label:'Destino',key:'dest',w:'minmax(200px,1.2fr)'},{label:'Chip',key:'port',w:'80px'},{label:'Estado',key:'state',w:'150px'},{label:'Próxima tentativa',key:'next',w:'170px'},{label:'Tentativas',key:'attempts',w:'95px'},{label:'Dedupe',key:'dedupe',w:'120px'}],dqRows,'Nenhum disparo recente na fila nova.')}</div>`;
+  const journeyBlock=`<div class="rot-compact-card rot-journey-card"><h4>Orquestração comercial ponta a ponta <em>o que é isso</em></h4><div class="rot-journey"><div><b>1</b><span>Lead entra</span><small>formulário, Facebook, base ou oportunidade</small></div><div><b>2</b><span>Qualifica</span><small>MQL, Não-MQL ou pendência real</small></div><div><b>3</b><span>Dispara WhatsApp</span><small>diagnóstico, follow-up, agenda ou proatividade</small></div><div><b>4</b><span>Conversa</span><small>agente conduz o simples; escala só risco/dúvida</small></div><div><b>5</b><span>Agenda</span><small>link, confirmação, lembrete e retomada/no-show</small></div></div><div class="rot-plain-note"><b>Objetivo da tela:</b><span>mostrar onde cada lead está, por qual chip saiu, quem é o SDR dono, qual automação atuou e qual próxima ação leva até a agenda.</span></div></div>`;
+  return `<div class="rot-tab-panel"><div class="rot-explain-card"><div><b>Arquitetura omni da máquina de vendas</b><span>Visão clara do caminho do lead até agenda, com bots, sequências, chips origem/destino e escuta operacional.</span></div><div class="rot-explain-kpis"><div><b>${esc(String(s.sdrChips||0))}/${esc(String(s.targetSdrChips||0))}</b><span>chips SDR atuais/alvo</span></div><div><b>${esc(String(s.missingSdrChips||0))}</b><span>chips SDR faltando</span></div><div><b>${esc(String(s.communicators||0))}</b><span>comunicadores separados</span></div><div><b>${esc(String(s.commercialCronsCentralized||0))}/${esc(String(s.commercialCronsTotal||0))}</b><span>rotas comerciais centrais</span></div></div></div>
+  ${journeyBlock}
+  ${dispatchBlock}
+  <div class="rot-tab-grid"><div class="rot-compact-card"><h4>SDRs e chips de origem <em>meta: 2 por SDR</em></h4>${rotinasDataGrid([{label:'SDR',key:'name',w:'150px'},{label:'Chips',key:'ports',w:'120px'},{label:'Atual/alvo',key:'current',w:'95px'},{label:'Faltam',key:'missing',w:'75px'},{label:'Estado',key:'status',w:'160px'},{label:'Regra de roteamento',key:'rule',w:'minmax(320px,1.4fr)'}],sdrRows,'Sem SDR configurado.')}</div>
+  <div class="rot-compact-card"><h4>Comunicadores <em>fora da régua SDR</em></h4>${rotinasDataGrid([{label:'Nome',key:'name',w:'140px'},{label:'Chips',key:'ports',w:'110px'},{label:'Conectados',key:'connected',w:'95px'},{label:'Estado',key:'status',w:'180px'},{label:'Regra',key:'rule',w:'minmax(320px,1fr)'}],commRows,'Sem comunicadores.')}</div></div>
+  <div class="rot-compact-card"><h4>Bots e responsabilidades</h4>${rotinasDataGrid([{label:'Bot',key:'bot',w:'190px'},{label:'Dono do quê',key:'owns',w:'minmax(320px,1.4fr)'},{label:'Estado',key:'status',w:'180px'},{label:'Handoff',key:'handoff',w:'minmax(300px,1fr)'}],botRows,'Sem bots mapeados.')}</div>
+  <div class="rot-compact-card"><h4>Sequências, chip origem e destino</h4>${rotinasDataGrid([{label:'Etapa',key:'stage',w:'180px'},{label:'Bot',key:'bot',w:'180px'},{label:'Sender',key:'sender',w:'220px'},{label:'Chip origem',key:'origin',w:'210px'},{label:'Destino',key:'dest',w:'170px'},{label:'Escuta',key:'listen',w:'240px'},{label:'Estado',key:'state',w:'110px'}],seqRows,'Sem sequência mapeada.')}</div>
+  <div class="rot-tab-grid"><div class="rot-compact-card"><h4>Mapa de chips</h4>${rotinasDataGrid([{label:'Porta',key:'port',w:'70px'},{label:'Chip',key:'label',w:'150px'},{label:'Papel',key:'role',w:'120px'},{label:'Origem',key:'origin',w:'160px'},{label:'Destino permitido',key:'dest',w:'210px'},{label:'Estado',key:'status',w:'105px'}],chipRows,'Sem chips.')}</div>
+  <div class="rot-compact-card"><h4>Regras que evitam confusão</h4>${rotinasDataGrid([{label:'Regra',key:'rule',w:'120px'},{label:'Contrato',key:'contract',w:'minmax(280px,1.2fr)'},{label:'Como aparece',key:'visible',w:'minmax(250px,1fr)'},{label:'Próximo gap',key:'gap',w:'minmax(260px,1fr)'}],guardRows,'Sem contratos.')}</div></div></div>`;
+}
+function rotinasFollowupsTab(d){
+  const e=d.executionHealth||{};
+  const rows=(e.explain37||[]).map((x,i)=>({passo:i+1,title:x.title,detail:x.detail,action:i===3?'Atualizar snapshot':'Ver logs'}));
+  const worker=((e.workerSummary||{}).items||[]).slice(-10).reverse().map(x=>({when:x.startedAt||x.file, owner:x.owner||'—', sent:x.sent||0, skipped:x.skipped||0, reason:x.reason||'', status:x.status||''}));
+  const phaseRows=[...new Set([...Object.keys(e.readyByPhase||{}),...Object.keys(e.sentTodayByPhase||{}),...Object.keys(e.blockedResearchByPhase||{})])].map(k=>({phase:k, sent:(e.sentTodayByPhase||{})[k]||0, ready:(e.readyByPhase||{})[k]||0, blocked:(e.blockedResearchByPhase||{})[k]||0, action:'Acompanhar'}));
+  return `<div class="rot-tab-panel"><div class="rot-explain-card ${e.snapshotStale?'attn':''}"><div><b>${esc(e.title||'Follow-ups')}</b><span>${esc(e.problem||'')}</span></div><div class="rot-explain-kpis"><div><b>${e.sentToday||0}</b><span>enviados hoje</span></div><div><b>${e.ready||0}</b><span>prontos no snapshot</span></div><div><b>${e.blockedResearch||0}</b><span>bloq. pesquisa</span></div><div><b>${e.snapshotAgeSeconds?Math.round(e.snapshotAgeSeconds/60):0}min</b><span>idade do snapshot</span></div></div></div>
+    <div class="rot-tab-grid"><div class="rot-compact-card"><h4>Por que os 37 não saíram todos?</h4>${rotinasDataGrid([{label:'#',key:'passo',w:'52px'},{label:'Causa',key:'title',w:'minmax(220px,1fr)'},{label:'Explicação',key:'detail',w:'minmax(360px,2fr)'},{label:'Ação',key:'action',w:'150px',html:r=>rotinasActionButtons([{label:r.action,onclick:'loadRotinas(true)'}])}],rows,'Sem explicação disponível.')}</div>
+    <div class="rot-compact-card"><h4>Execuções reais do worker</h4>${rotinasDataGrid([{label:'Quando',key:'when',w:'180px'},{label:'Owner',key:'owner',w:'90px'},{label:'Enviou',key:'sent',w:'70px'},{label:'Pulou',key:'skipped',w:'70px'},{label:'Motivo',key:'reason',w:'minmax(260px,1fr)'},{label:'Status',key:'status',w:'90px'}],worker,'Sem log recente.')}</div></div>
+    <div class="rot-compact-card"><h4>Fila por fase</h4>${rotinasDataGrid([{label:'Fase',key:'phase',w:'110px'},{label:'Enviados hoje',key:'sent',w:'120px'},{label:'Prontos',key:'ready',w:'90px'},{label:'Bloq. pesquisa',key:'blocked',w:'130px'},{label:'Ação',key:'action',w:'160px',html:r=>rotinasActionButtons([{label:'Abrir follow-ups',onclick:"setViewMode('followups')"},{label:'Atualizar',onclick:'loadRotinas(true)'}])}],phaseRows,'Sem fases no snapshot.')}</div></div>`;
+}
+function rotinasQualificacaoTab(d){
+  const li=d.leadIntake||{}, w=d.myWork||{};
+  const rows=(li.items||[]).slice(0,30).map(x=>({lead:x.company||x.contact||'Lead',contact:[x.contact,x.email,x.phoneMasked].filter(Boolean).join(' · '),decision:x.decision||'—',next:x.nextAction||'',when:x.enteredAt||''}));
+  return `<div class="rot-tab-panel"><div class="rot-compact-card"><h4>Qualificação e decisões</h4>${rotinasDataGrid([{label:'Lead',key:'lead',w:'minmax(220px,1.2fr)'},{label:'Contato',key:'contact',w:'minmax(260px,1.4fr)'},{label:'Decisão',key:'decision',w:'150px'},{label:'Próxima ação',key:'next',w:'minmax(260px,1.3fr)'},{label:'Entrada',key:'when',w:'160px'},{label:'Ações',key:'actions',w:'220px',html:r=>rotinasActionButtons([{label:'Abrir HubSpot',onclick:'loadRotinas(true)'},{label:'Abrir conversa',onclick:"setViewMode('conversas')"}])}],rows,'Nenhum lead recente.')}</div><div class="rot-compact-card"><h4>Pendências humanas</h4>${rotinasMiniRows(w.waiting||[],{limit:10,empty:'Nenhuma qualificação aguardando Rafael.'})}</div></div>`;
+}
+function rotinasConversasTab(d){
+  const w=d.myWork||{};
+  const rows=[...(w.waiting||[]).map(x=>({...x,kind:'Decisão'})),...(w.escalated||[]).map(x=>({...x,kind:'Ajuda'}))].slice(0,30).map(x=>({lead:x.title||x.company||x.name||'Item',detail:x.detail||x.reason||x.action||'',kind:x.kind,status:x.status||x.statusLabel||'',at:x.at||''}));
+  return `<div class="rot-tab-panel"><div class="rot-compact-card"><h4>Conversas e decisões operáveis <em>${rows.length}</em></h4>${rotinasDataGrid([{label:'Lead',key:'lead',w:'minmax(260px,1.2fr)'},{label:'Tipo',key:'kind',w:'100px'},{label:'Detalhe',key:'detail',w:'minmax(360px,1.8fr)'},{label:'Status',key:'status',w:'160px'},{label:'Quando',key:'at',w:'160px'},{label:'Ações',key:'actions',w:'230px',html:r=>rotinasActionButtons([{label:'Abrir conversa',onclick:"setViewMode('conversas')"},{label:'Marcar resolvido',onclick:'loadRotinas(true)'}])}],rows,'Nenhuma conversa pedindo ajuda.')}</div></div>`;
+}
+
+function rotinasOpsIntegrityBlock(d){
+  const oi=(d&&d.opsIntegrity)||{}, cards=oi.cards||[];
+  const cardHtml=cards.map(c=>{
+    const checks=(c.checks||[]).map(ch=>`<div class="rot-mini-row"><div><strong>${esc(ch.label||'Checagem')}</strong><small>${esc(ch.detail||'')}</small></div><span class="tag ${ch.state==='ok'?'':'warn'}">${ch.state==='ok'?'OK':'Ajustar'}</span></div>`).join('');
+    const steps=(c.nextSteps||[]).map(x=>`<li>${esc(x)}</li>`).join('');
+    const crons=(c.crons||[]).map(r=>`<div class="mini-hint"><b>${esc(r.name||'Cron')}</b> · ${esc(r.enabled?'ativo':'pausado')} · última: ${esc(r.lastRunAt||'—')} · ${esc(r.lastStatus||'—')}</div>`).join('');
+    return `<div class="rot-compact-card ${c.status==='ok'?'':'attn'}"><h4>${esc(c.title||'Operação')} <em>${c.status==='ok'?'OK':(c.attention||0)+' ponto(s)'}</em></h4><div class="rot-plain-note"><b>${esc(c.summary||'')}</b><span>O painel mostra o que precisa existir para manter isso saudável; não executa backup, commit, push ou deploy sozinho.</span></div><div class="rot-mini-list">${checks||'<div class="mini-empty">Sem checagens.</div>'}</div><details><summary>O que precisa para manter OK</summary><ul class="rot-why">${steps}</ul>${crons?`<div class="focus-safe"><b>Crons relacionados</b>${crons}</div>`:''}</details></div>`;
+  }).join('');
+  return `<div class="rot-compact-card"><h4>Backup Drive, GitHub e deploy seguro <em>${oi.status==='ok'?'OK':(oi.attention||0)+' atenção'}</em></h4><div class="rot-explain-kpis"><div><b>${cards.find(c=>c.key==='backup_drive')?.status==='ok'?'OK':'Ver'}</b><span>Backup Drive</span></div><div><b>${cards.find(c=>c.key==='github')?.status==='ok'?'OK':'Ver'}</b><span>GitHub</span></div><div><b>${cards.find(c=>c.key==='deploy')?.status==='ok'?'OK':'Ver'}</b><span>Stage/deploy</span></div></div><div class="rot-tab-grid">${cardHtml||'<div class="mini-empty">Sem dados de governança.</div>'}</div></div>`;
+}
+function rotinasSistemaTab(d){
+  const folders=d.cronFolders||[];
+  const wc=d.whatsappCentralizer||{}, ws=wc.summary||{};
+  const cg=d.cronGovernance||{}, gs=cg.summary||{};
+  const moduleRows=(wc.modules||[]).map(m=>({name:m.name,file:m.file,status:m.ok?'OK':'Falta'}));
+  const senderRows=(wc.senders||[]).map(s=>({name:s.name,file:s.file,envelope:s.centralEnvelope?'Sim':'Não',routing:s.routing?'Sim':'Parcial',queue:s.dispatchQueue?'Sim':'Não',ledger:s.lockedLedger?'Sim':'Não'}));
+  const govRows=(cg.rows||[]).map(r=>({name:r.name,type:r.type,arch:r.architecture,coverage:r.coverage,action:r.safeAction,state:r.enabled?'ativo':'pausado',risk:r.risk,script:r.script,can:r.canEnable?'Pode operar':'Não reativar'}));
+  const opsBlock=rotinasOpsIntegrityBlock(d);
+  const centralBlock=`<div class="rot-compact-card"><h4>Centralizador WhatsApp <em>${esc(String(ws.sendersWithEnvelope||0))}/${esc(String(ws.sendersTotal||0))} senders</em></h4><div class="rot-explain-kpis"><div><b>${esc(String(ws.modulesOk||0))}/${esc(String(ws.modulesTotal||0))}</b><span>módulos centrais</span></div><div><b>${esc(String(ws.sendersWithEnvelope||0))}</b><span>com natureza/quota</span></div><div><b>${esc(String(ws.routingConnected||0))}</b><span>com roteamento ligado</span></div><div><b>${esc(String(ws.sendersWithDispatchQueue||0))}</b><span>com fila/dual-write</span></div><div><b>shadow</b><span>quota sem bloquear</span></div></div>${rotinasDataGrid([{label:'Sender',key:'name',w:'minmax(220px,1fr)'},{label:'Arquivo',key:'file',w:'minmax(280px,1.3fr)'},{label:'Natureza/quota',key:'envelope',w:'130px'},{label:'Roteamento',key:'routing',w:'120px'},{label:'Fila',key:'queue',w:'90px'},{label:'Ledger lock',key:'ledger',w:'110px'}],senderRows,'Nenhum sender mapeado.')}${rotinasDataGrid([{label:'Módulo',key:'name',w:'minmax(220px,1fr)'},{label:'Arquivo',key:'file',w:'minmax(320px,1.5fr)'},{label:'Estado',key:'status',w:'100px'}],moduleRows,'Nenhum módulo central.')}</div>`;
+  const governanceBlock=`<div class="rot-compact-card"><h4>Gestão da estrutura inteira <em>${esc(String(gs.active||0))}/${esc(String(gs.total||0))} crons ativos</em></h4><div class="rot-explain-kpis"><div><b>${esc(String(gs.commercialCentralized||0))}/${esc(String(gs.commercialTotal||0))}</b><span>envio comercial centralizado</span></div><div><b>${esc(String(gs.listener||0))}</b><span>escuta operacional</span></div><div><b>${esc(String(gs.warmup||0))}</b><span>warmup separado</span></div><div><b>${esc(String(gs.pausedLegacy||0))}</b><span>legados não reativar</span></div></div>${rotinasDataGrid([{label:'Rotina',key:'name',w:'minmax(260px,1.2fr)'},{label:'Papel',key:'type',w:'190px'},{label:'Arquitetura',key:'arch',w:'155px'},{label:'Cobertura',key:'coverage',w:'minmax(330px,1.5fr)'},{label:'Ação segura',key:'action',w:'minmax(300px,1.3fr)'},{label:'Estado',key:'state',w:'90px',html:r=>`<span class="tag ${r.state==='ativo'?'':'warn'}">${esc(r.state)}</span>`},{label:'Reativação',key:'can',w:'125px'}],govRows,'Sem crons para governar.')}</div>`;
+  return `<div class="rot-tab-panel">${opsBlock}${centralBlock}${governanceBlock}<div class="rot-cron-folders">${folders.map(g=>`<details class="rot-cron-folder"><summary><b>${esc(g.name)}</b><span>${g.active}/${g.count} ativos · ${g.crucial} cruciais · ${g.redundant} redundantes</span></summary>${rotinasDataGrid([{label:'Cron',key:'name',w:'minmax(260px,1.4fr)'},{label:'Significado',key:'meaning',w:'minmax(360px,1.8fr)'},{label:'Crucial?',key:'crucial',w:'90px',html:r=>r.crucial?'Sim':'Não'},{label:'Redundante?',key:'redundant',w:'110px',html:r=>r.redundant?'Sim':'Não'},{label:'Período',key:'dailyWindow',w:'180px'},{label:'Agenda',key:'scheduleDisplay',w:'150px'},{label:'Estado',key:'enabled',w:'120px',html:r=>`<span class="tag ${r.enabled?'':'warn'}">${r.enabled?'ativo':'pausado'}</span>`}],g.items||[],'Sem crons nesta pasta.')}</details>`).join('')||'<div class="mini-empty">Sem crons classificados.</div>'}</div><details class="rot-old-detail"><summary>Bastidores completos</summary>${rotinasVisibleConfigBlock(d)}${rotinasAutomationAuditBlock(d)}${rotinasModuleRows(d.modules||[])}</details></div>`;
+}
+function rotinasTabBody(d){
+  if(rotinasTab==='overview') rotinasTab='arquitetura';
+  if(rotinasTab==='arquitetura') return rotinasArquiteturaTab(d);
+  if(rotinasTab==='qualificacao') return rotinasQualificacaoTab(d);
+  if(rotinasTab==='followups') return rotinasFollowupsTab(d);
+  if(rotinasTab==='conversas') return rotinasConversasTab(d);
+  if(rotinasTab==='sistema') return rotinasSistemaTab(d);
+  return rotinasFollowupsTab(d);
+}
+function rotinasOpen(id){const d=document.getElementById(id); if(d){d.open=true; d.scrollIntoView({behavior:'smooth',block:'start'});}}
+function rotinasHero(h){
+  h=h||{}; const attn=h.status==='attention';
+  return `<div class="rot-hero ${attn?'attn':''}"><span class="dot"></span><div><b>${esc(h.statusLabel||'Lendo o estado da máquina…')}</b><span>${esc(h.statusDetail||'')}</span></div></div>`;
+}
+function rotinasIcon(kind){
+  const k=String(kind||'').toLowerCase();
+  return `<span class="rot-dot ${esc(k)}"></span>`;
+}
+function rotinasList(items, empty){
+  return `<ul>${(items||[]).map(t=>`<li>${rotinasIcon(t.icon)}<span>${esc(t.text||'')}</span></li>`).join('')||`<li>${rotinasIcon('ok')}<span>${esc(empty||'Nada novo agora.')}</span></li>`}</ul>`;
+}
+function rotinasNowCard(h){
+  h=h||{}; const attention=(h.attention||[]);
+  const hasAttention=attention.length>0;
+  const main=hasAttention?attention.map(a=>({icon:'warn', text:`${a.area||'Atenção'}: ${a.text||''}`})):(h.today||[]);
+  const secondary=hasAttention?(h.today||[]).slice(0,3):[];
+  return `<div class="rot-card rot-now ${hasAttention?'attn':''}"><div class="h"><b>O que importa agora</b><span class="pill ${hasAttention?'warn':'ok'}">${hasAttention?attention.length+' decisão'+(attention.length===1?'':'ões'):'sem pendência'}</span></div>${rotinasList(main,'Nada pedindo decisão sua agora — pode focar nas conversas.')}${secondary.length?`<div class="rot-subline"><b>Também cuidado hoje:</b> ${secondary.map(x=>esc(x.text||'')).join(' · ')}</div>`:''}</div>`;
+}
+function rotinasTodayCard(h){
+  const items=(h&&h.today)||[];
+  return `<div class="rot-card"><div class="h"><b>Hoje</b><span class="pill ok">cuidados de hoje</span></div>${rotinasList(items,'Nada novo agora — pode focar nas conversas.')}</div>`;
+}
+function rotinasAttentionCard(h){
+  const items=(h&&h.attention)||[]; const attn=items.length>0;
+  const body=attn?`<ul>${items.map(a=>`<li><span class="sev ${esc(a.severity||'média')}">${esc(a.severity||'média')}</span><span><b>${esc(a.area||'')}:</b> ${esc(a.text||'')}</span></li>`).join('')}</ul>`:`<ul><li>${rotinasIcon('ok')}<span>Nada pedindo decisão sua agora.</span></li></ul>`;
+  return `<div class="rot-card ${attn?'attn':''}"><div class="h"><b>Atenção</b><span class="pill ${attn?'warn':'ok'}">${attn?items.length+' ponto'+(items.length===1?'':'s'):'tudo certo'}</span></div>${body}</div>`;
+}
+function rotinasConfigCard(h){
+  const items=(h&&h.config)||[];
+  return `<div class="rot-card"><div class="h"><b>Como o Dexter trabalha</b><span class="pill">configuração</span></div><ul>${items.map(c=>`<li>${rotinasIcon('cfg')}<span>${esc(c)}</span></li>`).join('')}</ul><button class="linkish" onclick="rotinasOpen('rotConfigDetails')">Ajustar configuração</button></div>`;
+}
+function rotinasTechCard(h){
+  const t=(h&&h.technical)||{};
+  return `<div class="rot-card"><div class="h"><b>Bastidores da operação</b><span class="pill ${(t.bridgesOk===t.bridgesTotal)?'ok':'warn'}">${t.bridgesOk||0}/${t.bridgesTotal||0} chips</span></div><ul><li>${rotinasIcon('whats')}<span>WhatsApp: ${t.bridgesOk||0} de ${t.bridgesTotal||0} chips conectados</span></li><li>${rotinasIcon('monitor')}<span>${t.monitors||0} monitores cuidando da operação</span></li><li>${rotinasIcon('process')}<span>${t.processes||0} processos sustentando o painel hoje</span></li></ul><button class="linkish" onclick="rotinasOpen('rotTechDetails')">Ver bastidores</button></div>`;
+}
+function rotinasMetro(journeys){
+  const by={}; (journeys||[]).forEach(j=>by[j.key]=j);
+  const STOPS=[
+    {label:'Entrada do lead', key:'entrada_mql', desc:'Formulário e captura'},
+    {label:'Qualificação', key:'entrada_mql', desc:'MQL / Não-MQL e diagnóstico'},
+    {label:'Ativação SDR', key:'primeiro_contato', desc:'Diagnóstico ou entrada em F1'},
+    {label:'Follows', key:'followup_sdr', desc:'Cadência F1–F4 e retomada'},
+    {label:'Agenda / No-show', key:'agenda_no_show', desc:'Confirma, lembra, remarca'},
+    {label:'Diagnóstico / Introdução', key:'agenda_no_show', desc:'Preparo e handoff'},
+  ];
+  const stops=STOPS.map((s,i)=>{const j=by[s.key]||{}; const off=j.enabled===false; const cnt=j.count||0;
+    return `<div class="stop ${off?'off':''}"><div class="node"><i></i><b>${esc(s.label)}</b></div><span>${esc(s.desc)}</span><small>${off?'pausada':'em andamento'}${cnt?` · ${cnt} cuidado${cnt===1?'':'s'} automatizado${cnt===1?'':'s'}`:''}</small></div>${i<STOPS.length-1?'<span class="arrow">→</span>':''}`;
+  }).join('');
+  return `<div class="focus-section"><h4>Jornada comercial agora <em>entrada → introdução</em></h4><div class="rot-metro">${stops}</div></div>`;
+}
+function drawRotinas(){
+  const el=document.getElementById('cards');
+  document.getElementById('queueTitle').textContent='Rotinas';
+  document.getElementById('queueCount').textContent='visão do Rafael';
+  const ft=document.getElementById('filterbar'); if(ft) ft.innerHTML='';
+  if(rotinasLoading && !rotinasData){ el.innerHTML='<div class="dispatch-board"><div class="dispatch-head"><div><b>Carregando rotinas…</b><span>Lendo arquivos locais, processos e saúde dos bridges.</span></div></div></div>'; return; }
+  if(rotinasError){ el.innerHTML=`<div class="dispatch-board"><div class="dispatch-head"><div><b>Acesso ou carga indisponível</b><span>${esc(rotinasError)}</span></div><button class="dispatch-total" onclick="loadRotinas(true)">Tentar de novo</button></div></div>`; return; }
+  const d=rotinasData;
+  if(!d){ el.innerHTML='<div class="dispatch-board"><div class="dispatch-head"><div><b>Central de rotinas</b><span>Carregando…</span></div></div></div>'; return; }
+  if(d.ok===false){ el.innerHTML='<div class="dispatch-board"><div class="dispatch-head"><div><b>Acesso restrito</b><span>Essa tela é privada do Rafael/admin.</span></div></div></div>'; return; }
+  if(rotinasTab==='overview') rotinasTab='arquitetura';
+  if(!['arquitetura','qualificacao','followups','conversas','sistema'].includes(rotinasTab)) rotinasTab='arquitetura';
+  try{ localStorage.setItem('zydon-rotinas-tab', rotinasTab); }catch(e){}
+  el.innerHTML=`<div class="mgmt-panel rotinas-panel compact rotinas-v3">
+    <div class="rot-command-head"><div><b>Central de operação WhatsApp</b><span>Follow-up, qualificação, conversas e crons com motivo, dono e próxima ação. Sem contador solto.</span></div><div class="rot-live">${esc(d.scope||'privado')} · ${esc(d.generatedAt||'ao vivo')}</div></div>
+    ${rotinasCompactHero(d)}
+    ${rotinasTabs(d)}
+    ${rotinasNotice?`<div class="focus-safe"><b>${esc(rotinasNotice)}</b></div>`:''}
+    ${rotinasTabBody(d)}
+  </div>`;
+}
+
 function leadOwnerLabel(c){return c.dealOwnerLabel||c.sdrLabel||ownerLabelOfConv(c)||'SDR'}
 function senderLabel(c){return c.senderLabel||chipLabel(c.port)||'Comunicador'}
 function hasCommunicator(c){
   const meta=portMeta[c.port]||{}, sender=senderLabel(c), owner=leadOwnerLabel(c);
   return !!(c.readOnlyInstitutional || meta.role==='comunicador' || meta.role==='institucional' || (sender && owner && sender!==owner && !String(sender).startsWith('Chip ')));
 }
-function communicatorChip(c){return hasCommunicator(c)?`<span class="inst-pill sender">Comunicador: ${esc(senderLabel(c))}</span>`:''}
+function communicatorChip(c){return hasCommunicator(c)?`<span class="inst-pill sender">${INBOX_COPY.communicatorBadge} ${esc(senderLabel(c))}</span>`:''}
 function institutionalMap(c){
   if(!c.readOnlyInstitutional) return '';
-  return `<div class="inst-map"><span class="inst-pill owner">Lead do SDR: ${esc(leadOwnerLabel(c))}</span>${communicatorChip(c)}</div>`;
+  return `<div class="inst-map"><span class="inst-pill owner">${INBOX_COPY.leadOwnerChip} ${esc(leadOwnerLabel(c))}</span>${communicatorChip(c)}</div>`;
 }
-function readonlyBadge(c){return c.readOnlyInstitutional?'<span class="badge b-shared">Auditoria institucional</span>':''}
+function readonlyBadge(c){return c.readOnlyInstitutional?`<span class="badge b-shared">${INBOX_COPY.communicatorBadge} ${esc(senderLabel(c))}</span>`:''}
 
 function drawCards(){
   if(viewMode==='gestao') return drawManagement();
   if(viewMode==='foco') return drawFocus();
+  if(viewMode==='agendas') return drawAgendas();
+  if(viewMode==='rotinas') return drawRotinas();
   const prevScroll=(getListScroller()&&getListScroller().scrollTop)||0;
   const list=filteredCards();
   const sig=listSignature();
@@ -8631,7 +12821,17 @@ function drawCards(){
   renderFilterBar();
   renderQueues();
   const el=document.getElementById('cards');
-  if(!list.length){ el.innerHTML=`<div class="empty"><b>Nada por aqui 🎉</b><span>Nenhuma conversa encontrada.</span></div>`; return; }
+  if(!list.length){
+    const q=(document.getElementById('search')?.value||'').trim();
+    const hasLoaded=(convs||[]).length>0;
+    const hasFilters=!!(q||filterOwner||filterStatus||filterChip);
+    if(hasLoaded && hasFilters){
+      el.innerHTML=`<div class="empty"><b>Conversas ocultas por filtro</b><span>Carreguei ${(convs||[]).length} conversa${(convs||[]).length===1?'':'s'}, mas o filtro/search atual deixou a lista vazia.</span><button class="ghost" onclick="document.getElementById('search').value=''; clearWFilters();">Limpar filtros e busca</button></div>`;
+    }else{
+      el.innerHTML=`<div class="empty"><b>Nada por aqui 🎉</b><span>Nenhuma conversa encontrada.</span></div>`;
+    }
+    return;
+  }
   const visible=list.slice(0, Math.min(listVisibleCount, list.length));
   const pagerTop=list.length>LIST_PAGE_SIZE?`<div class="list-page-info"><span>Mostrando <b>${visible.length}</b> de ${list.length}</span></div>`:'';
   const pagerBottom=list.length>visible.length?`<div class="list-pager"><button onclick="showMoreCards()">Mostrar mais ${Math.min(LIST_PAGE_SIZE, list.length-visible.length)}</button><span>${visible.length}/${list.length}</span><button class="ghost" onclick="scrollListTop()">Topo</button></div>`:`<div class="list-pager done"><span>Fim da lista · ${list.length} conversa${list.length===1?'':'s'}</span><button class="ghost" onclick="scrollListTop()">Topo</button></div>`;
@@ -9007,7 +13207,7 @@ function drawHead(c){
   const sender=senderLabel(c);
   const contactPhoneHtml=`${contact?`<span class="contact-name">${esc(contact)}</span><span class="dotsep"></span>`:''}<span>${esc(ptxt)}</span>`;
   const subHtml = ro
-    ? `${contactPhoneHtml}<span class="dotsep"></span><span class="inst-pill owner">Proprietário SDR: ${esc(leadOwner)}</span><span class="inst-pill sender">Comunicador: ${esc(sender)}</span>`
+    ? `${contactPhoneHtml}<span class="dotsep"></span><span class="inst-pill owner">${INBOX_COPY.leadOwnerBadge} ${esc(leadOwner)}</span><span class="inst-pill sender">${INBOX_COPY.communicatorBadge} ${esc(sender)}</span>`
     : `${contactPhoneHtml}<span class="dotsep"></span><span class="owner"><span class="av" style="background:${colorFor(owner)};width:16px;height:16px;border-radius:50%;font-size:8px;display:grid;place-items:center;font-weight:700;color:#0a0a0a">${esc(initials(owner))}</span> SDR ${esc(owner)}</span>${hasCommunicator(c)?`<span class="dotsep"></span>${communicatorChip(c)}`:''}`;
   document.getElementById('convHead').innerHTML=`
     <button class="icon-btn back-btn" onclick="mobileBack()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg></button>
@@ -9272,6 +13472,348 @@ async function loadDispatchStats(force=false){
   }
   finally{ dispatchStatsLoading=false; }
   if(viewMode==='gestao') drawCards();
+}
+
+// --- Central Dexter dentro de Gestão -----------------------------------------
+function dexterQueryString(){
+  const f=dexterFilters||{}, p=new URLSearchParams();
+  p.set('days', f.days||14); p.set('limit', f.limit||80); if(f.search) p.set('search', f.search); return p.toString();
+}
+async function loadDexterCenter(force=false){
+  if(dexterLoading && !force) return;
+  dexterLoading=true; dexterError='';
+  if(viewMode==='gestao') drawCards();
+  try{ dexterData=await api('/api/dexter-center?'+dexterQueryString(),{timeoutMs:12000}); }
+  catch(e){ dexterError=String(e&&e.message||e); dexterData=dexterData||{ok:false,summary:{},crons:[],contexts:[],agendas:{summary:{}}}; }
+  finally{ dexterLoading=false; }
+  if(viewMode==='gestao') drawCards();
+}
+function setDexterTab(t){dexterTab=t||'overview'; drawCards();}
+function refreshDexterCenter(){return loadDexterCenter(true)}
+function dxStatusClass(v){const s=String(v||'').toLowerCase(); if(s.includes('error')||s.includes('falh')||s.includes('critical')) return 'err'; if(s.includes('paused')||s.includes('attention')||s.includes('scheduled')) return 'warn'; return 'ok'}
+function dxWhen(x){ if(!x) return '—'; try{return new Date(x).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}catch(e){return String(x||'—')} }
+function dxOverview(d){
+  const s=d.summary||{}, ag=s.agendas||{}, cr=d.crons||[], ctx=d.contexts||[];
+  const active=cr.filter(c=>c.enabled!==false && c.state!=='paused').length, paused=cr.filter(c=>c.enabled===false || c.state==='paused').length;
+  const next=cr.filter(c=>c.nextRunAt).sort((a,b)=>String(a.nextRunAt).localeCompare(String(b.nextRunAt))).slice(0,5);
+  return `<div class="dx-overview-grid">
+    <div class="dx-ocard"><h4>Crons do Dexter</h4><div class="dx-ostat"><b>${s.cronsTotal||cr.length||0}</b><span>rotinas conhecidas</span></div><div class="dx-ochips"><span class="dx-mini ok">${active} ativos</span><span class="dx-mini warn">${paused} pausados</span><span class="dx-mini">${s.scriptOnlyCrons||0} script-only</span></div></div>
+    <div class="dx-ocard"><h4>Contextos e chats</h4><div class="dx-ostat"><b>${s.contextsTotal||ctx.length||0}</b><span>contextos recentes</span></div><div class="dx-ochips"><span class="dx-mini">${s.originContexts||0} origem</span><span class="dx-mini">${s.discordContexts||0} Discord</span></div></div>
+    <div class="dx-ocard"><h4>Agendas e mensagens</h4><div class="dx-ostat"><b>${ag.total||0}</b><span>eventos no período</span></div><div class="dx-ochips"><span class="dx-mini ok">${ag.confirmations||0} confirmações</span><span class="dx-mini warn">${ag.missingLinkOrFailures||0} atenção</span></div></div>
+    <div class="dx-ocard" style="grid-column:1 / -1"><h4>Próximas execuções</h4><div class="dx-olist">${next.map(c=>`<div class="dx-oitem"><b>${esc(c.name||c.jobId)}</b><span>${esc(dxWhen(c.nextRunAt))} · ${esc(c.schedule||'')} · ${esc(c.deliver||'')}</span></div>`).join('')||'<div class="mini-empty">Sem próxima execução registrada.</div>'}</div></div>
+  </div>`;
+}
+function dxCronRows(rows){
+  rows=(rows||[]);
+  if(!rows.length) return '<div class="ag-grid"><div class="ag-state"><b>Nenhum cron encontrado.</b><span>O inventário local não retornou jobs.</span></div></div>';
+  const head='<div class="dx-cron-row head"><div>Rotina</div><div>Status</div><div>Próxima</div><div>Última</div><div>Destino / script</div><div>Tipo</div></div>';
+  const body=rows.map(c=>`<div class="dx-cron-row ${c.enabled===false||c.state==='paused'?'paused':''}">
+    <div class="dx-cname"><b>${esc(c.name||c.jobId)}</b><small>${esc(c.jobId||'')}</small>${(c.skills||[]).length?`<div class="dx-tags">${(c.skills||[]).slice(0,3).map(x=>`<span class="dx-tag">${esc(x)}</span>`).join('')}</div>`:''}</div>
+    <div><span class="dx-mini ${dxStatusClass(c.lastStatus||c.state)}">${esc(c.enabled===false?'pausado':(c.lastStatus||c.state||'—'))}</span><div class="dx-sub">${esc(c.pausedReason||'')}</div></div>
+    <div class="dx-mono">${esc(dxWhen(c.nextRunAt))}<div class="dx-sub">${esc(c.schedule||'')}</div></div>
+    <div class="dx-mono">${esc(dxWhen(c.lastRunAt))}</div>
+    <div><b class="dx-mono">${esc(c.deliver||'')}</b><div class="dx-sub">${esc(c.script||c.promptPreview||'sem script')}</div></div>
+    <div><span class="dx-tag">${c.noAgent?'script':'agente'}</span></div>
+  </div>`).join('');
+  return `<div class="ag-grid dx-rows">${head}${body}</div>`;
+}
+function dxAgendasSummary(d){
+  const ag=((d&&d.summary)||{}).agendas||{};
+  return `<div class="dx-overview-grid"><div class="dx-ocard"><h4>Agendas monitoradas</h4><div class="dx-ostat"><b>${ag.total||0}</b><span>eventos no período</span></div><div class="dx-ochips"><span class="dx-mini ok">${ag.confirmations||0} confirmações</span><span class="dx-mini">${ag.reminders||0} lembretes</span><span class="dx-mini warn">${ag.missingLinkOrFailures||0} atenção</span></div></div><div class="dx-ocard"><h4>Última execução</h4><div class="dx-ostat"><b>${esc(dxWhen(ag.lastRunAt))}</b></div><span class="dx-sub">Escopo: ${esc(ag.scope||'consolidado')}</span></div></div>`;
+}
+function dxContextCards(rows){
+  rows=(rows||[]);
+  if(!rows.length) return '<div class="ag-state"><b>Nenhum contexto recente encontrado.</b><span>Ajuste o período/busca.</span></div>';
+  return `<div class="dx-ctx-grid">${rows.slice(0,80).map(r=>`<div class="dx-ctx-card"><div class="dx-ctx-head"><b>${esc(r.title||r.source||'Contexto')}</b><span class="dx-mini">${esc(dxWhen(r.lastAt||r.when))}</span></div><div class="dx-ctx-meta"><span>${esc(r.source||'')}</span><span>${esc(r.thread||r.chat||'')}</span></div><div class="dx-ctx-prev">${esc(r.preview||r.snippet||'')}</div><div class="dx-ctx-crons">${(r.crons||[]).slice(0,4).map(x=>`<span class="dx-ctx-cron">${esc(x)}</span>`).join('')||'<span class="dx-sub">sem cron ligado explicitamente</span>'}</div></div>`).join('')}</div>`;
+}
+function dexterCentralBlock(){
+  const d=dexterData||{}, s=d.summary||{};
+  const tabs=[['overview','Visão geral','saúde + próximos ciclos'],['crons','Crons','rotinas e entregas'],['contexts','Contextos','chats e sessões'],['agendas','Agendas','controle de reuniões']];
+  const body=dexterLoading&&!dexterData?'<div class="ag-state"><span class="ag-spin"></span>Carregando Central do Dexter…</div>':(dexterError&&!dexterData?`<div class="ag-state ag-state-err"><b>Central indisponível.</b><span>${esc(dexterError)}</span></div>`:(dexterTab==='crons'?dxCronRows(d.crons||[]):(dexterTab==='contexts'?dxContextCards(d.contexts||[]):(dexterTab==='agendas'?dxAgendasSummary(d):dxOverview(d)))));
+  const subtitle=d.ok?`${s.cronsTotal||0} crons · ${s.contextsTotal||0} contextos · somente leitura`:(dexterLoading?'carregando inventário':'central read-only');
+  return `<div class="dx-panel mgmt-section" id="central-dexter"><div class="dispatch-head"><div><b>Central do Dexter</b><span>${esc(subtitle)}. Um lugar para entender o que roda, em qual chat, e qual contexto alimenta cada automação.</span></div><button class="bb-btn" onclick="refreshDexterCenter()" ${dexterLoading?'disabled':''}>${dexterLoading?'Atualizando…':'Atualizar'}</button></div>
+    <div class="dx-subtabs">${tabs.map(t=>`<button class="dx-subtab ${dexterTab===t[0]?'on':''}" onclick="setDexterTab('${t[0]}')"><b>${t[1]}</b><span>${t[2]}</span></button>`).join('')}</div>
+    <div class="focus-safe"><b>Somente leitura:</b> esta central não cria, pausa nem reativa cron; só materializa a configuração e os contextos que o Dexter já usa.</div>
+    ${body}
+  </div>`;
+}
+
+// --- Controle de agendas (/agendas) ------------------------------------------
+// Auditoria diária read-only do ciclo de agenda/diagnóstico. Lê /api/agendas
+// (ledger + estado do monitor); não envia WhatsApp nem escreve no HubSpot.
+function agendaQueryString(force){
+  const f=agendasFilters, p=new URLSearchParams();
+  p.set('days', f.days);
+  if(f.sdr && f.sdr!=='all') p.set('sdr', f.sdr);
+  if(f.kind && f.kind!=='all') p.set('kind', f.kind);
+  if(f.status && f.status!=='all') p.set('status', f.status);
+  if(f.search) p.set('search', f.search);
+  p.set('limit', f.limit);
+  return p.toString();
+}
+async function loadAgendas(force=false){
+  if(agendasLoading && !force) return;
+  agendasLoading=true; agendasError='';
+  if(viewMode==='agendas') drawAgendas();
+  try{
+    agendasData=await api('/api/agendas?'+agendaQueryString(force),{timeoutMs:15000});
+  }catch(e){
+    agendasError=String(e&&e.message||e);
+    agendasData=agendasData||{ok:false,rows:[],summary:{},meta:{}};
+  }
+  finally{ agendasLoading=false; }
+  if(viewMode==='agendas') drawAgendas();
+}
+function applyAgendaFilter(key,val){ agendasFilters[key]=val; loadAgendas(true); }
+const agendaSearchDebounced=debounce(()=>{ const el=document.getElementById('agSearch'); agendasFilters.search=el?el.value.trim():''; loadAgendas(true); }, 400);
+function clearAgendaFilters(){ agendasFilters={days:7, sdr:'all', kind:'all', status:'all', search:'', limit:200}; loadAgendas(true); }
+function agendaKindClass(kind){
+  return ({confirmacao:'ag-k-confirm',lembrete:'ag-k-lembrete',grupo:'ag-k-grupo',agenda:'ag-k-agenda',diagnostico:'ag-k-diag',complemento:'ag-k-compl'})[kind]||'ag-k-agenda';
+}
+function agendaStatusClass(status){
+  const s=String(status||'').toLowerCase();
+  if(s.indexOf('falh')>=0) return 'ag-s-fail';
+  if(s.indexOf('andamento')>=0) return 'ag-s-wait';
+  if(s.indexOf('time')>=0) return 'ag-s-group';
+  return 'ag-s-ok';
+}
+function agendaRelDay(iso){
+  if(!iso) return '';
+  try{ return new Date(iso).toLocaleDateString('pt-BR',{timeZone:'America/Sao_Paulo',day:'2-digit',month:'2-digit'}); }catch(e){ return ''; }
+}
+function agendaSummaryCards(){
+  const s=(agendasData&&agendasData.summary)||{};
+  const card=(value,label,extra)=>`<div class="ag-kpi ${extra||''}"><b>${value}</b><span>${label}</span></div>`;
+  const last=s.lastRunAt?hsDateTime(s.lastRunAt):'—';
+  return `<div class="ag-kpis">
+    ${card(s.total||0,'Eventos no período')}
+    ${card(s.confirmations||0,'Confirmações')}
+    ${card(s.reminders||0,'Lembretes')}
+    ${card(s.groupNotices||0,'Avisos ao time')}
+    ${card(s.missingLinkOrFailures||0,'Sem link / falhas', (s.missingLinkOrFailures||0)>0?'ag-kpi-warn':'')}
+    ${card(last,'Última execução')}
+  </div>`;
+}
+function agendaFiltersBar(){
+  const meta=(agendasData&&agendasData.meta)||{};
+  const f=agendasFilters;
+  const sdrOpts=(meta.sdrOptions||[]);
+  const statusOpts=(meta.statusOptions||[]);
+  const opt=(value,label,sel)=>`<option value="${esc(value)}" ${String(value)===String(sel)?'selected':''}>${esc(label)}</option>`;
+  const periodOpts=[{v:1,l:'Hoje'},{v:3,l:'3 dias'},{v:7,l:'7 dias'},{v:14,l:'14 dias'},{v:30,l:'30 dias'}];
+  const limitOpts=[50,100,200,500];
+  const active=(f.sdr!=='all'||f.kind!=='all'||f.status!=='all'||f.search||Number(f.days)!==7);
+  return `<div class="ag-filters">
+    <label>Período<select onchange="applyAgendaFilter('days',this.value)">${periodOpts.map(o=>opt(o.v,o.l,f.days)).join('')}</select></label>
+    <label>SDR<select onchange="applyAgendaFilter('sdr',this.value)">${opt('all','Todos os SDRs',f.sdr)}${sdrOpts.map(o=>opt(o,o,f.sdr)).join('')}</select></label>
+    <label>Tipo<select onchange="applyAgendaFilter('kind',this.value)">${opt('all','Todos os tipos',f.kind)}${AGENDA_KIND_OPTIONS.map(o=>opt(o.key,o.label,f.kind)).join('')}</select></label>
+    <label>Status<select onchange="applyAgendaFilter('status',this.value)">${opt('all','Todos',f.status)}${statusOpts.map(o=>opt(o,o,f.status)).join('')}</select></label>
+    <label class="ag-search-field">Busca<input id="agSearch" type="search" value="${esc(f.search||'')}" placeholder="Empresa, lead, telefone…" oninput="agendaSearchDebounced()"></label>
+    <label>Limite<select onchange="applyAgendaFilter('limit',this.value)">${limitOpts.map(o=>opt(o,o,f.limit)).join('')}</select></label>
+    <div class="ag-filter-actions">
+      <button class="ag-btn" onclick="loadAgendas(true)" ${agendasLoading?'disabled':''}>${agendasLoading?'Atualizando…':'Atualizar'}</button>
+      ${active?'<button class="ag-btn ghost" onclick="clearAgendaFilters()">Limpar</button>':''}
+    </div>
+  </div>`;
+}
+function agendaRow(r){
+  const company=esc(r.company||'—');
+  const lead=r.lead?`<span class="ag-lead">${esc(r.lead)}</span>`:'';
+  const phone=r.phoneMasked?`<span class="ag-phone">${esc(r.phoneMasked)}</span>`:'';
+  const meetingId=r.meetingId?`<span class="ag-mid" title="Identificador da agenda">#${esc(r.meetingId)}</span>`:'';
+  const linkWarn=(!r.hasLink && (r.kind==='confirmacao'||r.kind==='lembrete'||r.kind==='agenda'))?'<span class="ag-flag" title="Mensagem sem link de reunião">sem link</span>':'';
+  const action=r.hubspotDealUrl?`<a class="ag-link" href="${esc(r.hubspotDealUrl)}" target="_blank" rel="noopener noreferrer">Abrir negócio</a>`:'<span class="ag-dash">—</span>';
+  return `<div class="ag-row">
+    <div class="ag-col ag-c-when" data-label="Envio"><b>${esc(hsDateTime(r.sentAt))}</b><span>${meetingId}</span></div>
+    <div class="ag-col ag-c-meeting" data-label="Agenda">${r.meetingAt?`<b>${esc(hsDateTime(r.meetingAt))}</b>`:'<span class="ag-dash">sem data</span>'}</div>
+    <div class="ag-col ag-c-sdr" data-label="SDR / chip">${esc(r.sdr||'—')}<span class="ag-chip-mini">${esc(r.chip||'')}</span></div>
+    <div class="ag-col ag-c-lead" data-label="Lead / empresa"><b>${company}</b>${lead}${phone}</div>
+    <div class="ag-col ag-c-kind" data-label="Tipo"><span class="ag-chip ${agendaKindClass(r.kind)}">${esc(r.kindLabel||r.kind||'')}</span></div>
+    <div class="ag-col ag-c-status" data-label="Status"><span class="ag-chip ${agendaStatusClass(r.status)}">${esc(r.status||'')}</span>${linkWarn}</div>
+    <div class="ag-col ag-c-msg" data-label="Mensagem enviada"><span class="ag-msg" title="${esc(r.messagePreview||'')}">${esc(r.messagePreview||'—')}</span></div>
+    <div class="ag-col ag-c-action" data-label="Evidência">${action}</div>
+  </div>`;
+}
+function agendaGrid(){
+  const d=agendasData;
+  if(agendasLoading && (!d||!d.rows||!d.rows.length)){
+    return `<div class="ag-grid"><div class="ag-state"><span class="ag-spin"></span>Carregando controle de agendas…</div></div>`;
+  }
+  if(agendasError && (!d||!d.rows||!d.rows.length)){
+    return `<div class="ag-grid"><div class="ag-state ag-state-err"><b>Não foi possível carregar as agendas.</b><span>${esc(agendasError)}</span><button class="ag-btn" onclick="loadAgendas(true)">Tentar de novo</button></div></div>`;
+  }
+  const rows=(d&&d.rows)||[];
+  if(!rows.length){
+    return `<div class="ag-grid"><div class="ag-state"><b>Nenhuma agenda no filtro atual.</b><span>Ajuste o período ou limpe os filtros para ver mais eventos.</span></div></div>`;
+  }
+  const head=`<div class="ag-row ag-head">
+    <div class="ag-col ag-c-when">Envio</div>
+    <div class="ag-col ag-c-meeting">Agenda</div>
+    <div class="ag-col ag-c-sdr">SDR / chip</div>
+    <div class="ag-col ag-c-lead">Lead / empresa</div>
+    <div class="ag-col ag-c-kind">Tipo</div>
+    <div class="ag-col ag-c-status">Status</div>
+    <div class="ag-col ag-c-msg">Mensagem enviada</div>
+    <div class="ag-col ag-c-action">Evidência</div>
+  </div>`;
+  const shown=(d&&d.summary&&d.summary.shown)||rows.length;
+  const total=(d&&d.summary&&d.summary.total)||rows.length;
+  const note=total>shown?`<div class="ag-grid-foot">Mostrando ${shown} de ${total} eventos. Aumente o limite para ver mais.</div>`:`<div class="ag-grid-foot">${shown} evento${shown===1?'':'s'} no período.</div>`;
+  return `<div class="ag-grid">${head}<div class="ag-rows">${rows.map(agendaRow).join('')}</div>${note}</div>`;
+}
+// Corpo da subaba "Agendas": preserva o datagrid/filtros já existentes.
+function agendaBodyHtml(){
+  const d=agendasData;
+  const scope=(d&&d.meta&&d.meta.scope)||'';
+  const stale=(d&&d.configured===false)?`<div class="ag-banner">Ainda não há registro local de agendas para auditar.</div>`:'';
+  return `<div class="ag-panel">
+    <div class="ag-head-row">
+      <div class="ag-title"><h2>Preparo para diagnóstico</h2><span>Agenda, confirmação, link e contexto para preparar o SDR antes do diagnóstico ou introdução.</span></div>
+      <div class="ag-scope">${scope?esc(scope):''}</div>
+    </div>
+    ${stale}
+    ${agendaSummaryCards()}
+    ${agendaFiltersBar()}
+    ${agendaGrid()}
+  </div>`;
+}
+// --- Centralizador Dexter: subtabs internas da rota única /agendas ------------
+const DEXTER_SUBTABS=[
+  {key:'overview',label:'Visão geral',hint:'Resumo de agendas, crons e contexto'},
+  {key:'agendas',label:'Agendas',hint:'Controle de agendas e mensagens'},
+  {key:'crons',label:'Crons',hint:'Execuções agendadas do Dexter'},
+  {key:'contextos',label:'Contextos',hint:'Chats e sessões recentes'},
+];
+async function loadDexterCenter(force=false){
+  if(dexterLoading && !force) return;
+  dexterLoading=true; dexterError='';
+  if(viewMode==='agendas') drawDexterBody();
+  try{
+    const f=dexterFilters, p=new URLSearchParams();
+    p.set('days', f.days); p.set('limit', f.limit);
+    if(f.search) p.set('search', f.search);
+    dexterData=await api('/api/dexter-center?'+p.toString(),{timeoutMs:15000});
+  }catch(e){
+    dexterError=String(e&&e.message||e);
+    dexterData=dexterData||{ok:false,crons:[],contexts:[],summary:{}};
+  }
+  finally{ dexterLoading=false; }
+  if(viewMode==='agendas') drawDexterBody();
+}
+function setDexterTab(key){
+  dexterTab=String(key||'overview');
+  if(dexterTab==='agendas'){ if(!agendasData && !agendasLoading) loadAgendas(); }
+  else if(!dexterData && !dexterLoading){ loadDexterCenter(); }
+  drawAgendas();
+}
+const dexterSearchDebounced=debounce(()=>{ const el=document.getElementById('dxSearch'); dexterFilters.search=el?el.value.trim():''; loadDexterCenter(true); }, 400);
+function applyDexterFilter(key,val){ dexterFilters[key]=val; loadDexterCenter(true); }
+function toggleDexterDetail(id){ dexterExpanded[id]=!dexterExpanded[id]; drawDexterBody(); }
+function dexterSubtabs(){
+  return `<div class="dx-subtabs">`+DEXTER_SUBTABS.map(t=>`<button class="dx-subtab ${dexterTab===t.key?'on':''}" onclick="setDexterTab('${t.key}')"><b>${esc(t.label)}</b><span>${esc(t.hint)}</span></button>`).join('')+`</div>`;
+}
+function dxStatusClass(c){ if(c.hasError) return 'err'; if(c.paused) return 'warn'; return 'ok'; }
+function dxStatusLabel(c){ if(c.hasError) return 'Erro'; if(c.paused) return 'Pausado'; return 'Ativo'; }
+function dexterOverviewHtml(){
+  const d=dexterData;
+  if(dexterLoading && !d) return `<div class="ag-grid"><div class="ag-state"><span class="ag-spin"></span>Carregando central…</div></div>`;
+  if(dexterError && !d) return `<div class="ag-grid"><div class="ag-state ag-state-err"><b>Não foi possível carregar a central.</b><span>${esc(dexterError)}</span><button class="ag-btn" onclick="loadDexterCenter(true)">Tentar de novo</button></div></div>`;
+  const s=(d&&d.summary)||{}, ag=s.agendas||{};
+  const crons=(d&&d.crons)||[], ctx=(d&&d.contexts)||[];
+  const topCrons=crons.slice().sort((a,b)=>String(a.nextRunAt||'').localeCompare(String(b.nextRunAt||''))).filter(c=>!c.paused).slice(0,4);
+  const recentCtx=ctx.slice(0,4);
+  const cronCard=`<div class="dx-ocard"><h4>Crons</h4>
+    <div class="dx-ostat"><b>${s.cronsTotal||0}</b><span>execuções agendadas</span></div>
+    <div class="dx-ochips"><span class="dx-mini ok">${s.cronsEnabled||0} ativos</span><span class="dx-mini warn">${s.cronsPaused||0} pausados</span><span class="dx-mini ${(s.cronsErrors||0)>0?'err':''}">${s.cronsErrors||0} com erro</span></div>
+    <div class="dx-olist">${topCrons.length?topCrons.map(c=>`<div class="dx-oitem"><b>${esc(c.name)}</b><span>${esc(c.scheduleDisplay||'')} · próximo ${esc(hsDateTime(c.nextRunAt)||'—')}</span></div>`).join(''):'<div class="dx-oitem"><span>Sem crons ativos.</span></div>'}</div></div>`;
+  const agCard=`<div class="dx-ocard"><h4>Agendas</h4>
+    <div class="dx-ostat"><b>${ag.total||0}</b><span>eventos no período</span></div>
+    <div class="dx-ochips"><span class="dx-mini">${ag.confirmations||0} confirmações</span><span class="dx-mini">${ag.reminders||0} lembretes</span><span class="dx-mini ${(ag.missingLinkOrFailures||0)>0?'warn':''}">${ag.missingLinkOrFailures||0} sem link/falhas</span></div>
+    <div class="dx-olist"><div class="dx-oitem"><b>${esc(ag.scope||'—')}</b><span>Última execução ${esc(ag.lastRunAt?hsDateTime(ag.lastRunAt):'—')}</span></div></div></div>`;
+  const ctxCard=`<div class="dx-ocard"><h4>Contextos recentes</h4>
+    <div class="dx-ostat"><b>${s.contextsRecent||0}</b><span>chats / sessões</span></div>
+    <div class="dx-olist">${recentCtx.length?recentCtx.map(c=>`<div class="dx-oitem"><b>${esc(c.title)}</b><span>${esc(c.source||'')} · ${esc(c.startedAt?hsDateTime(c.startedAt):'')}</span></div>`).join(''):'<div class="dx-oitem"><span>Nenhum contexto recente.</span></div>'}</div></div>`;
+  const note=`<div class="ag-banner">Rotinas e follow-ups serão consolidados aqui nesta central.</div>`;
+  return `<div class="dx-overview-grid">${agCard}${cronCard}${ctxCard}</div>${note}`;
+}
+function dexterCronRow(c){
+  const cls=dxStatusClass(c), paused=c.paused?'paused':'';
+  const tags=[]; if(c.noAgent) tags.push('script'); else tags.push('agente');
+  (c.skills||[]).slice(0,2).forEach(s=>tags.push(s));
+  const origin=(c.origin&&(c.origin.chatName||c.origin.platform))||'';
+  const id=esc(c.id||c.name);
+  const open=dexterExpanded[c.id];
+  const detail=open?`<div class="dx-detail">
+    <div><b>Script:</b> ${esc(c.script||'—')} · <b>Workdir:</b> ${esc(c.workdir||'—')}</div>
+    <div><b>Origem:</b> ${esc(origin||'—')}${c.origin&&c.origin.threadId?` · thread ${esc(c.origin.threadId)}`:''}</div>
+    ${c.runsCompleted!=null?`<div><b>Execuções concluídas:</b> ${c.runsCompleted}</div>`:''}
+    ${c.pausedReason?`<div><b>Motivo da pausa:</b> ${esc(c.pausedReason)}</div>`:''}
+    ${c.promptPreview?`<div><b>Resumo:</b> ${esc(c.promptPreview)}</div>`:''}
+  </div>`:'';
+  return `<div class="dx-cron-row ${paused}">
+    <div class="dx-cname"><b>${esc(c.name)}</b><small>${esc(origin||c.script||'')}</small><div class="dx-tags">${tags.map(t=>`<span class="dx-tag">${esc(t)}</span>`).join('')}</div></div>
+    <div><span class="ag-chip ${cls==='ok'?'ag-s-ok':(cls==='warn'?'ag-s-wait':'ag-s-fail')}">${dxStatusLabel(c)}</span></div>
+    <div class="dx-mono">${esc(c.scheduleDisplay||'—')}<span class="dx-sub">último ${esc(c.lastRunAt?hsDateTime(c.lastRunAt):'—')}</span></div>
+    <div class="dx-mono">${esc(c.nextRunAt?hsDateTime(c.nextRunAt):'—')}<span class="dx-sub">status ${esc(c.lastStatus||'—')}</span></div>
+    <div class="dx-mono">${esc(c.deliver||'—')}<span class="dx-sub">${esc(c.script||'')}</span></div>
+    <div><button class="dx-detbtn" onclick="toggleDexterDetail('${id}')">${open?'ocultar':'ver detalhes'}</button></div>
+    ${detail}
+  </div>`;
+}
+function dexterCronsHtml(){
+  const d=dexterData;
+  if(dexterLoading && !d) return `<div class="ag-grid"><div class="ag-state"><span class="ag-spin"></span>Carregando crons…</div></div>`;
+  if(dexterError && !d) return `<div class="ag-grid"><div class="ag-state ag-state-err"><b>Não foi possível carregar os crons.</b><span>${esc(dexterError)}</span><button class="ag-btn" onclick="loadDexterCenter(true)">Tentar de novo</button></div></div>`;
+  const crons=(d&&d.crons)||[];
+  const head=`<div class="dx-cron-row head"><div>Cron</div><div>Estado</div><div>Agenda</div><div>Próximo run</div><div>Destino / script</div><div></div></div>`;
+  const body=crons.length?crons.map(dexterCronRow).join(''):`<div class="ag-state"><b>Nenhum cron encontrado.</b><span>Ajuste a busca para ver mais execuções.</span></div>`;
+  return `${dexterFilterBar('Buscar cron por nome, script ou chat…')}<div class="ag-grid">${head}<div class="dx-rows">${body}</div><div class="ag-grid-foot">${crons.length} cron${crons.length===1?'':'s'} · somente leitura</div></div>`;
+}
+function dexterContextCard(c){
+  const crons=(c.linkedCrons||[]);
+  const prev=c.lastPreview||c.firstPreview||'';
+  return `<div class="dx-ctx-card">
+    <div class="dx-ctx-head"><b>${esc(c.title)}</b><span class="dx-mini">${esc(c.source||'')}</span></div>
+    <div class="dx-ctx-meta"><span>${esc(c.startedAt?hsDateTime(c.startedAt):'')}</span><span>· ${c.messageCount||0} msgs</span>${c.toolCallCount?`<span>· ${c.toolCallCount} ações</span>`:''}${c.threadId?`<span>· thread ${esc(c.threadId)}</span>`:''}</div>
+    ${prev?`<div class="dx-ctx-prev">${esc(prev)}</div>`:''}
+    ${crons.length?`<div class="dx-ctx-crons">${crons.map(k=>`<span class="dx-ctx-cron" title="Cron que roda deste contexto">${esc(k.name)}</span>`).join('')}</div>`:''}
+  </div>`;
+}
+function dexterContextsHtml(){
+  const d=dexterData;
+  if(dexterLoading && !d) return `<div class="ag-grid"><div class="ag-state"><span class="ag-spin"></span>Carregando contextos…</div></div>`;
+  if(dexterError && !d) return `<div class="ag-grid"><div class="ag-state ag-state-err"><b>Não foi possível carregar os contextos.</b><span>${esc(dexterError)}</span><button class="ag-btn" onclick="loadDexterCenter(true)">Tentar de novo</button></div></div>`;
+  const ctx=(d&&d.contexts)||[];
+  const body=ctx.length?`<div class="dx-ctx-grid">${ctx.map(dexterContextCard).join('')}</div>`:`<div class="ag-grid"><div class="ag-state"><b>Nenhum contexto recente.</b><span>Aumente o período para ver mais chats/sessões.</span></div></div>`;
+  return `${dexterFilterBar('Buscar contexto por título, chat ou origem…')}${body}`;
+}
+function dexterFilterBar(placeholder){
+  const f=dexterFilters;
+  const opt=(v,l)=>`<option value="${v}" ${Number(f.days)===v?'selected':''}>${l}</option>`;
+  return `<div class="ag-filters">
+    <label>Período<select onchange="applyDexterFilter('days',this.value)">${opt(7,'7 dias')}${opt(14,'14 dias')}${opt(30,'30 dias')}${opt(60,'60 dias')}</select></label>
+    <label class="ag-search-field">Busca<input id="dxSearch" type="search" value="${esc(f.search||'')}" placeholder="${esc(placeholder||'Buscar…')}" oninput="dexterSearchDebounced()"></label>
+    <div class="ag-filter-actions"><button class="ag-btn" onclick="loadDexterCenter(true)" ${dexterLoading?'disabled':''}>${dexterLoading?'Atualizando…':'Atualizar'}</button></div>
+  </div>`;
+}
+function dexterBodyHtml(){
+  if(dexterTab==='agendas') return agendaBodyHtml();
+  if(dexterTab==='crons') return dexterCronsHtml();
+  if(dexterTab==='contextos') return dexterContextsHtml();
+  return dexterOverviewHtml();
+}
+function drawDexterBody(){
+  const el=document.getElementById('dxBody'); if(!el){ drawAgendas(); return; }
+  el.innerHTML=dexterBodyHtml();
+}
+function drawAgendas(){
+  const el=document.getElementById('cards'); if(!el) return;
+  const qt=document.getElementById('queueTitle'); if(qt) qt.textContent='Agendas';
+  const qc=document.getElementById('queueCount');
+  if(qc) qc.textContent='Preparo SDR para diagnóstico';
+  el.innerHTML=`<div class="dx-panel">
+    ${agendaBodyHtml()}
+  </div>`;
 }
 // --- Prévia read-only do limbo de Primeiro Contato / cadência segura ----------
 async function loadCadenciaPreview(force){
@@ -9734,7 +14276,7 @@ function applyReadonlyComposer(c){
   if(!help){ help=document.createElement('div'); help.id='readonlyHelp'; help.className='readonly-help'; const host=document.querySelector('.conversation .composer'); if(host) host.insertBefore(help, host.firstChild); }
   if(help){
     help.hidden=!ro;
-    help.innerHTML=ro?`<b>Somente leitura:</b> envio feito por ${esc(senderLabel(c))} para lead do SDR ${esc(leadOwnerLabel(c))}. Esta tela é só auditoria; para responder, abra a conversa/carteira do SDR responsável.`:'';
+    help.innerHTML=ro?`<b>${INBOX_COPY.readonlyTitle}</b> ${esc(INBOX_COPY.readonlyExplainer(senderLabel(c), leadOwnerLabel(c)))}`:'';
   }
 }
 
@@ -9744,7 +14286,7 @@ async function transcribePendingAudioForActive(convId){
   try{
     await api('/api/transcribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conv:convId,msgId:m.id})});
     if(active!==convId) return;
-    const d=await api('/api/messages?conv='+encodeURIComponent(convId));
+    const d=await api('/api/messages?conv='+encodeURIComponent(convId), {timeoutMs:22000});
     if(active!==convId) return;
     msgs=d.messages||[];
     msgsConvId=convId;
@@ -9795,10 +14337,13 @@ async function openConv(id, keep){
       if(active===id) tl.innerHTML=`<div class="empty"><b>Carregando mensagens…</b><span>Se houver áudio, ele aparece primeiro e a transcrição vem em seguida.</span></div>`;
     },350);
     // Guardrail mobile: nunca deixar a tela detalhe presa indefinidamente nesse texto.
-    safetyTimer=setTimeout(()=>{ if(active===id) showMessageLoadError('Ainda não recebi resposta do servidor. Tente novamente ou puxe para atualizar a tela.'); },11000);
+    // Deve ficar MAIOR que o timeout de /api/messages: o backend pode aguardar
+    // singleflight por até 9s em picos de envio/cache frio, e o cliente não pode
+    // mostrar falha antes da requisição longa terminar.
+    safetyTimer=setTimeout(()=>{ if(active===id) showMessageLoadError('Ainda não recebi resposta do servidor. Tente novamente ou puxe para atualizar a tela.'); },24000);
   }
   try{
-    const d=await api('/api/messages?conv='+encodeURIComponent(id));
+    const d=await api('/api/messages?conv='+encodeURIComponent(id), {timeoutMs:22000});
     if(loadingTimer) clearTimeout(loadingTimer); if(safetyTimer) clearTimeout(safetyTimer);
     if(active!==id) return;
     msgs=d.messages||[];
@@ -9873,6 +14418,44 @@ function setSending(on){
   if(btn){ btn.disabled=!!on; const lbl=document.getElementById('sendLabel'); if(lbl) lbl.textContent=on?'Enviando…':'Enviar'; }
   const ta=document.getElementById('composer'); if(ta) ta.disabled=!!on;
   const attach=document.getElementById('attachBtn'); if(attach) attach.disabled=!!on;
+}
+function newConversationPorts(){
+  const blocked=new Set([4600,4606,4607,4609,4610]);
+  return ((me&&me.ports)||[]).filter(p=>p&&p.port&&!blocked.has(+p.port));
+}
+function closeNewConversation(){ const m=document.getElementById('newConvModal'); if(m) m.hidden=true; }
+function openNewConversation(){
+  if(viewMode!=='conversas') setViewMode('conversas');
+  const modal=document.getElementById('newConvModal'), body=document.getElementById('newConvBody'); if(!modal||!body) return;
+  const ports=newConversationPorts();
+  if(!ports.length){ body.innerHTML='<div class="empty"><b>Nenhum chip de envio permitido</b><span>Chips institucionais/pessoais ficam somente leitura no Channel.</span></div>'; modal.hidden=false; return; }
+  const opts=ports.map(p=>`<option value="${+p.port}">${esc(p.label||chipLabel(p.port))}${p.paused?' (pausado)':''}</option>`).join('');
+  body.innerHTML=`<div class="new-conv-form">
+    <label>Chip de envio<select id="newConvPort">${opts}</select></label>
+    <label>Telefone do lead<input id="newConvPhone" inputmode="tel" placeholder="(11) 99999-9999"></label>
+    <label>Mensagem inicial<textarea id="newConvText" rows="5" placeholder="Escreva a primeira mensagem. Ela será enviada pelo WhatsApp e abrirá a conversa na lista."></textarea></label>
+    <div class="new-conv-actions"><button onclick="closeNewConversation()">Cancelar</button><button class="primary" id="newConvSend" onclick="sendNewConversation()">Enviar e abrir conversa</button></div>
+    <div class="new-conv-hint">Seguro: não envia por chip institucional e não cria conversa fantasma sem mensagem real.</div>
+  </div>`;
+  modal.hidden=false;
+  setTimeout(()=>document.getElementById('newConvPhone')?.focus(),40);
+}
+async function sendNewConversation(){
+  const btn=document.getElementById('newConvSend');
+  const port=+(document.getElementById('newConvPort')?.value||0);
+  const phone=(document.getElementById('newConvPhone')?.value||'').trim();
+  const text=(document.getElementById('newConvText')?.value||'').trim();
+  if(!phone) return alert('Informe o telefone do lead.');
+  if(!text) return alert('Escreva a mensagem inicial.');
+  if(btn){ btn.disabled=true; btn.textContent='Enviando…'; }
+  try{
+    const r=await api('/api/start-conversation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port,phone,text,clientMessageId:newClientMessageId()})});
+    closeNewConversation();
+    await loadAll();
+    const convId=r.conv || `${port}::${String(r.to||'')}`;
+    if(convId) await openConv(convId,false);
+  }catch(e){ alert('Falha ao iniciar conversa: '+(e&&e.message?e.message:e)); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent='Enviar e abrir conversa'; } }
 }
 async function sendReply(){
   if(sendInFlight) return;
@@ -9958,15 +14541,17 @@ function refreshInboxNewOnly(){
 async function loadAll(opts={}){
   // Em telas analíticas, não recalcule a inbox inteira em background.
   // Foco/Gestão têm rota e carga própria; competir com /api/messages derrubava fluidez.
-  if((viewMode==='foco'||viewMode==='gestao') && !opts.force && opts.fast){
-    if(!pipelineFocus && !pipelineFocusLoading) loadPipelineFocus();
+  if((viewMode==='foco'||viewMode==='gestao'||viewMode==='agendas'||viewMode==='rotinas') && !opts.force && opts.fast){
+    if((viewMode==='foco'||viewMode==='gestao') && !pipelineFocus && !pipelineFocusLoading) loadPipelineFocus();
+    if(viewMode==='agendas' && !agendasData && !agendasLoading) loadAgendas();
+    if(viewMode==='rotinas' && me && canUseRotinas() && !rotinasData && !rotinasLoading) loadRotinas();
     updateLiveStatus();
     return;
   }
   // CH-RT: a inbox precisa refletir diagnóstico/primeiro contato quase em tempo real.
-  // Antes o polling era 15s e sempre puxava blocos pesados; no mobile parecia que
-  // precisava F5. Agora /api/conversations roda rápido (3s quando visível) e as
-  // cargas pesadas continuam no máximo a cada 30s.
+  // O polling visível roda leve a cada 45s; mudanças externas de ledger/history
+  // antecipam o refresh pelo deps_mtime no backend sem recompute síncrono pesado.
+  // Cargas completas de apoio continuam espaçadas para preservar fluidez no mobile.
   if(loadAllInFlight && !opts.force) return;
   loadAllInFlight=true;
   if(opts.preserveListScroll) pendingListScrollRestore=(getListScroller()&&getListScroller().scrollTop)||0;
@@ -9994,6 +14579,10 @@ async function loadAll(opts={}){
     // Card novo no topo: marca antes de desenhar para o destaque já sair no 1º draw.
     if(prevFirst && convs[0] && convs[0].id!==prevFirst && viewMode==='conversas') markNewTop(convs[0].id);
     portMeta={}; (me.ports||[]).forEach(p=>portMeta[p.port]=p);
+    updateNavigationAccess();
+    if(viewMode==='rotinas' && !canUseRotinas()){
+      setViewMode('conversas');
+    }
     document.getElementById('meName').textContent=me.name;
     document.getElementById('meSub').textContent=(me.admin?'Admin · ':(me.view_all?'Supervisor · ':''))+(me.ports||[]).length+' conexões';
     const ava=document.getElementById('meAva'); ava.textContent=initials(me.name); ava.style.background=colorFor(me.name);
@@ -10054,6 +14643,20 @@ def conversation_from_cache(uid, conv_id):
                 return c
     return None
 
+
+def conversations_cache_should_refresh(cache, now, deps_mtime):
+    """Decide quando /api/conversations deve recomputar em background.
+
+    TTL alto protege performance. deps_mtime baixo protege frescor: crons e bridges
+    alteram ledger/history por fora do processo web, então a lista precisa perceber
+    fonte nova antes do TTL cego sem recomputar síncrono no request público.
+    """
+    cache_age = now - float((cache or {}).get('ts', 0) or 0)
+    cached_deps = float((cache or {}).get('deps_mtime') or 0)
+    return cache_age >= CONVERSATIONS_API_TTL or (
+        cached_deps < float(deps_mtime or 0)
+        and cache_age >= CONVERSATIONS_MIN_REFRESH_INTERVAL
+    )
 
 def background_refresh_conversations(uid, cache_key):
     def run():
@@ -10227,6 +14830,11 @@ class H(BaseHTTPRequestHandler):
             if path in APP_ROUTES: return self.redirect('/login')
             return self.sendb(403, b'Acesso negado. Faca login em /login.\n', 'text/plain; charset=utf-8')
         if path in APP_ROUTES:
+            if APP_ROUTES.get(path) == 'rotinas' and not rotinas_access_allowed(uid):
+                # Não deixar SDRs (ex.: Breno) caírem numa tela de erro ao acessar
+                # /rotinas por link antigo/aba aberta; a navegação normal já esconde
+                # Rotinas para não-Rafael e volta para Conversas.
+                return self.redirect('/conversas')
             refresh_session = build_cookie(SESSION_COOKIE, make_session(uid), SESSION_TTL, request_is_https(self), same_site='None')
             return self.sendb(200, HTML.encode(), 'text/html; charset=utf-8', cookies=[refresh_session])
         if path in ('/api/conversations','/api/conversations-safe'):
@@ -10243,7 +14851,7 @@ class H(BaseHTTPRequestHandler):
                 # Se já existe qualquer cache, devolve stale imediatamente e atualiza
                 # em background. Só a primeira carga sem cache pode calcular síncrona.
                 cache_age = now-cache.get('ts',0)
-                if cache_age >= CONVERSATIONS_API_TTL or (float(cache.get('deps_mtime') or 0) < deps_mtime and cache_age >= CONVERSATIONS_MIN_REFRESH_INTERVAL):
+                if conversations_cache_should_refresh(cache, now, deps_mtime):
                     background_refresh_conversations(uid, cache_key)
                 body=json.dumps({'user':user_payload, 'conversations':cache['conversations']}, ensure_ascii=False).encode()
                 return self.sendb(200, body)
@@ -10352,12 +14960,30 @@ class H(BaseHTTPRequestHandler):
         if path=='/api/ops-health-summary':
             # Cockpit leve de garantia operacional. Só lê arquivos/cache; sem HubSpot/WhatsApp.
             return self.sendb(200, json.dumps(ops_health_summary(uid), ensure_ascii=False).encode())
+        if path=='/api/proatividade-summary':
+            return self.sendb(200, json.dumps(proatividade_summary(uid), ensure_ascii=False).encode())
+        if path=='/api/proatividade-config':
+            return self.sendb(200, json.dumps({'ok': True, 'config': proatividade_config()}, ensure_ascii=False).encode())
         if path=='/api/dispatch-stats':
             # Gestão operacional: volume de mensagens disparadas por dia/chip.
             # Fonte local read-only: controle/wpp_envios.json. Sem bridge/HubSpot.
             qs=parse_qs(parsed.query)
             _force=str((qs.get('force') or [''])[0]).lower() in ('1','true','yes')
             return self.sendb(200, json.dumps(dispatch_stats(uid, (qs.get('days') or [14])[0], force=_force), ensure_ascii=False).encode())
+        if path=='/api/agendas':
+            # Controle de agendas: auditoria read-only do ciclo de agenda/diagnóstico.
+            # Fontes locais (ledger + estado do monitor). Sem bridge/HubSpot/escrita.
+            qs=parse_qs(parsed.query)
+            g=lambda k,d='':(qs.get(k) or [d])[0]
+            return self.sendb(200, json.dumps(agendas_report(uid, g('days',7), g('sdr'), g('kind'), g('status'), g('search'), g('limit',200)), ensure_ascii=False).encode())
+        if path=='/api/dexter-center':
+            # Centralizador Dexter (subabas Crons/Contextos da tela /agendas).
+            # Read-only: lê jobs.json e state.db do Hermes; não cria/edita cron,
+            # não envia WhatsApp, não escreve no HubSpot. Resumo seguro, sem prompt
+            # completo, token ou JID cru.
+            qs=parse_qs(parsed.query)
+            g=lambda k,d='':(qs.get(k) or [d])[0]
+            return self.sendb(200, json.dumps(dexter_center_report(uid, g('days',14), g('search'), g('limit',80)), ensure_ascii=False).encode())
         if path=='/api/cadencia/preview':
             # CH: prévia read-only do limbo de Primeiro Contato. Apenas lê o JSON do
             # dry-run (NÃO roda o script, NÃO envia WhatsApp, NÃO escreve HubSpot).
@@ -10367,9 +14993,25 @@ class H(BaseHTTPRequestHandler):
             # CH: decisões humanas LOCAIS do limbo de Primeiro Contato (read-only aqui).
             # SDR vê só a própria carteira; supervisor/admin vê tudo. Sem side-effects.
             return self.sendb(200, json.dumps(cadencia_decisoes_scoped(uid), ensure_ascii=False).encode())
+        if path=='/api/rotinas/config':
+            if not rotinas_access_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'rotinas_forbidden'}, ensure_ascii=False).encode())
+            return self.sendb(200, json.dumps({'ok': True, 'config': rotinas_config(), 'journeys': ROTINAS_JOURNEY_DEFS}, ensure_ascii=False).encode())
+        if path=='/api/rotinas/summary':
+            # Central de rotinas do Rafael: read-only, sem ações perigosas.
+            if not rotinas_access_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'rotinas_forbidden'}, ensure_ascii=False).encode())
+            return self.sendb(200, json.dumps(rotinas_summary(uid), ensure_ascii=False).encode())
+        if path=='/api/followups-dashboard':
+            # FOLLOWUPS: cockpit Rafael-only de qualificação/execução. Read-only.
+            if not followups_access_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'followups_forbidden'}, ensure_ascii=False).encode())
+            qs=parse_qs(parsed.query)
+            limit=(qs.get('limit') or [160])[0]
+            return self.sendb(200, json.dumps(followups_dashboard(uid, limit), ensure_ascii=False).encode())
         if path=='/api/admin/users':
-            if not USERS.get(uid,{}).get('admin'):
-                return self.sendb(403, json.dumps({'ok':False,'error':'admin_required'}).encode())
+            if not chip_management_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'chip_management_required'}).encode())
             paused=load_paused_ports()
             return self.sendb(200, json.dumps({'ok':True,'users':users_public(),'ports':[{'port':p, **cfg, 'paused': int(p) in paused} for p,cfg in sorted(PORTS.items())]}, ensure_ascii=False).encode())
         if path=='/api/hubspot':
@@ -10398,7 +15040,7 @@ class H(BaseHTTPRequestHandler):
             qs=parse_qs(parsed.query)
             try: port=int((qs.get('port') or [0])[0])
             except Exception: port=0
-            if port not in effective_ports(uid):
+            if port not in manageable_ports(uid):
                 return self.sendb(403, b'Chip nao permitido', 'text/plain; charset=utf-8')
             if path=='/qr.png':
                 try:
@@ -10438,9 +15080,29 @@ class H(BaseHTTPRequestHandler):
         global USERS, PORTS, INSTITUTIONAL_PRIVATE_PORTS
         parsed=urlparse(self.path); uid=self.auth()
         if not uid: return self.sendb(403,b'Acesso negado','text/plain')
+        if parsed.path=='/api/rotinas/config':
+            if not rotinas_access_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'rotinas_forbidden'}, ensure_ascii=False).encode())
+            try:
+                n=int(self.headers.get('Content-Length','0') or 0)
+                body=json.loads(self.rfile.read(n).decode() or '{}') if n>0 else {}
+                cfg=save_rotinas_config(body)
+                return self.sendb(200, json.dumps({'ok':True,'config':cfg}, ensure_ascii=False).encode())
+            except Exception as e:
+                return self.sendb(400, json.dumps({'ok':False,'error':type(e).__name__}, ensure_ascii=False).encode())
+        if parsed.path=='/api/proatividade-config':
+            if not user_can_view_all(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'supervisor_required'}, ensure_ascii=False).encode())
+            try:
+                n=int(self.headers.get('Content-Length','0') or 0)
+                body=json.loads(self.rfile.read(n).decode() or '{}') if n>0 else {}
+                cfg=save_proatividade_config(body)
+                return self.sendb(200, json.dumps({'ok':True,'config':cfg}, ensure_ascii=False).encode())
+            except Exception as e:
+                return self.sendb(400, json.dumps({'ok':False,'error':type(e).__name__}, ensure_ascii=False).encode())
         if parsed.path=='/api/admin/ports':
-            if not USERS.get(uid,{}).get('admin'):
-                return self.sendb(403, json.dumps({'ok':False,'error':'admin_required'}).encode())
+            if not chip_management_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'chip_management_required'}).encode())
             try:
                 n=int(self.headers.get('Content-Length','0') or 0)
                 body=json.loads(self.rfile.read(n).decode() or '{}') if n>0 else {}
@@ -10458,7 +15120,17 @@ class H(BaseHTTPRequestHandler):
                     # cria/atualiza usuário operacional do chip e libera para Rafael/admin
                     users=json.loads(USERS_FILE.read_text(encoding='utf-8')) if USERS_FILE.exists() else {}
                     ouid=meta['owner']; u=users.get(ouid,{})
-                    u.setdefault('name', meta['label']); u['role']='sdr' if meta['role']=='sdr' else 'comunicador'; u['ports']=[port]; u.setdefault('admin', False); u.setdefault('token', secrets.token_urlsafe(18))
+                    u.setdefault('name', meta['label'])
+                    u['role']='sdr' if meta['role']=='sdr' else 'comunicador'
+                    # Multichip: criar nova porta para um SDR existente ANEXA o chip,
+                    # nunca substitui a lista anterior. A regra de saída central decide
+                    # se mantém conversa no chip antigo ou sorteia novo lead entre chips.
+                    existing_ports=[]
+                    for x in (u.get('ports') or []):
+                        try: existing_ports.append(int(x))
+                        except Exception: pass
+                    u['ports']=sorted(set(existing_ports + [int(port)]))
+                    u.setdefault('admin', False); u.setdefault('token', secrets.token_urlsafe(18))
                     if body.get('hubspotOwnerId') or body.get('hubspot_owner_id'):
                         u['hubspot_owner_id']=re.sub(r'\D+','',str(body.get('hubspotOwnerId') or body.get('hubspot_owner_id') or ''))[:32]
                     users[ouid]=u
@@ -10471,6 +15143,8 @@ class H(BaseHTTPRequestHandler):
                 try: port=int(body.get('port'))
                 except Exception: return self.sendb(400,json.dumps({'ok':False,'error':'porta obrigatória'},ensure_ascii=False).encode())
                 if action=='delete':
+                    if not USERS.get(uid,{}).get('admin'):
+                        return self.sendb(403,json.dumps({'ok':False,'error':'admin_required_for_delete'},ensure_ascii=False).encode())
                     if port in (4600,4601,4603,4605,4606,4607):
                         return self.sendb(400,json.dumps({'ok':False,'error':'não remover portas base; use desconectar se precisar'},ensure_ascii=False).encode())
                     stop_bridge_process(port); data.pop(str(port), None); save_ports_config({int(k):v for k,v in data.items()})
@@ -10485,6 +15159,8 @@ class H(BaseHTTPRequestHandler):
                     r=start_bridge_process(port, meta.get('auth') or f'auth_{port}')
                     return self.sendb(200,json.dumps({'ok':True,'result':r,'status':bridge_status(port)},ensure_ascii=False).encode())
                 if action=='disconnect':
+                    if not USERS.get(uid,{}).get('admin'):
+                        return self.sendb(403,json.dumps({'ok':False,'error':'admin_required_for_disconnect'},ensure_ascii=False).encode())
                     stop=stop_bridge_process(port)
                     auth=str(meta.get('auth') or '')
                     removed=False
@@ -10506,15 +15182,18 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())
         if parsed.path=='/api/admin/users':
-            if not USERS.get(uid,{}).get('admin'):
-                return self.sendb(403, json.dumps({'ok':False,'error':'admin_required'}).encode())
+            if not chip_management_allowed(uid):
+                return self.sendb(403, json.dumps({'ok':False,'error':'chip_management_required'}).encode())
             try:
                 n=int(self.headers.get('Content-Length','0') or 0)
                 body=json.loads(self.rfile.read(n).decode() or '{}') if n>0 else {}
                 action=str(body.get('action') or 'upsert').strip().lower()
                 target=str(body.get('id') or '').strip().lower()
+                is_admin_actor=bool(USERS.get(uid,{}).get('admin'))
                 data=json.loads(USERS_FILE.read_text(encoding='utf-8')) if USERS_FILE.exists() else {}
                 if action=='delete':
+                    if not is_admin_actor:
+                        return self.sendb(403,json.dumps({'ok':False,'error':'admin_required_for_delete'},ensure_ascii=False).encode())
                     if target=='rafael':
                         return self.sendb(400,json.dumps({'ok':False,'error':'não é permitido remover Rafael/admin principal'},ensure_ascii=False).encode())
                     if target not in data:
@@ -10523,11 +15202,18 @@ class H(BaseHTTPRequestHandler):
                 else:
                     new_uid, rec = validate_admin_user_payload(body)
                     existing = data.get(new_uid, {})
+                    if not is_admin_actor and bool(existing.get('admin') or existing.get('view_all')):
+                        return self.sendb(403,json.dumps({'ok':False,'error':'admin_required_for_supervisor'},ensure_ascii=False).encode())
                     token = existing.get('token') or secrets.token_urlsafe(18)
                     # Proteção: sempre manter Rafael como admin e com todos os chips.
                     if new_uid == 'rafael':
                         rec['admin'] = True
                         rec['ports'] = sorted(PORTS.keys())
+                    elif not is_admin_actor:
+                        # Equipe pode vincular chip/e-mail para pareamento; não pode
+                        # promover ninguém a admin/supervisor nem ampliar visão da inbox.
+                        rec['admin'] = False
+                        rec.pop('view_all', None)
                     rec['token'] = token
                     data[new_uid] = rec
                 save_users(data)
@@ -10580,6 +15266,26 @@ class H(BaseHTTPRequestHandler):
                     return self.sendb(404,json.dumps({'ok':False,'error':'áudio não encontrado'},ensure_ascii=False).encode())
                 item=transcribe_audio_message(m, force=force) or {}
                 return self.sendb(200,json.dumps({'ok':bool(item.get('transcript')),'transcript':item.get('transcript') or '', 'status':item.get('status') or 'pending', 'provider':item.get('provider') or ''},ensure_ascii=False).encode())
+            except Exception as e:
+                return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())
+        if parsed.path=='/api/start-conversation':
+            try:
+                n=int(self.headers.get('Content-Length','0') or 0)
+                body=json.loads(self.rfile.read(n).decode() or '{}') if n>0 else {}
+            except Exception:
+                return self.sendb(400,json.dumps({'ok':False,'error':'JSON inválido'},ensure_ascii=False).encode())
+            payload, err = normalize_new_conversation_request(uid, body)
+            if err:
+                return self.sendb(400,json.dumps({'ok':False,'error':err},ensure_ascii=False).encode())
+            port=payload['port']; chat=payload['chat']; target_jid=payload['target_jid']; text=payload['text']
+            if _dedupe_send(uid, port, target_jid, 'text', text):
+                return self.sendb(200,json.dumps({'ok':True,'duplicate':True,'skipped':True,'conv':payload['conv'],'to':target_jid},ensure_ascii=False).encode())
+            try:
+                resp=post_json(f'http://127.0.0.1:{port}/send', {'to':target_jid,'text':text})
+                audit=record_outbound_audit(uid, port, chat, target_jid, 'text', {'to':target_jid,'text':text,'newConversation':True}, resp, normalized_to_pn=(target_jid!=chat))
+                schedule_outbound_reconciliation(audit)
+                invalidate_channel_api_cache(uid, payload['conv'])
+                return self.sendb(200,json.dumps({'ok':True,'bridge':resp,'to':target_jid,'conv':payload['conv'],'normalizedToPN':target_jid!=chat},ensure_ascii=False).encode())
             except Exception as e:
                 return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())
         if parsed.path=='/api/send':

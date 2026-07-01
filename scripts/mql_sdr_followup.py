@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Follow-up SDR para leads MQL que já receberam diagnóstico/PDF.
+"""Follow-up 1 SDR para leads MQL que já receberam diagnóstico/PDF.
 
 Consulta o ledger compartilhado controle/wpp_envios.json, encontra envios diretos
-`status=enviado_lead` cujo owner é Sarah/Breno/Lucas Batista e envia uma segunda
-mensagem curta pelo SDR dono, fazendo uma pergunta operacional específica.
+`status=enviado_lead` cujo owner é Sarah/Breno/Lucas Batista e envia o Follow-up 1
+oficial. Não existe "follow-up manual" pós-diagnóstico: depois do diagnóstico o
+próximo contato é sempre a régua determinística Follow-up 1, no mesmo dia ou no
+dia posterior, com estudo do negócio e ponte para portal real coerente.
 
 Seguro por padrão:
 - não envia para grupo;
-- não duplica se já houver msg_type=mql_sdr_followup para o mesmo deal/telefone;
-- não envia se já houver follow-up SDR registrado para o mesmo deal/telefone;
-- se o lead respondeu ao diagnóstico, não envia follow-up automático; move para Retorno Contato;
+- não duplica se já houver follow-up 1 MQL para o mesmo deal/telefone;
+- não envia pergunta genérica pós-diagnóstico;
+- se o lead respondeu ao diagnóstico, não envia follow-up automático; cria tarefa e só move para Retorno Contato se o negócio ainda estiver em etapa inicial (nunca regredir Introdução+);
 - respeita limite por execução, por hora e por dia.
 """
 import argparse
@@ -23,6 +25,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ROOT = Path('/root/.hermes/zydon-prospeccao')
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DISPARO = ROOT / 'disparo_dinamico.py'
 WA_DATA = Path('/root/.hermes/whatsapp-extra/channel_data')
 
@@ -30,13 +34,30 @@ spec = importlib.util.spec_from_file_location('disparo_dinamico', str(DISPARO))
 d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
 
+CADENCIA = ROOT / 'scripts' / 'cadencia_primeiro_contato.py'
+spec_cad = importlib.util.spec_from_file_location('cadencia_primeiro_contato', str(CADENCIA))
+cad = importlib.util.module_from_spec(spec_cad)
+spec_cad.loader.exec_module(cad)
+
 BRT = timezone(timedelta(hours=-3))
 OWNER_TO_KEY = {v['owner_id']: k for k, v in d.BRIDGES.items()}
 OWNER_TO_NAME = {v['owner_id']: v['owner_name'] for v in d.BRIDGES.values()}
-MSG_TYPE = 'mql_sdr_followup'
+MSG_TYPE = 'mql_followup1_deterministico'
+LEGACY_MSG_TYPES = {'mql_sdr_followup', MSG_TYPE}
 DIRECT_STATUSES = {'enviado_lead', 'enviado_mql'}
 STAGE_PRIMEIRO_CONTATO_FEITO = '1214320997'  # Pipeline Principal: Primeiro Contato
 STAGE_RETORNO_CONTATO = '998099482'  # Lead respondeu depois do diagnóstico
+# Rafael 30/06: nunca regredir lead em Introdução ou etapa superior para Retorno.
+PROTECTED_STAGE_ORDER = {
+    '1269308723': 6,  # Introdução
+    '1269710168': 7,  # Diagnóstico EC
+    '990617426': 8,   # Apresentação Comercial
+    '1269308724': 9,  # Apresentação Técnica
+    '984052831': 10,  # Proposta / Negociação
+    '1213797817': 11, # Termos e condições
+    '984052834': 12,  # Fechado
+    '984052835': 13,  # Perdido
+}
 
 
 def parse_dt(raw):
@@ -89,6 +110,26 @@ def message_text(m):
     return ''
 
 
+WEAK_RESPONSES = {'oi','olá','ola','bom dia','boa tarde','boa noite','ok','okk','obrigado','obrigada','sim','whatsapp','wpp','zap'}
+EFFECTIVE_TERMS = (
+    'faz sentido','quanto custa','preço','preco','valor','plano','ligar','ligação','ligacao',
+    'agenda','agendar','reunião','reuniao','demonstração','demonstracao','proposta',
+    'erp','bling','omie','tiny','sankhya','portal','pedido','vendedor','cliente','tabela',
+    'restaurante','revenda','distribuidor','atacado','pode falar','contato dele','contato dela'
+)
+
+
+def is_effective_interaction_text(text):
+    """Só evolui para Retorno Contato quando há interação efetiva com a cadência inicial."""
+    low = re.sub(r'\s+', ' ', (text or '').lower()).strip()
+    cleaned = re.sub(r'[^a-z0-9áàâãéêíóôõúç ]+', '', low).strip()
+    if not cleaned:
+        return False
+    if cleaned in WEAK_RESPONSES or len(cleaned.split()) <= 2:
+        return any(t in low for t in EFFECTIVE_TERMS)
+    return True
+
+
 def incoming_messages_after(jid, after_dt):
     """Mensagens do lead depois do diagnóstico.
 
@@ -113,8 +154,9 @@ def incoming_messages_after(jid, after_dt):
             if not any(v and v in chat for v in vars_):
                 continue
             dt = parse_dt(m.get('timestamp'))
-            if dt and dt > after_dt:
-                out.append({'dt': dt, 'text': message_text(m), 'source': path.name})
+            text = message_text(m)
+            if dt and dt > after_dt and is_effective_interaction_text(text):
+                out.append({'dt': dt, 'text': text, 'source': path.name})
     out.sort(key=lambda x: x['dt'])
     return out
 
@@ -148,61 +190,97 @@ def company(rec):
     return slug.title() if slug else 'sua empresa'
 
 
-def insight_from_text(rec):
-    text = str(rec.get('text') or '')
-    m = re.search(r'Em resumo,\s*(.+?)(?:\n| A Sarah| O Breno| O Lucas Batista| A consultora| O consultor|$)', text, re.S)
-    if m:
-        val = re.sub(r'\s+', ' ', m.group(1)).strip()
-        if val:
-            return val[:260]
+def study_context(rec):
+    """Extrai o estudo usado no Follow-up 1.
+
+    Não pode virar uma pergunta genérica. Se o diagnóstico já foi enviado, a
+    primeira mensagem seguinte precisa mostrar que a operação foi entendida.
+    """
+    blobs = [
+        str(rec.get('research_basis') or ''),
+        str(rec.get('group_summary') or ''),
+        str(rec.get('text') or ''),
+        str(rec.get('question_text') or ''),
+        str(rec.get('agenda_text') or ''),
+    ]
+    text = '\n'.join(b for b in blobs if b)
     summary = str(rec.get('group_summary') or '')
-    m = re.search(r'• Oportunidade:\s*(.+)', summary)
-    if m:
-        return re.sub(r'\s+', ' ', m.group(1)).strip()[:260]
+    if re.search(r'sorveterias|açaiterias|acaiterias|açaí|acai|sorvete', text, re.I) and re.search(r'WhatsApp|telefone|planilha', text, re.I):
+        return 'vocês vendem para sorveterias, açaiterias e operações de delivery de açaí/sorvete, e o gargalo aparece quando pedido chega por WhatsApp, telefone e planilha'
+    for pattern in (
+        r'• Oportunidade:\s*(.+)',
+        r'• Dor[^\n]*(pedidos.+)',
+        r'• Dor[^\n]*:\s*(.+)',
+        r'• Formulário[^\n]*:\s*(.+)',
+        r'• Perfil aderente:\s*(.+)',
+        r'• Empresa validada:\s*(.+)',
+        r'•\s*(.+?(?:WhatsApp|telefone|planilha|catálogo|catalogo|pedido|pedidos|reposição|reposicao|atacado|distribui|sorveterias|açaiterias).*)',
+    ):
+        m = re.search(pattern, summary, re.I)
+        if m:
+            val = re.sub(r'\s+', ' ', m.group(1)).strip(' .')
+            if len(val) >= 25:
+                return val[:260]
+    if re.search(r'sorveterias|açaiterias|acaiterias|açaí|acai|sorvete', text, re.I):
+        return 'vocês vendem para sorveterias, açaiterias e operações de delivery de açaí/sorvete, e o gargalo aparece quando pedido chega por WhatsApp, telefone e planilha'
+    if re.search(r'cosm[eé]tico|beleza|perfumaria|est[eé]tica', text, re.I):
+        return 'vocês trabalham com produtos de beleza/cosméticos e podem organizar catálogo, tabela comercial e recompras B2B em um portal próprio'
+    if re.search(r't[eê]xtil|confec|moda|roupa|vestu[aá]rio', text, re.I):
+        return 'vocês trabalham com linha de produtos têxteis/moda e podem organizar catálogo, grade, tabela comercial e reposição em um portal B2B'
+    if re.search(r'autope[cç]as|pe[çc]as|oficina|frota|mec[aâ]nic', text, re.I):
+        return 'vocês têm uma operação de peças/produtos recorrentes em que o cliente precisa consultar catálogo, preço e disponibilidade antes de pedir'
+    if re.search(r'distribui|atacad|revenda|lojista|representante|vendedor', text, re.I):
+        return 'vocês têm venda B2B recorrente e o cliente precisa consultar catálogo, tabela comercial, preço e disponibilidade antes de tirar pedido'
     return ''
 
 
-def question_for(rec):
-    blob = (str(rec.get('text') or '') + ' ' + str(rec.get('group_summary') or '') + ' ' + company(rec)).lower()
-    if any(x in blob for x in ('instagram', 'lead', 'essência', 'essencias', 'aromas', 'lojista', 'revenda')):
-        return 'Hoje a reposição dos lojistas chega mais pelo WhatsApp/Instagram ou vocês já têm algum catálogo com pedido recorrente?'
-    if any(x in blob for x in ('academia', 'suplement', 'mercado', 'atacado')):
-        return 'Hoje o pedido de atacado entra mais pelo site, por vendedor ou fecha no WhatsApp?'
-    if any(x in blob for x in ('agro', 'produtor', 'insumo', 'máquina', 'maquina', 'implemento', 'fertilizante')):
-        return 'Hoje esses pedidos de produtores e clientes recorrentes chegam mais por WhatsApp, ligação ou vendedor?'
-    if any(x in blob for x in ('estoque', 'preço', 'preco', 'tabela')):
-        return 'Hoje o cliente consulta preço e disponibilidade com vendedor ou vocês já têm algum canal para isso?'
-    if any(x in blob for x in ('erp', 'bling', 'omie', 'olist', 'sankhya')):
-        return 'Hoje o pedido B2B entra em algum canal integrado ao ERP ou ainda depende de conversa manual?'
-    return 'Hoje os pedidos B2B chegam mais por WhatsApp, ligação, e-mail ou vendedor?'
+def portal_for_context(rec):
+    text = ' '.join(str(rec.get(k) or '') for k in ('research_basis', 'group_summary', 'text', 'empresa', 'slug'))
+    norm = text.lower()
+    if re.search(r'sorveterias|açaiterias|acaiterias|açaí|acai|sorvete|alimento|foodservice|delivery', norm):
+        return {'name': 'Ceasa Mais', 'url': 'https://portal.ceasamais.com.br/', 'buyer_context': 'Esse cliente vende para mercados, padarias, restaurantes e compradores de food service.'}
+    if re.search(r'artigos esportivos|esportivo|esporte|roupa esportiva|moda fitness|confec|vestu[aá]rio|t[eê]xtil', norm):
+        if re.search(r'esport|fitness', norm):
+            return {'name': 'Bullpadel B2B', 'url': 'https://b2b.bullpadelbr.com/', 'buyer_context': 'Esse cliente vende para lojas, academias e pontos ligados a artigos esportivos.'}
+        return {'name': 'Fiação Itabaiana', 'url': 'https://compreonline.fiacaoitabaiana.com.br/', 'buyer_context': 'Esse cliente vende para confecções, lojistas e compradores do setor têxtil.'}
+    if re.search(r'cosm[eé]tico|beleza|perfumaria|est[eé]tica|dermo', norm):
+        return {'name': 'Provanza', 'url': 'https://lojista.provanza.com.br/', 'buyer_context': 'Esse cliente vende para revendas, salões e lojistas de beleza.'}
+    if re.search(r'pet|veterin|ração|racao|agropecu', norm):
+        return {'name': 'Mouragro', 'url': 'https://loja.mouragro.com.br/', 'buyer_context': 'Esse cliente vende para pet shops, clínicas veterinárias e compradores do agro/pet.'}
+    if re.search(r'autope[cç]as|mec[aâ]nic|oficina|frota|automot', norm):
+        return {'name': 'Siga Importados', 'url': 'https://siga.knakasaki.com/', 'buyer_context': 'Esse cliente vende para oficinas, auto centers e compradores de reposição automotiva.'}
+    if re.search(r'constru|material|home center|acabamento|obra|decor', norm):
+        return {'name': 'Stoky Distribuidora', 'url': 'https://stoky.com.br/', 'buyer_context': 'Esse cliente vende para lojistas, revendas e compradores recorrentes do atacado.'}
+    return {'name': 'Stoky Distribuidora', 'url': 'https://stoky.com.br/', 'buyer_context': 'Esse cliente vende para lojistas, revendas e compradores recorrentes do atacado.'}
+
+
+FOLLOWUP1_MSG_TYPE = 'mql_followup1_deterministico'
+MIN_HOURS_AFTER_DIAG_FOR_SDR_FOLLOW = 3.0
 
 
 def compose(rec, sender_name):
-    nome = first_name(rec)
-    empresa = company(rec)
-    insight = insight_from_text(rec)
-    sent_by_owner = str(rec.get('fallback_note') or '').lower().find('sdr dono') >= 0
-    if sent_by_owner:
-        # Quando o próprio SDR já enviou o diagnóstico, o follow-up não pode soar
-        # como uma reapresentação ou repetir a mesma abertura. Ele deve continuar
-        # a conversa a partir do material anterior.
-        opener = f"{nome}, {'aqui é a' if sender_name == 'Sarah' else 'aqui é o'} {sender_name} da Zydon. Passando para continuar o ponto que te enviei sobre a {empresa}, sem recomeçar a conversa do zero."
-    else:
-        opener = f"{nome}, {'aqui é a' if sender_name == 'Sarah' else 'aqui é o'} {sender_name} da Zydon. Vi o diagnóstico que a gente te enviou da {empresa}."
-    parts = [opener]
-    incoming = rec.get('_incoming_after') or incoming_messages_after(rec.get('to'), rec.get('_dt'))
-    if incoming:
-        last = incoming[-1]
-        resposta = (last.get('text') or '').strip()
-        if resposta:
-            parts.append(f"Vi sua resposta sobre o diagnóstico: \"{resposta[:220]}\". Vou seguir exatamente a partir disso, sem começar do zero.")
-        else:
-            parts.append('Vi que você respondeu depois do diagnóstico, então vou continuar a partir desse contexto e não começar do zero.')
-    if insight:
-        parts.append(f"Puxei um ponto dele: {insight}")
-    parts.append(question_for(rec))
-    parts.append('Pode me responder por aqui mesmo.')
-    return '\n\n'.join(parts)
+    """Renderiza o Follow-up 1 oficial aprovado por Rafael.
+
+    Não cria copy nova. Só substitui variáveis permitidas no manifesto F1:
+    nome, empresa, portal_segmento, portal_url e portal_buyer_context.
+    """
+    portal = portal_for_context(rec)
+    lead = {
+        'nome': first_name(rec),
+        'empresa': company(rec),
+        'deal_id': rec.get('deal_id') or rec.get('dealId') or '',
+        'jid': rec.get('to') or '',
+    }
+    old_portal_example_for = cad.portal_example_for
+    try:
+        cad.portal_example_for = lambda _lead: portal
+        text = cad.extract_message_variation(lead, 1)
+        gate_ok, gate_reason = cad.approved_followup_template_gate(text, 1, lead)
+        if not gate_ok:
+            raise RuntimeError(f'Follow 1 aprovado bloqueado: {gate_reason}')
+        return text
+    finally:
+        cad.portal_example_for = old_portal_example_for
 
 
 def find_contact_by_email(email):
@@ -228,9 +306,23 @@ def deal_owner(deal_id):
     return ((res or {}).get('properties') or {}).get('hubspot_owner_id') or ''
 
 
+def deal_stage(deal_id):
+    if not deal_id:
+        return ''
+    res = d.hs_request(f'https://api.hubapi.com/crm/v3/objects/deals/{deal_id}?properties=dealstage')
+    return str(((res or {}).get('properties') or {}).get('dealstage') or '')
+
+
+def is_protected_stage(stage):
+    return str(stage or '') in PROTECTED_STAGE_ORDER
+
+
 def move_deal_stage(deal_id, stage):
     if not deal_id:
         return None
+    current = deal_stage(deal_id)
+    if is_protected_stage(current) and stage in {STAGE_RETORNO_CONTATO, STAGE_PRIMEIRO_CONTATO_FEITO}:
+        return f'protected_stage_skip:{current}'
     res = d.hs_request(
         f'https://api.hubapi.com/crm/v3/objects/deals/{deal_id}',
         'PATCH',
@@ -264,12 +356,87 @@ def resolve_hubspot_ids(rec):
     return contact_id, deal_id
 
 
+def next_sdr_sla_due(interaction_dt):
+    """Rafael 29/06: resposta efetiva sem agenda vira Retorno Contato com SLA por período útil.
+
+    Interação pela manhã => tarefa 14h do mesmo dia.
+    Interação pela tarde/noite => tarefa 9h do próximo dia útil.
+    """
+    dt = interaction_dt or datetime.now(timezone.utc)
+    brt = dt.astimezone(BRT)
+    if brt.hour < 12:
+        due_brt = brt.replace(hour=14, minute=0, second=0, microsecond=0)
+    else:
+        due_brt = (brt + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        while due_brt.weekday() >= 5:
+            due_brt += timedelta(days=1)
+    return due_brt.astimezone(timezone.utc)
+
+
+def create_return_task(rec, incoming, stage_resp=None):
+    contact_id, deal_id = resolve_hubspot_ids(rec)
+    if not deal_id or not contact_id:
+        return None
+    interaction_dt = None
+    try:
+        if incoming:
+            interaction_dt = incoming[-1].get('dt')
+    except Exception:
+        interaction_dt = None
+    due_dt = next_sdr_sla_due(interaction_dt)
+    texts = []
+    for m in (incoming or [])[-3:]:
+        txt = (m.get('text') or '').strip()
+        if txt:
+            texts.append(re.sub(r'\s+', ' ', txt)[:500])
+    resumo = ' | '.join(texts) if texts else 'Lead respondeu/interagiu no WhatsApp; abrir conversa antes de seguir.'
+    current_stage = deal_stage(deal_id)
+    if is_protected_stage(current_stage):
+        # Rafael 30/06: fora das primeiras 6 etapas não criar atividade nem regredir.
+        return None
+    stage_note = 'Se o negócio ainda estiver em etapa inicial, pode ser movido para Retorno Contato; SDR precisa assumir.'
+    body_txt = [
+        'Lead interagiu de forma efetiva com as informações enviadas na cadência inicial. Não enviar follow-up automático por cima.',
+        stage_note,
+        f"Lead: {first_name(rec)} / {company(rec)}",
+        f"Destino: {rec.get('to')}",
+        f"Deal: {deal_id}",
+        f"Contato: {contact_id}",
+        f"SLA SDR: tarefa aberta para {due_dt.astimezone(BRT).strftime('%d/%m/%Y %H:%M BRT')}",
+        '',
+        'Resposta(s) capturada(s):',
+        resumo,
+        '',
+        'Próxima ação SDR: abrir o histórico, considerar todo o contexto do que foi falado e conduzir para agenda se fizer sentido. Não mandar follow-up automático por cima.'
+    ]
+    body = {
+        'properties': {
+            'hs_timestamp': due_dt.isoformat().replace('+00:00', 'Z'),
+            'hs_task_subject': 'Entrar em contato — lead interagiu com a cadência inicial',
+            'hs_task_body': '\n'.join(body_txt),
+            'hs_task_status': 'NOT_STARTED',
+            'hs_task_priority': 'HIGH',
+            'hubspot_owner_id': str(rec.get('owner_id') or ''),
+        },
+        'associations': [
+            {'to': {'id': int(contact_id)}, 'types': [{'associationCategory': 'HUBSPOT_DEFINED', 'associationTypeId': 204}]},
+            {'to': {'id': int(deal_id)}, 'types': [{'associationCategory': 'HUBSPOT_DEFINED', 'associationTypeId': 216}]},
+        ],
+    }
+    res = d.hs_request('https://api.hubapi.com/crm/v3/objects/tasks', 'POST', body)
+    return res.get('id') if res else None
+
+
 def create_task(rec, text, sender, send_resp):
     contact_id, deal_id = resolve_hubspot_ids(rec)
     if not deal_id or not contact_id:
         return None
+    current_stage = deal_stage(deal_id)
+    if is_protected_stage(current_stage):
+        # Rafael 30/06: atividades automáticas só nas primeiras 6 etapas.
+        return None
     body_txt = [
-        'Follow-up SDR após diagnóstico MQL enviado ao lead.',
+        'Follow-up 1 SDR após diagnóstico MQL enviado ao lead.',
         f"Lead: {first_name(rec)} / {company(rec)}",
         f"Destino: {rec.get('to')}",
         f"Deal: {deal_id}",
@@ -283,7 +450,7 @@ def create_task(rec, text, sender, send_resp):
     body = {
         'properties': {
             'hs_timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-            'hs_task_subject': f"WhatsApp — follow-up diagnóstico MQL enviado por {sender.get('sender_name')}",
+            'hs_task_subject': f"WhatsApp — Follow-up 1 diagnóstico MQL enviado por {sender.get('sender_name')}",
             'hs_task_body': '\n'.join(body_txt),
             'hs_task_status': 'COMPLETED',
             'hs_task_priority': 'MEDIUM',
@@ -298,33 +465,85 @@ def create_task(rec, text, sender, send_resp):
     return res.get('id') if res else None
 
 
+def outgoing_messages_after(jid, after_dt):
+    """Fail-safe anti-duplicidade: se já existe qualquer mensagem nossa no
+    histórico real depois do diagnóstico, não mandar Follow 1 de novo mesmo que
+    o ledger não tenha sido gravado. Incidente 30/06: wrapper matou o processo
+    após a primeira bolha e repetiu saudação porque o ledger só era escrito no
+    fim da sequência.
+    """
+    if not after_dt:
+        return []
+    vars_ = jid_variants(jid)
+    out = []
+    for path in WA_DATA.glob('history_*.json'):
+        try:
+            rows = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(rows, list):
+            continue
+        for m in rows:
+            if not isinstance(m, dict) or m.get('fromMe') is not True:
+                continue
+            vals = [m.get('chat'), m.get('sender'), m.get('participant'), m.get('jid'), m.get('remoteJidAlt'), m.get('jidAlt')]
+            raw = m.get('rawKey') or {}
+            if isinstance(raw, dict):
+                vals += [raw.get('remoteJid'), raw.get('remoteJidAlt'), raw.get('participant')]
+            if not any(phone_key(str(v or '')) in vars_ or str(v or '') in vars_ for v in vals):
+                continue
+            ts = m.get('timestamp') or m.get('messageTimestamp') or 0
+            try:
+                ts = float(ts)
+                if ts > 10**12:
+                    ts /= 1000
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            except Exception:
+                continue
+            if dt > after_dt + timedelta(seconds=30):
+                out.append(m)
+    return out
+
+
 def already_followed(envios, rec):
     did = str(rec.get('deal_id') or rec.get('dealId') or '')
     pk = phone_key(rec.get('to'))
     for r in envios:
         if not isinstance(r, dict):
             continue
-        if str(r.get('msg_type') or '').lower() != MSG_TYPE:
+        if str(r.get('msg_type') or '').lower() not in LEGACY_MSG_TYPES:
             continue
         if did and str(r.get('deal_id') or r.get('dealId') or '') == did:
             return True
         if pk and phone_key(r.get('to')) == pk:
             return True
+    source_dt = parse_dt(rec.get('date_tz') or rec.get('date'))
+    if pk and source_dt and outgoing_messages_after(rec.get('to'), source_dt):
+        return True
     return False
 
 
-def sent_count(envios, owner_name, hours=None):
+def sent_count(envios, owner_name, hours=None, today_only=False):
+    """Conta follows MQL enviados por SDR em janela segura.
+
+    `hours` protege o limite horário. Para limite diário, usar
+    `today_only=True`; contar o histórico inteiro travava a escala depois que o
+    SDR acumulava 12 envios em vários dias.
+    """
     now = datetime.now(timezone.utc)
+    today_brt = now.astimezone(BRT).date()
     n = 0
     for r in envios:
         if not isinstance(r, dict):
             continue
-        if str(r.get('msg_type') or '').lower() != MSG_TYPE:
+        if str(r.get('msg_type') or '').lower() not in LEGACY_MSG_TYPES:
             continue
         if str(r.get('sdr') or '') != owner_name:
             continue
         dt = parse_dt(r.get('date_tz') or r.get('date'))
         if not dt:
+            continue
+        if today_only and dt.astimezone(BRT).date() != today_brt:
             continue
         if hours is None or (now - dt).total_seconds() <= hours * 3600:
             n += 1
@@ -336,6 +555,10 @@ def collect(envios, max_age_hours):
     out = []
     for rec in envios:
         if not isinstance(rec, dict):
+            continue
+        if str(rec.get('campaign_id') or '') == 'diagnostico_agendado' or str(rec.get('msg_type') or '').lower().startswith('diagnostico_agenda'):
+            # Confirmação/lembrete de agenda não é diagnóstico comercial e resposta a isso
+            # NÃO pode mover negócio de Diagnóstico SDR para Retorno Contato.
             continue
         if str(rec.get('status') or '').lower() not in DIRECT_STATUSES:
             continue
@@ -355,11 +578,11 @@ def collect(envios, max_age_hours):
         incoming_last_dt = incoming[-1]['dt'] if incoming else None
         incoming_age_h = (now - incoming_last_dt).total_seconds() / 3600 if incoming_last_dt else None
         age_h = (now - dt).total_seconds() / 3600
-        # Follow-up automático só para lead sem resposta e com pelo menos 60min
-        # desde o diagnóstico. Se respondeu ao diagnóstico, não mandar nova
+        # Follow-up automático só para lead sem resposta e com respiro mínimo desde
+        # o diagnóstico. Se respondeu ao diagnóstico, não mandar nova
         # automação: mover para Retorno Contato e deixar SDR humano continuar.
         # Incidente King Talhas 26/06.
-        if age_h < 1.0:
+        if age_h < MIN_HOURS_AFTER_DIAG_FOR_SDR_FOLLOW:
             continue
         if age_h > max_age_hours and not incoming:
             continue
@@ -406,12 +629,13 @@ def main():
                 print(f"DRY SKIP respondeu diagnóstico -> Retorno Contato: {company(rec)} deal={resolved_deal_id} resp={(last.get('text') or '')[:120]}")
                 continue
             moved_stage = move_deal_stage(resolved_deal_id, STAGE_RETORNO_CONTATO)
-            print(f"SKIP respondeu diagnóstico -> Retorno Contato: {company(rec)} deal={resolved_deal_id} stage={moved_stage} resp={(last.get('text') or '')[:120]}")
+            task_id = create_return_task(rec, rec.get('_incoming_after') or [])
+            print(f"SKIP respondeu diagnóstico -> Retorno Contato: {company(rec)} deal={resolved_deal_id} stage={moved_stage} task={task_id} resp={(last.get('text') or '')[:120]}")
             continue
         if sent_count(envios, owner_name, 1) >= args.max_per_hour:
             print(f"SKIP {owner_name}: limite horário follow-up")
             continue
-        if sent_count(envios, owner_name, None) >= args.max_per_day:
+        if sent_count(envios, owner_name, None, today_only=True) >= args.max_per_day:
             print(f"SKIP {owner_name}: limite diário follow-up")
             continue
         port, status, errs = d.escolher_porta_online(bridge, envios)
@@ -431,8 +655,16 @@ def main():
         marker = 'RESPONDEU_DIAG ' if rec.get('_incoming_after') else ''
         print(f"SEND {marker}{owner_name}/porta {port} -> {company(rec)} {rec.get('to')} | {text[:120].replace(chr(10),' ')}")
         if args.dry_run:
+            sent += 1
             continue
-        ok, resp = d.send_whatsapp(port, rec.get('to'), text)
+        ok, resp = d.send_whatsapp_sequence(
+            port,
+            rec.get('to'),
+            text,
+            final_pause_seconds=240.0,
+            max_parts=3,
+            delay_schedule=[12.0, 240.0],
+        )
         if not ok:
             print(f"FALHA {company(rec)}: {resp}")
             continue

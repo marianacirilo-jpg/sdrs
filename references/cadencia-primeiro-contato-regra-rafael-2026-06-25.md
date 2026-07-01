@@ -26,7 +26,8 @@ Essas atividades podem existir, mas não devem tirar o lead da cadência se o ne
 
 ## O que bloqueia / muda a cadência
 
-- Resposta do lead no WhatsApp depois do primeiro contato: mover para `998099482` / **Retorno Contato** e parar a cadência enquanto estiver fora de Primeiro Contato.
+- Resposta do lead no WhatsApp depois do primeiro contato: se o negócio ainda estiver em etapa inicial (`Lead Sem Contato`, `Primeiro Contato` ou `Retorno Contato`), mover para `998099482` / **Retorno Contato** e parar a cadência enquanto estiver fora de Primeiro Contato.
+- **Nunca regredir** negócio que já esteja em **Introdução** ou qualquer etapa superior (`Diagnóstico EC`, apresentações, proposta, termos, fechado/perdido) para Retorno Contato. Nesses casos, criar tarefa/alerta para o responsável e preservar a etapa atual.
 - Saída da etapa **Primeiro Contato**: parar follow-ups enquanto estiver fora.
 - Retorno posterior para **Primeiro Contato**: volta a ser elegível.
 

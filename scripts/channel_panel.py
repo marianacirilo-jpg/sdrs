@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from whatsapp_safe_send import safe_post_bridge
 
 PROJECT = Path('/root/.hermes/zydon-prospeccao')
 WA_EXTRA = Path('/root/.hermes/whatsapp-extra')
@@ -226,7 +227,7 @@ class H(BaseHTTPRequestHandler):
                 port=int(body.get('port')); chat=str(body.get('chat') or ''); text=str(body.get('text') or '').strip()
                 if port not in USERS[uid]['ports']: return self.sendb(403,b'Porta nao permitida','text/plain')
                 if not chat or not text: return self.sendb(400,b'Missing chat/text','text/plain')
-                resp=post_json(f'http://127.0.0.1:{port}/send', {'to':chat,'text':text})
+                resp=safe_post_bridge(port, '/send', {'to':chat,'text':text}, uid='channel_panel_legacy', timeout=20)
                 return self.sendb(200,json.dumps({'ok':True,'bridge':resp},ensure_ascii=False).encode())
             except Exception as e:
                 return self.sendb(500,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False).encode())

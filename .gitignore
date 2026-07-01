@@ -1,3 +1,4 @@
+# Runtime / secrets
 .env
 *.env
 *secret*
@@ -6,26 +7,31 @@
 *.pem
 *.key
 rclone.conf
-google_token.json
-google_client_secret.json
+
+# Python / Node
 .venv/
+venv/
 __pycache__/
 *.pyc
 node_modules/
+.pytest_cache/
+
+# Operational data
 logs/
-*.log
 backups/
-pdfs/
+media/
+controle/
 pesquisas/
 outputs/
+tmp/
+*.lock
+*.db
+*.sqlite
+
+# Generated/binary outputs
+*.pdf
+*.xlsx
+*.docx
+*.zip
 *.tar
 *.tgz
-.DS_Store
-
-# Zydon operational runtime / sensitive
-tmp/
-controle/runtime/
-controle/releases/
-controle/backups/
-controle/*.lock
-controle/*.tmp

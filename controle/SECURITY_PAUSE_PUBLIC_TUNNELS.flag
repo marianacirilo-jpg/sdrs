@@ -1,1 +1,0 @@
-Public Channel tunnels paused because current access is token-link only, not Google/Cloudflare Access login. Do not expose externally until CH-022/CH-023 auth is configured.

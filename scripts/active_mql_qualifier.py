@@ -20,12 +20,16 @@ import fcntl
 import json
 import os
 import re
+import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 ROOT = Path('/root/.hermes/zydon-prospeccao')
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from zydon_operational_queues import update_json_locked  # noqa: E402
 CONTROL = ROOT / 'controle'
 PROCESSED = CONTROL / 'processed_emails.txt'
 WPP = CONTROL / 'wpp_envios.json'
@@ -127,15 +131,49 @@ def recent_form_contacts(hours=3):
     return hs('POST', '/crm/v3/objects/contacts/search', body).get('results', [])
 
 
-def is_form_signal(p):
+def _dt(s):
+    try:
+        return datetime.fromisoformat((s or '').replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def is_reentry_contact(p):
+    recent_dt = _dt(p.get('recent_conversion_date'))
+    created_dt = _dt(p.get('createdate'))
+    return bool(recent_dt and created_dt and (recent_dt - created_dt).total_seconds() > 300)
+
+
+def is_test_or_internal_base(p):
+    """Base teste/admin interno não entra na fila MQL."""
+    blob = ' '.join(str(p.get(k) or '') for k in (
+        'email','firstname','lastname','company','recent_conversion_event_name',
+        'hs_analytics_source','hs_analytics_source_data_1','hs_analytics_source_data_2',
+        'hs_latest_source','hs_latest_source_data_1','hs_latest_source_data_2',
+    )).lower()
+    return any(tok in blob for tok in (
+        'form admin', 'base teste', ' leo testes', 'leonardo tester',
+        'joao@empresa.com.br', 'empresa ltda.', 'empresa ltda', '+55(11) 99999-9999',
+    ))
+
+
+def is_form_signal(p, *, is_reentry=False):
+    """Aceita form/Lead Ads; bloqueia eventos operacionais/teste."""
+    if is_test_or_internal_base(p):
+        return False
+    event = (p.get('recent_conversion_event_name') or '').lower()
+    blocked = ('meeting', 'meetings link', 'agenda', 'calendly', 'conversation',
+               'conversations', 'whatsapp', 'whats app', 'chat', 'inbox', 'offline', 'call', 'interno')
+    if event:
+        if any(x in event for x in blocked):
+            return False
+        return True
+    if is_reentry:
+        return False
     src = (p.get('hs_object_source') or '').upper()
     label = (p.get('hs_object_source_label') or '').upper()
-    event = (p.get('recent_conversion_event_name') or '').lower()
     latest = ' '.join(str(p.get(k) or '').lower() for k in ('hs_analytics_source','hs_latest_source','hs_latest_source_data_1','hs_latest_source_data_2'))
-    if src == 'FORM' or label in {'FORM','FORMS'} or 'facebook' in event or 'lead ads' in event or 'facebook' in latest:
-        return True
-    blocked = ('meeting','agenda','conversation','whatsapp','offline','call')
-    return bool(event and not any(x in event for x in blocked))
+    return src == 'FORM' or label in {'FORM','FORMS'} or 'facebook' in latest
 
 
 def domain_from_email(email):
@@ -164,19 +202,22 @@ def classify_hint(p, site):
     company = (p.get('company') or '').lower()
     site_txt = (site.get('summary') or '').lower()
     strong_icp_terms = ['autope', 'motope', 'atacado', 'atacad', 'distribuidor', 'distribuidora', 'indústria', 'industria', 'importador', 'importadora', 'food service', 'hospitalar', 'produto médico', 'produtos medicos', 'posto', 'frota', 'oficina', 'revenda', 'lojista']
-    bad_terms = ['consultoria', 'software house', 'agência', 'marketing digital', 'serviço jurídico', 'advocacia', 'imobiliária', 'restaurante', 'clínica estética']
+    obvious_disqualifiers = [
+        'base teste', 'form admin', 'teste fake', 'lead teste', 'empresa teste',
+        'sem empresa', 'não tenho empresa', 'nao tenho empresa', 'não tenho cnpj',
+        'nao tenho cnpj', 'estudante', 'trabalho escolar', 'currículo', 'curriculo',
+    ]
+    # Regra Rafael 2026-07-01: os anúncios já vêm bem qualificados e os follow-ups
+    # qualificam mais. Em dúvida/pending_review, considerar MQL e mandar para o
+    # pipeline de diagnóstico. Só desqualificar automaticamente quando for óbvio
+    # que é teste/fake/sem empresa/sem qualquer estrutura comercial real.
+    if any(t in blob or t in company or t in site_txt for t in obvious_disqualifiers):
+        return 'classified_non_mql_hint', 'Não-MQL: indício claro de teste/fake/sem empresa ou sem estrutura comercial real.'
     form_icp = any(t in blob or t in company for t in strong_icp_terms)
     public_icp = any(t in site_txt for t in strong_icp_terms)
-    bad = any(t in blob or t in company for t in bad_terms)
-    people = p.get('quantas_pessoas_atuam_na_sua_empresa') or ''
-    sellers = p.get('quantos_vendedores_internos_sua_empresa_possui') or ''
-    revenue = p.get('qual_o_faturamento_anual_da_sua_empresa_') or ''
-    scale = people in {'26_a_50','51_a_100','101_a_150','+151'} or '+151' in people or '6_a_20' in sellers or 'R$1 milhão' in revenue or 'R$5 milhões' in revenue or 'R$10' in revenue
-    if bad and not form_icp:
-        return 'classified_non_mql_hint', 'Não-MQL provável: segmento parece serviço/consultoria/varejo não ICP.'
-    if form_icp and (scale or public_icp or site.get('ok')):
-        return 'mql_candidate_needs_main_pipeline', 'MQL provável: formulário/site indicam ICP B2B; enviar ao pipeline principal para confirmação e diagnóstico.'
-    return 'pending_review', 'Pendente: sinais insuficientes para decisão automática segura.'
+    if form_icp or public_icp:
+        return 'mql_candidate_needs_main_pipeline', 'MQL provável: formulário/site indicam ICP B2B; seguir diagnóstico e follow-up.'
+    return 'mql_candidate_needs_main_pipeline', 'MQL por regra Rafael: lead de anúncio/formulário com dúvida inicial deve seguir diagnóstico; follow-ups qualificam mais. Só desqualificar teste/fake/sem estrutura clara.'
 
 
 def upsert_pipeline(contact, state, reason, site):
@@ -184,40 +225,46 @@ def upsert_pipeline(contact, state, reason, site):
     email = (p.get('email') or '').strip().lower()
     if not email:
         return False
-    data = load_json(PIPELINE, {'items': []})
-    if not isinstance(data, dict):
-        data = {'items': []}
-    items = data.setdefault('items', [])
     key = f"{email}|{p.get('recent_conversion_date') or p.get('createdate') or ''}"
-    existing = next((x for x in items if x.get('key') == key), None)
-    # Sem ruído: se o candidato já foi registrado igual, manter o estado e não
-    # imprimir de novo a cada minuto. Só há novidade quando é item novo ou mudou
-    # state/reason/site_summary.
-    if existing and existing.get('state') == state and existing.get('reason') == reason and existing.get('site_summary') == site.get('summary'):
-        return False
-    row = existing or {'key': key, 'events': []}
-    row.update({
-        'updated_at': now_iso_brt(),
-        'state': state,
-        'reason': reason,
-        'contact_id': contact.get('id'),
-        'email': email,
-        'company': p.get('company'),
-        'firstname': p.get('firstname'),
-        'phone': p.get('hs_searchable_calculated_phone_number') or p.get('mobilephone') or p.get('phone'),
-        'source': p.get('recent_conversion_event_name') or p.get('hs_latest_source_data_1') or p.get('hs_object_source_label'),
-        'createdate': p.get('createdate'),
-        'recent_conversion_date': p.get('recent_conversion_date'),
-        'site_summary': site.get('summary'),
-        'mql_confirmed': False,
-        'diagnostic_allowed': False,
-    })
-    row.setdefault('events', []).append({'at': now_iso_brt(), 'state': state, 'reason': reason})
-    if not existing:
-        row['created_at'] = now_iso_brt()
-        items.append(row)
-    save_json(PIPELINE, data)
-    return True
+    changed = {'value': False}
+
+    def update(data):
+        if not isinstance(data, dict):
+            data = {'items': []}
+        items = data.setdefault('items', [])
+        existing = next((x for x in items if isinstance(x, dict) and x.get('key') == key), None)
+        # Sem ruído: se o candidato já foi registrado igual, manter o estado e não
+        # imprimir de novo a cada minuto. Só há novidade quando é item novo ou mudou
+        # state/reason/site_summary.
+        if existing and existing.get('state') == state and existing.get('reason') == reason and existing.get('site_summary') == site.get('summary'):
+            changed['value'] = False
+            return data
+        row = existing or {'key': key, 'events': []}
+        row.update({
+            'updated_at': now_iso_brt(),
+            'state': state,
+            'reason': reason,
+            'contact_id': contact.get('id'),
+            'email': email,
+            'company': p.get('company'),
+            'firstname': p.get('firstname'),
+            'phone': p.get('hs_searchable_calculated_phone_number') or p.get('mobilephone') or p.get('phone'),
+            'source': p.get('recent_conversion_event_name') or p.get('hs_latest_source_data_1') or p.get('hs_object_source_label'),
+            'createdate': p.get('createdate'),
+            'recent_conversion_date': p.get('recent_conversion_date'),
+            'site_summary': site.get('summary'),
+            'mql_confirmed': state in {'mql_candidate_needs_main_pipeline','mql_opportunity_needs_diagnostic','mql_confirmado_rafael_manual','mql_opportunity_diagnostico_autorizado'},
+            'diagnostic_allowed': state in {'mql_candidate_needs_main_pipeline','mql_opportunity_needs_diagnostic','mql_confirmado_rafael_manual','mql_opportunity_diagnostico_autorizado'},
+        })
+        row.setdefault('events', []).append({'at': now_iso_brt(), 'state': state, 'reason': reason})
+        if not existing:
+            row['created_at'] = now_iso_brt()
+            items.append(row)
+        changed['value'] = True
+        return data
+
+    update_json_locked(PIPELINE, {'items': []}, update)
+    return changed['value']
 
 
 def main():
@@ -232,10 +279,15 @@ def main():
         for c in recent_form_contacts(hours=3):
             p = c.get('properties') or {}
             email = (p.get('email') or '').strip().lower()
-            if not email or email in done or not is_form_signal(p) or (p.get('lifecyclestage') or '').lower() == 'customer':
+            is_reentry = is_reentry_contact(p)
+            if not email or email in done or not is_form_signal(p, is_reentry=is_reentry) or (p.get('lifecyclestage') or '').lower() == 'customer':
                 continue
             site = fetch_site(domain_from_email(email))
-            state, reason = classify_hint(p, site)
+            lifecycle = (p.get('lifecyclestage') or '').strip().lower()
+            if lifecycle == 'opportunity':
+                state, reason = 'mql_opportunity_needs_diagnostic', 'Lifecycle opportunity: Rafael definiu que oportunidade segue diagnóstico/follow-up; não tratar como Não-MQL.'
+            else:
+                state, reason = classify_hint(p, site)
             if upsert_pipeline(c, state, reason, site):
                 out.append(f"{state}: {p.get('company') or email} — {email} — {reason}")
         if out:

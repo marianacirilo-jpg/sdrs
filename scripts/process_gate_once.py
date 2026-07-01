@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from whatsapp_safe_send import safe_post_bridge
+from whatsapp_send_orchestrator import enrich_legacy_row
+from whatsapp_routing import choose_outbound_port
+from whatsapp_dispatch_flow import record_dispatch_shadow, record_dispatch_worker_owned
+from zydon_operational_queues import replace_wpp_envios_locked
 from mql_dedupe_guard import can_send_diagnostic
 from mql_execution_queue import dedupe_keys, load_queue, mark_step, save_queue, upsert_and_save
 
@@ -19,21 +23,56 @@ PESQ = PROJ/'pesquisas'
 PDFS = PROJ/'pdfs'
 MOTOR = PROJ/'motor'
 GROUP = '120363408131718880@g.us'
+# Rafael 30/06: não avisar mais o grupo WhatsApp quando o lead é MQL/Não-MQL.
+# Os resumos internos de qualificação agora vão apenas para Mariana Cirilo, em
+# conversa 1:1. Mantemos os nomes legados de algumas funções/status (`grupo_*`)
+# para compatibilidade do ledger/dedup/watchdogs, mas o destino real não é mais
+# o grupo.
+INTERNAL_NOTIFY_TARGET = '553484255965@s.whatsapp.net'  # Mariana Cirilo / Mariana | Zydon
+INTERNAL_NOTIFY_LABEL = 'Mariana Cirilo'
+INTERNAL_NOTIFY_ROTATION_PORTS = [4607, 4600]  # alterna por hora: Rafael ↔ Mariana
+# Rodízio correto para conversa 1:1: quando o remetente é Rafael (4607), envia
+# para Mariana; quando o remetente é Mariana (4600), envia para Rafael. Enviar de
+# Mariana para a própria Mariana não aparece no chat Rafael↔Mariana.
+INTERNAL_NOTIFY_TARGET_BY_PORT = {
+    4607: ('553484255965@s.whatsapp.net', 'Mariana Cirilo'),
+    4600: ('553496698718@s.whatsapp.net', 'Rafael Calixto'),
+}
 HS = 'https://api.hubapi.com'
 DEALS_PIPELINE_ID = '671008549'
 DEALSTAGE_LEADS_INVALIDOS = '1388724005'
 TOKEN_PATH = Path('/root/.hermes/credentials/hubspot.env')
+# Contrato fixo Rafael/Zydon para diagnóstico MQL.
+# Não espalhar strings/tempos no código: qualquer mudança comercial precisa alterar
+# estas constantes e os testes que travam o contrato aprovado.
 TEXT_TO_PDF_DELAY_SECONDS = 60
 PDF_TO_QUESTION_DELAY_SECONDS = 30
 QUESTION_TO_AGENDA_DELAY_SECONDS = 20 * 60
+MQL_DIAGNOSTIC_TEXT_FIXED = 'Fiz uma análise prévia do potencial da digitalização B2B do seu negócio.'
+MQL_INTENT_QUESTION_FIXED = 'Como você imagina que a Zydon poderia te apoiar?'
+MQL_AGENDA_PREFIX_FIXED = 'Se quiser garantir o melhor horário para um diagnóstico completo, pode marcar direto aqui:'
+
+
+def diagnostic_worker_owned_enabled():
+    """Cutover por flag do diagnóstico/PDF para o worker central.
+
+    Desligado por padrão: o fluxo legado (texto+PDF+pergunta via /send e
+    /send-file diretamente daqui) continua idêntico. Ligado apenas quando
+    `ZYDON_MQL_DIAGNOSTIC_WORKER_OWNED=1`, aí o producer não faz envio próprio:
+    resolve grupo/HubSpot/task, enfileira o bundle real e deixa o transporte das
+    três partes + agenda a cargo do worker via completion `diagnostic_bundle`.
+    """
+    return os.environ.get('ZYDON_MQL_DIAGNOSTIC_WORKER_OWNED', '') == '1'
+
+
 OWNER_MAP = {
-    '88063842': {'nome':'Sarah', 'porta':4601, 'portas':[4601], 'assinatura':'Aqui é a Sarah, da Zydon', 'agenda':'https://meetings.hubspot.com/sarah-bento'},
-    # Breno usa somente o chip ativo 4605; 4602 foi removido/desativado.
-    '86265630': {'nome':'Breno', 'porta':4605, 'portas':[4605], 'assinatura':'Aqui é o Breno, da Zydon', 'agenda':'https://meetings.hubspot.com/breno-mendonca'},
-    '85778446': {'nome':'Lucas Batista', 'porta':4603, 'assinatura':'Aqui é o Lucas Batista, da Zydon', 'agenda':'https://meetings.hubspot.com/lucas-alcantara-nogueira-batista'},
+    '88063842': {'nome':'Sarah', 'porta':4601, 'portas':[4601], 'assinatura':'Aqui é a Sarah, da Zydon', 'agenda':'https://meetings.hubspot.com/sarah-bento', 'owner_uid':'sarah'},
+    # Breno 2 recém-conectado fica prioritário; 4605 continua como fallback/afinidade.
+    '86265630': {'nome':'Breno', 'porta':4611, 'portas':[4611, 4605], 'assinatura':'Aqui é o Breno, da Zydon', 'agenda':'https://meetings.hubspot.com/breno-mendonca', 'owner_uid':'breno'},
+    '85778446': {'nome':'Lucas Batista', 'porta':4603, 'portas':[4603], 'assinatura':'Aqui é o Lucas Batista, da Zydon', 'agenda':'https://meetings.hubspot.com/lucas-alcantara-nogueira-batista', 'owner_uid':'lucas_batista'},
     # Owner legado visto em negócios antigos/reinscritos; tratar como Lucas Batista
     # para não cair em mensagem genérica sem agenda do consultor.
-    '76764091': {'nome':'Lucas Batista', 'porta':4603, 'assinatura':'Aqui é o Lucas Batista, da Zydon', 'agenda':'https://meetings.hubspot.com/lucas-alcantara-nogueira-batista'},
+    '76764091': {'nome':'Lucas Batista', 'porta':4603, 'portas':[4603], 'assinatura':'Aqui é o Lucas Batista, da Zydon', 'agenda':'https://meetings.hubspot.com/lucas-alcantara-nogueira-batista', 'owner_uid':'lucas_batista'},
 }
 INSTITUTIONAL_PORTS = {
     4600: {'nome':'Mariana', 'assinatura':'Aqui é a Mariana, da Zydon'},
@@ -44,14 +83,253 @@ INSTITUTIONAL_PORTS = {
 }
 INSTITUTIONAL_ROTATION_PORTS = [4600, 4606, 4607, 4609, 4610]
 DEFAULT_OWNER = {'nome':'Institucional', 'porta':4600, 'portas':INSTITUTIONAL_ROTATION_PORTS, 'assinatura':'Aqui é a Mariana, da Zydon'}
-# Não-MQL: aviso no grupo sai pela rotação institucional/comunicadores.
+# Não-MQL/MQL: aviso interno não vai mais para grupo; vai direto para Mariana Cirilo.
 # 4604 foi removido/desativado e deve ser ignorado no SAF/MQL.
 # A task de não-MQL também NÃO deve ser atribuída ao SDR (Sarah/Breno/Lucas Batista)
 # — 'owner_id' None = não atribui ao SDR.
-NON_MQL_NOTIFY_OWNER = {'nome':'Institucional', 'porta':4600, 'portas':INSTITUTIONAL_ROTATION_PORTS, 'assinatura':'Aqui é a Mariana, da Zydon', 'owner_id': None}
+NON_MQL_NOTIFY_OWNER = {'nome':'Institucional', 'porta':4607, 'portas':INTERNAL_NOTIFY_ROTATION_PORTS, 'assinatura':'Aqui é a Mariana, da Zydon', 'owner_id': None}
+
+
+def resolve_diagnostic_sender(owner, jid, *, lead_key=None, rows=None, dispatches=None):
+    """Resolve chip de diagnóstico pelo roteador central lead->chip.
+
+    Lead com histórico/fila ativa mantém o mesmo chip; lead novo usa distribuição
+    do roteador entre chips do owner. Se o roteador bloquear ou não achar porta,
+    cai no owner['porta'] legado para preservar produção, mas expondo routing_mode.
+    """
+    owner = dict(owner or {})
+    owner_uid = owner.get('owner_uid') or owner.get('uid') or owner.get('nome') or ''
+    decision = choose_outbound_port(owner_uid, jid, lead_key=lead_key or jid, rows=rows, dispatches=dispatches)
+    port = decision.get('port') or owner.get('porta')
+    out = dict(owner)
+    try:
+        out['porta'] = int(port) if port is not None else port
+    except Exception:
+        out['porta'] = port
+    out['routing_mode'] = decision.get('mode')
+    out['routing_reason'] = decision.get('reason')
+    out['owner_uid'] = owner_uid
+    return out
+
+
+def refresh_owner_map_from_channel_users():
+    """Complementa chips dos SDRs pela configuração central da tela WhatsApp/equipe."""
+    try:
+        users = json.loads((PROJ / 'controle' / 'channel_users.json').read_text(encoding='utf-8'))
+    except Exception:
+        users = {}
+    if not isinstance(users, dict):
+        return
+    uid_to_owner = {v.get('owner_uid'): k for k, v in OWNER_MAP.items() if v.get('owner_uid')}
+    for uid, user in users.items():
+        if not isinstance(user, dict) or user.get('role') != 'sdr':
+            continue
+        owner_id = str(user.get('hubspot_owner_id') or uid_to_owner.get(uid) or '')
+        if owner_id not in OWNER_MAP:
+            continue
+        ports = []
+        for p in user.get('ports') or []:
+            try:
+                ports.append(int(p))
+            except Exception:
+                pass
+        if ports:
+            OWNER_MAP[owner_id]['portas'] = sorted(set(ports))
+            OWNER_MAP[owner_id]['porta'] = int(OWNER_MAP[owner_id]['portas'][0])
+            OWNER_MAP[owner_id]['owner_uid'] = uid
+
+
+refresh_owner_map_from_channel_users()
 
 # Pesquisa feita via Claude Code neste ciclo (salva também em pesquisas/*.md)
 RESEARCH = {
+  'rubia.pacheco@medterrarural.com.br': {
+    'slug':'medterra-rural-rubia-pacheco', 'mql': True,
+    'empresa_real':'MedTerra Rural / Med Terra São Bento LTDA — marca rural/gourmet de azeites, cafés especiais, mel, farinha de pinhão e presentes, com domínio oficial medterrarural.com.br e loja online comprar.medterrarural.com.br; contato Rubia Pacheco.',
+    'dominio_site':'medterrarural.com.br — acesso direto local neste ciclo retornou HTTP 200 em HTTPS e confirmou site oficial WordPress com descrição “Azeite, café e mel direto da origem”, produtos naturais, Fazenda São Bento/Fazenda MedTerra, links para loja online comprar.medterrarural.com.br e redes sociais. A loja online também retornou HTTP 200, com catálogo, carrinho, preços, frete grátis acima de R$189,90 e CNPJ 55.746.233/0001-20.',
+    'redes':'Pesquisa real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback por urllib/curl acessou medterrarural.com.br, páginas Quem Somos/Nossa Origem e comprar.medterrarural.com.br. As fontes públicas mostram posicionamento de alimentos naturais/presentes com loja online; o formulário e a confirmação manual recente do Rafael indicam que a venda para empórios deve seguir como oportunidade MQL e ser aprofundada no diagnóstico/follow-up.',
+    'segmento':'Produtora/marca rural gourmet de alimentos naturais, com e-commerce próprio, ERP Omie, venda por canais/vendedor e potencial de canal B2B para empórios/lojistas conforme formulário.',
+    'motivo':'MQL confirmado por orientação explícita recente do Rafael (“Esse é MQL”) sobre lead novo de Facebook Lead Ads. Formulário informa atuação em Empórios, ERP Omie, loja virtual ativa, venda por canais/vendedor e dor de escalar sem contratar mais gente; pesquisa pública confirmou empresa real com domínio e catálogo próprios. Seguir diagnóstico e deixar o follow-up qualificar a profundidade do canal B2B.',
+    'insight':'empórios e clientes recorrentes consultarem o catálogo de azeites, cafés, mel e presentes, fazendo pedidos de reposição pelo canal digital sem depender de cada atendimento manual',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 97686-2759; loja pública também exibe telefone corporativo fixo +55 (11) 4837-8305.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 97686-2759.',
+  },
+  'gerencia@tecmaxbr.com.br': {
+    'slug':'tecmaxbr-andre-palozi', 'mql': True,
+    'empresa_real':'Tecmax Indústria e Comércio Ltda / Tecmax BR — importadora e distribuidora de componentes para extintores de incêndio, ligada ao domínio tecmaxbr.com.br; contato André Palozi Zandonadi.',
+    'dominio_site':'tecmaxbr.com.br — pesquisa delegada via Claude Code com WebSearch/WebFetch localizou site oficial Tecmax BR e página “sobre nós”, além de fontes públicas de CNPJ/Econodata. Acesso direto local por urllib/curl retornou desconexão remota neste ambiente, então a validação pública principal veio do Claude Code/WebSearch.',
+    'redes':'Pesquisa real neste ciclo: WebSearch gerenciado Hermes falhou por billing externo; fallback com Claude Code WebSearch/WebFetch localizou tecmaxbr.com.br, página sobre nós, Econodata/CNPJ e referência de importação. Fontes indicam operação em Maringá/PR/Joinville-SC, André Palozi Zandonadi como sócio-administrador e importação/revenda de componentes para extintores, coerente com o formulário que declara “Distribuidores e empresas de manutenção”.',
+    'segmento':'Importador/distribuidor B2B de componentes para extintores de incêndio, atendendo fabricantes, distribuidores e empresas de manutenção; produto físico de reposição/abastecimento recorrente, com catálogo, preço, disponibilidade e pedidos por WhatsApp.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara distribuidores e empresas de manutenção, ERP Bling, faturamento de R$5 a R$10 milhões/ano, venda por WhatsApp, dor de não vender fora do horário comercial e compra 24h possível. A pesquisa pública confirmou Tecmax BR como importadora/distribuidora de componentes para extintores, um caso B2B de reposição recorrente para fabricantes/manutenção. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedido recorrente sem depender do vendedor no horário comercial.',
+    'insight':'fabricantes, distribuidores e empresas de manutenção consultarem catálogo, preço e disponibilidade de componentes para extintores e fecharem pedidos de reposição fora do horário comercial sem depender de cada atendimento por WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 44 99182-6482.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 44 99182-6482.',
+  },
+  'vendas@m3acessorios.com.br': {
+    'slug':'m3-acessorios-automotivos-matheus-cabral', 'mql': True,
+    'empresa_real':'M3 Acessórios Automotivos Ltda — fabricante/fornecedor de acessórios automotivos, especialmente capas para pinça de freio, com domínio m3acessorios.com.br; contato Matheus Cabral.',
+    'dominio_site':'m3acessorios.com.br / www.m3acessorios.com.br — acesso direto local retornou HTTP 404 neste ambiente, mas Claude Code com WebSearch/WebFetch localizou o site oficial e fontes públicas/marketplaces ligados à marca M3 Acessórios Automotivos.',
+    'redes':'Pesquisa real neste ciclo: WebSearch gerenciado Hermes falhou por billing externo; fallback com Claude Code WebSearch/WebFetch localizou www.m3acessorios.com.br, Serasa/Casa dos Dados, Galpão M3 e revenda em marketplace de autopeças. As fontes públicas indicam fabricante/fornecedor de capas para pinça de freio e presença no canal de acessórios automotivos; o formulário declara venda para lojas e distribuidoras de acessórios automotivos.',
+    'segmento':'Fabricante/fornecedor B2B de acessórios automotivos para lojas e distribuidoras de acessórios; autopeças/acessórios com catálogo, preço, disponibilidade e pedidos recorrentes de revenda.',
+    'motivo':'Passa no crivo MQL acirrado com ressalva de porte: o formulário declara lojas e distribuidoras de acessórios automotivos, ERP Bling, 2 a 5 vendedores, dor de depender de poucos clientes grandes e compra 24h possível. A pesquisa pública confirmou M3 como operação real de acessórios automotivos/fabricação de capas para pinça de freio, categoria de autopeças/acessórios com venda para revenda. Embora o faturamento informado seja até R$250 mil, há fit B2B recorrente e dor direta de pulverizar carteira via canal digital.',
+    'insight':'lojas e distribuidoras consultarem catálogo, preço e disponibilidade de acessórios automotivos e comprarem sozinhas, ajudando a reduzir a dependência de poucos clientes grandes',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 97097-4671.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 97097-4671.',
+  },
+  'eric.caputo@viermon.com.br': {
+    'slug':'viermon-chocolates-eric-caputo', 'mql': True,
+    'empresa_real':'Viermon Chocolates — empresa de chocolates com domínio corporativo viermon.com.br e loja Nuvemshop ativa em modo senha, contato Eric Caputo.',
+    'dominio_site':'viermon.com.br / www.viermon.com.br — acesso direto neste ciclo retornou HTTP 200 e redirecionou para /password/ em ambiente Nuvemshop/Tiendanube, com og:site_name “Viermon Chocolates”, store id 004/994/455 e tema de e-commerce carregado. A loja está protegida por senha no momento, mas o domínio oficial e estrutura de loja virtual estão ativos.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo. Fallback local por urllib/curl acessou https/http com e sem www e confirmou loja Nuvemshop ativa em viermon.com.br/password/. Buscas textuais via Bing/DuckDuckGo retornaram ruído/captcha e não trouxeram fonte pública adicional segura. A decisão usa o formulário recente e específico: venda para floriculturas, lojas de conveniência, lojas de presente, restaurantes e lanchonetes; venda por representantes externos com pronta entrega e televendas; loja virtual ativa; faturamento de R$1 milhão a R$5 milhões/ano; 11 a 25 pessoas; 2 a 5 vendedores internos; ERP Outro; autosserviço 24h possível mediante provocação.',
+    'segmento':'Indústria/fornecedora/distribuidora de chocolates e presentes alimentícios para canais comerciais como floriculturas, lojas de conveniência, lojas de presente, restaurantes e lanchonetes. Produto físico de reposição/abastecimento e venda recorrente por representantes externos, pronta entrega e televendas, com loja virtual ativa.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara venda B2B para floriculturas, conveniências, lojas de presente, restaurantes e lanchonetes, com representantes externos, pronta entrega e televendas, faturamento de R$1 a R$5 milhões/ano, 11 a 25 pessoas, 2 a 5 vendedores e loja virtual ativa. A pesquisa pública confirmou domínio oficial e estrutura de e-commerce Nuvemshop da Viermon Chocolates, embora protegido por senha. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de reposição para lojas e estabelecimentos comerciais.',
+    'insight':'floriculturas, conveniências, lojas de presente e restaurantes consultarem catálogo, preço e disponibilidade de chocolates para repor estoque e montar pedidos sem depender de cada contato do representante ou televendas',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 95276-8528.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 95276-8528.',
+  },
+  'diretoria@pedrosoebolzani.com.br': {
+    'slug':'gasam-pedroso-bolzani-samuel', 'mql': True,
+    'empresa_real':'Gasam / Pedroso e Bolzani (GPB) — operação de broker/representação comercial em Sorocaba/SP, ponte entre indústria e varejo, com formulário recente declarando atendimento a padarias, restaurantes, mercados e distribuidoras.',
+    'dominio_site':'pedrosoebolzani.com.br — site oficial validado por pesquisa via Claude Code/WebFetch, posicionando a GPB como broker e ponte entre indústria e comércio varejista. O acesso direto local por urllib retornou HTTP 503 no momento do ciclo, mas a pesquisa delegada encontrou o site oficial e o subdomínio sistema.pedrosoebolzani.com.br/login, coerente com operação digital própria e ERP informado como Outro.',
+    'redes':'Pesquisa real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback local por urllib/curl tentou https/http com e sem www e recebeu HTTP 503. Em seguida, Claude Code com WebSearch/WebFetch encontrou fontes públicas: site oficial pedrosoebolzani.com.br, sistema.pedrosoebolzani.com.br/login, LinkedIn br.linkedin.com/company/pedrosoebolzani com 11–50 funcionários e Sorocaba/SP, Instagram/Facebook da Pedroso & Bolzani e Econodata do CNPJ 43.777.057/0001-04. Não houve fonte pública confiável ligando o nome Gasam diretamente à razão social; a decisão considera a operação pública GPB/broker e os campos fortes do formulário.',
+    'segmento':'Broker/representação comercial B2B para indústria e varejo alimentar/food service, atendendo padarias, restaurantes, mercados e distribuidoras. Operação de abastecimento/recompra recorrente por representantes, com loja virtual declarada e potencial para catálogo, preço, disponibilidade e pedidos self-service 24h.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário recente declara atendimento a padarias, restaurantes, mercados e distribuidoras, venda por representante, 2 a 5 vendedores internos, loja virtual ativa e crença de que o cliente compraria sozinho 24h. A pesquisa pública confirmou Pedroso e Bolzani/GPB como broker, ponte entre indústria e comércio varejista, com presença pública e sistema próprio. Apesar de o nome Gasam não ter sido validado publicamente, há fit claro de abastecimento B2B recorrente para canais comerciais, dependente de representantes e com potencial direto para digitalizar catálogo, preço e pedido recorrente.',
+    'insight':'padarias, restaurantes e mercados consultarem catálogo, preço e disponibilidade para repor produtos e montar pedidos recorrentes sem depender de cada contato do representante',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 96907-6194.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 96907-6194.',
+  },
+  'comercial@mdadistribuidora.com.br': {
+    'slug':'mda-distribuidora-rodrigo-rosa', 'mql': True,
+    'empresa_real':'MDA Distribuidora — distribuidora de produtos de limpeza, conservação domiciliar e automotiva em Porto Ferreira/SP, com domínio oficial mdadistribuidora.com.br e operação declarada para supermercados, mercados, casas de limpeza, conveniências, padarias, bares, lanchonetes e hotéis.',
+    'dominio_site':'mdadistribuidora.com.br redireciona para www.mdadistribuidora.com.br — site oficial ativo em Wix. Acesso direto no ciclo retornou HTTP 200, confirmou LocalBusiness “MDA Distribuidora”, cidade Porto Ferreira/SP, endereço Rua Francisco de Nuncci, Jardim Progresso, telefone (19) 3581-2144, domínio próprio e texto institucional sobre distribuição de produtos de limpeza, conservação domiciliar e automotiva.',
+    'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por cobrança/billing externo, então foi feito fallback por urllib/curl direto em https://mdadistribuidora.com.br e www. O site oficial confirmou empresa real, domínio próprio, localização em Porto Ferreira/SP e posicionamento de distribuição de produtos de limpeza, conservação domiciliar e automotiva. Buscas textuais via Bing retornaram ruído para “MDA” governamental e não foram usadas como fonte operacional. O formulário HubSpot recente trouxe os sinais comerciais principais: 10 vendedores externos, atendimento a supermercados, mercados, casas de limpeza, conveniência, padaria, bar, lanchonete e hotel, faturamento de R$10 a R$50 milhões/ano, 11 a 25 pessoas, ERP Outro, venda presencial e dor de escalar/prospectar novos nichos.',
+    'segmento':'Distribuidora B2B de produtos de limpeza, conservação domiciliar e automotiva para supermercados, mercados, casas de limpeza, conveniências, padarias, bares, lanchonetes e hotéis; produto físico de reposição/abastecimento, com mix amplo, vendedores externos, tabela, preço, estoque e pedidos recorrentes.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara operação de distribuição com 10 vendedores externos, atendimento a supermercados, mercados, casas de limpeza, conveniências, padarias, bares, lanchonetes e hotéis, faturamento de R$10 a R$50 milhões/ano, 11 a 25 pessoas e dor clara de escalar sem contratar mais gente/prospectar novos nichos. A pesquisa pública confirmou domínio oficial ativo da MDA Distribuidora e distribuição de produtos de limpeza, conservação domiciliar e automotiva. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de abastecimento para clientes comerciais, reduzindo dependência de visita presencial e aumentando alcance por nicho.',
+    'insight':'supermercados, mercados, conveniências e padarias consultarem catálogo, preço e disponibilidade de produtos de limpeza para repor estoque e montar pedidos sem depender de cada visita do vendedor externo',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 19 99212-5754; site oficial publica telefone corporativo fixo (19) 3581-2144.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 19 99212-5754.',
+  },
+  'fabio@starfil.com.br': {
+    'slug':'fs-distribuidora-starfil-fabio-sartorelli', 'mql': True,
+    'empresa_real':'FS Distribuidora / Starfil Filtros Automotivos — operação ligada ao domínio starfil.com.br, fabricante/fornecedora de filtros automotivos para linha leve, pesada, motocicletas e marítima, com catálogo público e programa de representantes/distribuidores.',
+    'dominio_site':'starfil.com.br — site oficial ativo. Acesso direto via urllib/curl retornou HTTP 200 e confirmou “Starfil Filtros Automotivos”, especialização na fabricação de filtros automotivos e de máquinas/equipamentos, linhas para automóveis, máquinas, ônibus e caminhões, catálogo de produtos, CNPJ 12.959.066/0001-92, endereço em Mendes/RJ, e chamada “Seja você também um representante e parceiro Starfil”.',
+    'redes':'Pesquisa real neste ciclo: web_search/web_extract gerenciados falharam por billing externo, então foi feito fallback por Claude Code com WebSearch/WebFetch e por urllib/curl direto em https://starfil.com.br e www.starfil.com.br. O site oficial confirmou catálogo, produtos de filtragem, download de catálogo, mais de 25 anos no mercado, representantes/parceiros e contatos públicos. Claude Code também localizou presença pública de Starfil Filtros em Instagram/Facebook/LinkedIn; não foram inventados dados de volume além do formulário.',
+    'segmento':'Autopeças B2B — fabricante/fornecedora/distribuidora de filtros automotivos para linha leve, pesada, motocicletas, máquinas, ônibus, caminhões e marítimo; produto físico de reposição recorrente, catálogo, referência por aplicação, preço, disponibilidade e pedidos recorrentes para oficinas, autopeças, distribuidores e representantes.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário informa área Autopeças, empresa FS Distribuidora, venda direta, faturamento de R$500 mil a R$1 milhão/ano, 2 a 5 vendedores, ERP Outro, sem loja virtual, dor de depender de poucos clientes grandes e abertura para compra 24h. A pesquisa pública confirmou domínio oficial ativo da Starfil Filtros Automotivos, fabricação/linha de filtros automotivos, catálogo de produtos e chamada para representantes/distribuidores. Há fit claro para digitalizar catálogo, tabela, disponibilidade e pedidos recorrentes de reposição automotiva, reduzindo dependência de poucos clientes grandes e atendimento manual.',
+    'insight':'oficinas, autopeças e distribuidores consultarem catálogo, aplicação, preço e disponibilidade de filtros para repor estoque e montar pedidos sem depender de cada atendimento direto',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98843-0758. Site oficial publica contato público +55 21 99765-3589.',
+    'whatsapp_publico':'Usar primeiro o celular válido recebido no HubSpot/formulário: +55 11 98843-0758.',
+  },
+  'contato@granarthurium.com.br': {
+    'slug':'gran-arthurium-licores-premiados', 'mql': True,
+    'empresa_real':'Gran Arthurium / Junqueira e Lobo Soluções em Bebidas LTDA — marca/indústria mineira de licores e whisky, com e-commerce próprio em granarthurium.com.br, CNPJ 44.682.638/0001-25 e atuação declarada para empórios, adegas, lojas de produtos mineiros, restaurantes, supermercados gourmet e tabacarias.',
+    'dominio_site':'granarthurium.com.br — site oficial ativo em Magento/e-commerce. Acesso direto via urllib/curl retornou HTTP 200 e confirmou catálogo de licores e whisky, carrinho, produtos como Licor Fino de Cappuccino, Licor de Doce de Leite, whisky Gran Arthurium, copinhos/miniaturas, preços, atendimento (31) 98306-1038 / (31) 2255-0949, contato@granarthurium.com.br, endereço em Sete Lagoas/MG e CNPJ 44.682.638/0001-25.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo, então foi feito fallback por urllib/curl direto em https://granarthurium.com.br, www, http e páginas internas. O site oficial confirmou loja virtual, catálogo de bebidas finas, página “Revenda / Seja um Parceiro”, “Onde Comprar”, “Personalizados” e “Nossa História”. A página de parceria comercial informa produtos premiados, margens atrativas, suporte dedicado, exclusividade regional e oportunidades para restaurantes, bares, hotéis, representantes, supermercados, empórios e lojas especializadas. A página institucional cita indústria de licores, uso oficial do Doce de Leite Viçosa, medalhas em Londres/Nova York e Prata no New Spirits 2026. Não foram inventados dados de volume além dos campos do formulário.',
+    'segmento':'Indústria/marca de bebidas finas e licores com e-commerce próprio, revenda/parceria comercial e canais B2B para restaurantes, bares, hotéis, representantes, supermercados, empórios, adegas, lojas especializadas e tabacarias. Produto físico com catálogo, preços, estoque, reposição e pedidos recorrentes para canais de venda e estabelecimentos comerciais.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara venda B2B para empórios, adegas, lojas de produtos mineiros, restaurantes, supermercados gourmet e tabacarias, ERP Olist/Tiny, faturamento de R$500 mil a R$1 milhão/ano, loja virtual ativa, dor de pedidos desorganizados por WhatsApp/telefone/planilha e possibilidade de compra 24h. A pesquisa pública confirmou site oficial ativo, catálogo de bebidas, página explícita de revenda/parceria comercial, representantes, supermercados, empórios e lojas especializadas. Há fit claro para digitalizar catálogo, tabela, disponibilidade e pedidos de revenda/abastecimento recorrente sem depender de WhatsApp e planilhas.',
+    'insight':'empórios, adegas, restaurantes e supermercados gourmet consultarem catálogo, preço e disponibilidade de licores e whisky para repor estoque e montar pedidos de revenda sem depender de cada atendimento por WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 31 97309-9933; site oficial publica atendimento (31) 98306-1038 e telefone (31) 2255-0949.',
+    'whatsapp_publico':'Usar primeiro o celular válido recebido no HubSpot/formulário: +55 31 97309-9933.',
+  },
+  'contato@minasdocesdistribuidora.com.br': {
+    'slug':'minas-doces-distribuidora-jayne-frazao', 'mql': True,
+    'empresa_real':'Minas Doces Distribuidora — empresa informada no formulário com domínio corporativo minasdocesdistribuidora.com.br e atuação declarada em supermercado, distribuidora, padaria, mercearia e farmácia; contato Jayne Frazão.',
+    'dominio_site':'minasdocesdistribuidora.com.br — domínio do e-mail foi testado por DNS, HTTPS, HTTP e www neste ciclo, mas não resolveu DNS no ambiente; não houve site oficial acessível para extrair catálogo público. O domínio corporativo do e-mail e o formulário recente validam uma empresa de distribuição, mas sem página pública consultável neste momento.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo ou bloqueio; fallback local por terminal tentou resolver minasdocesdistribuidora.com.br e www, acessar HTTP/HTTPS e pesquisar Bing/Google/DuckDuckGo por “Minas Doces Distribuidora”, “minasdocesdistribuidora.com.br”, “contato@minasdocesdistribuidora.com.br” e variações. As buscas retornaram ruído ou captcha e não trouxeram fonte pública segura adicional. A decisão foi baseada no formulário forte e recente: área marcada como Supermercado, Distribuidora, Padaria, Mercearia e Farmácia; ERP Bling; faturamento de R$1 milhão a R$5 milhões/ano; venda por vendedor externo; dor de vendedores gastarem tempo só tirando pedido; e crença de que clientes podem comprar sozinhos 24h.',
+    'segmento':'Distribuidora/fornecedora B2B de doces/alimentos e itens de abastecimento para supermercados, padarias, mercearias, farmácias e clientes comerciais, com produto físico de reposição, catálogo, preço, estoque e pedidos recorrentes por vendedor externo.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara explicitamente distribuidora atendendo supermercados, padarias, mercearias e farmácias, com faturamento de R$1 a R$5 milhões/ano, ERP Bling, venda por vendedor externo e dor clara de vendedores gastando tempo apenas tirando pedido. Mesmo sem site público acessível no ciclo, os campos do formulário são específicos e compatíveis com ICP de distribuição/abastecimento recorrente, com fit direto para digitalizar catálogo, tabela, disponibilidade e pedido recorrente de clientes comerciais.',
+    'insight':'supermercados, padarias, mercearias e farmácias consultarem catálogo, preço e disponibilidade para repor produtos e montar pedidos sem depender de cada visita ou atendimento do vendedor externo',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 27 99810-7106.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 27 99810-7106.',
+  },
+  'alanbianco@estacaoy.com.br': {
+    'slug':'dbianco-cosmeticos-alan-bianco', 'mql': True,
+    'empresa_real':'D’Bianco / DBianco Professional — marca/fábrica de cosméticos capilares com e-commerce próprio em dbianco.com.br, linha profissional e home care, contato Alan Bianco.',
+    'dominio_site':'estacaoy.com.br, domínio do e-mail, respondeu com página vazia; a operação pública validada está em dbianco.com.br, site oficial Shopify ativo da DBianco Professional. O site mostra catálogo de cosméticos capilares e perfumaria, carrinho, produtos como DB Cream, Luxury, Argan Oil, Leave-in, linhas de tratamento e Work Salone, WhatsApp público +55 11 98314-0135 e página “Seja um Distribuidor”.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback local via urllib/curl acessou diretamente estacaoy.com.br, dbianco.com.br e páginas internas. O site dbianco.com.br confirmou loja virtual, catálogo, redes Facebook/Instagram/YouTube/TikTok, frete nacional e página “Torne-se um Distribuidor D’Bianco”, com chamada para portfólio profissional/home care premium, atendimento a salões de beleza e consumidor final, suporte a parceiros, margens atrativas e expansão nacional. Não foi inventado volume de vendas ou CNPJ.',
+    'segmento':'Fábrica/marca de cosméticos capilares com canal digital próprio, linha profissional e home care, venda por WhatsApp/e-commerce e programa de distribuidores/parceiros para salões de beleza e consumidor final. Produto físico com catálogo, preço, estoque, reposição e potencial de venda recorrente para distribuidores, salões, influenciadoras/parceiras e clientes de beleza.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário informa fábrica de cosméticos com marca própria, loja virtual ativa, faturamento de R$500 mil a R$1 milhão/ano, venda hoje por WhatsApp, ERP Outro e dor de carteira parada. A pesquisa pública confirmou site oficial ativo, catálogo de produtos físicos, linha profissional/home care, WhatsApp e página explícita para distribuidores oficiais, salões e parceiros. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de distribuidores/salões/parceiros sem depender de cada conversa manual no WhatsApp.',
+    'insight':'distribuidores, salões e parceiros consultarem catálogo, preço e disponibilidade das linhas profissionais e home care para repor produtos sem depender de cada atendimento no WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98314-0135; o site oficial DBianco também publica WhatsApp +55 11 98314-0135.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário e confirmado no site oficial: +55 11 98314-0135.',
+  },
+  'rodrigo.gencel@cbbdistribuidora.com.br': {
+    'slug':'cbb-distribuidora-rodrigo-gencel', 'mql': True,
+    'empresa_real':'CBB Distribuidora LTDA — distribuidora informada no formulário, com atuação declarada em padarias, supermercados, restaurantes e afins; contato Rodrigo Gencel no domínio cbbdistribuidora.com.br.',
+    'dominio_site':'cbbdistribuidora.com.br — domínio do e-mail foi tentado em https/http e www neste ciclo, mas não resolveu DNS no ambiente. Não houve site oficial acessível para validar catálogo público; a qualificação foi baseada no formulário forte e na busca pública disponível.',
+    'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por billing externo; fallback por terminal tentou cbbdistribuidora.com.br, www.cbbdistribuidora.com.br e buscas textuais por “CBB DISTRIBUIDORA LTDA”, “cbbdistribuidora.com.br” e “Rodrigo Gencel”. As buscas retornaram ruído de CBB/basquete e não trouxeram fonte pública adicional segura. O formulário, porém, é forte e recente: distribuidora para padarias, supermercados e restaurantes, TOTVS, R$10 a R$50 milhões/ano, +151 pessoas, RCA presencial, loja virtual ativa e autosserviço 24h declarado.',
+    'segmento':'Distribuidora B2B de abastecimento alimentar/food service para padarias, supermercados, restaurantes e clientes comerciais, com equipe/estrutura grande, RCA presencial, loja virtual e potencial de pedidos recorrentes por catálogo, preço, estoque e reposição.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara explicitamente operação de distribuidora para padarias, supermercados e restaurantes, faturamento de R$10 a R$50 milhões/ano, +151 pessoas, ERP TOTVS, venda por RCA presencial, loja virtual ativa e crença de que o cliente compraria sozinho 24h. Mesmo sem site público acessível no ciclo, os campos do formulário são compatíveis com ICP T1 de distribuição/abastecimento recorrente e têm fit claro para digitalizar catálogo, tabela, preço, estoque e pedidos de clientes comerciais.',
+    'insight':'padarias, supermercados e restaurantes consultarem catálogo, preço e disponibilidade para repor estoque e montar pedidos sem depender de cada visita ou digitação do RCA',
+    'telefone_publico':'Telefone celular válido recebido no formulário/HubSpot: +55 12 99100-4090.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 12 99100-4090.',
+  },
+  'alexlisboa@axcelquimica.com.br': {
+    'slug':'axcel-tecnologia-quimica-alex-lisboa', 'mql': True,
+    'empresa_real':'Axcel Tecnologia Química Ltda — empresa informada no formulário com atuação em oficinas mecânicas, ERP Omie e venda/atendimento via WhatsApp.',
+    'dominio_site':'axcelquimica.com.br — domínio do e-mail foi acessado por https/http e www neste ciclo; o servidor respondeu, mas bloqueou o acesso automatizado com HTTP 403 e/ou certificado inválido no ambiente. Isso confirma domínio existente, mas não permitiu extrair catálogo público de forma segura.',
+    'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por billing externo; fallback por terminal tentou axcelquimica.com.br, www.axcelquimica.com.br, HTTP/HTTPS com SSL flexível e buscas textuais por “Axcel Tecnologia Química Ltda”, “Axcel Química”, “Alex Lisboa Axcel” e “Axcel oficinas mecânicas”. As buscas foram contaminadas por resultados de Microsoft Excel/Axcel genérico e não trouxeram fonte pública confiável adicional. A decisão foi baseada nos campos fortes do formulário: oficinas mecânicas, Omie, R$1 a R$5 milhões/ano, 2 a 5 vendedores, venda por WhatsApp e dor de vendedores gastarem tempo só tirando pedido.',
+    'segmento':'Fornecedor/indústria química para oficinas mecânicas, com venda recorrente de produtos físicos para clientes automotivos, catálogo, preço, estoque e reposição, além de atendimento comercial por WhatsApp.',
+    'motivo':'Passa no crivo MQL acirrado: o formulário declara venda para oficinas mecânicas, ERP Omie, faturamento de R$1 a R$5 milhões/ano, 2 a 5 vendedores internos, atendimento via WhatsApp e dor clara de vendedores ocupados tirando pedido. Oficinas/automotivo e reposição recorrente estão dentro do ICP forte; Omie é ERP nativo Zydon. A pesquisa pública não conseguiu extrair o site por bloqueio 403, mas o formulário recente é suficientemente específico e compatível com MQL confirmado.',
+    'insight':'oficinas consultarem catálogo, preço e disponibilidade de produtos químicos para montar pedidos de reposição sem depender de cada atendimento por WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 18 98807-1570.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 18 98807-1570.',
+  },
+  'atacadaodosfogos@atacadaodosfogos.com.br': {
+    'slug':'atacadao-dos-fogos-joao', 'mql': False,
+    'empresa_real':'Atacadão Dos Fogos — loja de fogos de artifício em Salvador/BA, com domínio atacadaodosfogos.com.br, e-commerce/catálogo FácilZap, WhatsApp, entrega local e CNPJ validado 36.604.976/0001-10.',
+    'dominio_site':'atacadaodosfogos.com.br — site oficial ativo. Acesso direto via urllib/curl retornou HTTP 200 e confirmou loja virtual com 150 produtos, cerca de 5.088 pedidos, 1,8M visitas, WhatsApp 71 98160-0963, endereço em Itapuã/Salvador, descrição de fogos de artifício para Réveillon, festas juninas, casamentos e chá revelação, além de entrega em Salvador e região metropolitana.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo; fallback por urllib/curl acessou diretamente https://atacadaodosfogos.com.br e variações www/http. O site oficial confirmou operação real, catálogo, carrinho, validação por WhatsApp, vendedor Geisa e dados da loja. Buscas textuais via Bing retornaram muito ruído de Atacadão supermercadista e não acrescentaram prova segura de atacado/distribuição B2B.',
+    'segmento':'Comércio/e-commerce local de fogos de artifício para eventos e datas sazonais, com catálogo online e WhatsApp. Produto físico e loja virtual existem, mas a evidência pública aponta venda ao consumidor/eventos em Salvador e região, não indústria, distribuidora/importadora ou atacado T1 com abastecimento recorrente para revendas/lojistas.',
+    'motivo':'Não passa no crivo MQL acirrado/fail-closed: o formulário informa ERP Outro, faturamento de R$500 mil a R$1 milhão/ano, 11 a 25 pessoas, 2 a 5 vendedores, loja virtual e venda por site/WhatsApp; porém a pesquisa pública confirmou principalmente loja local de fogos para Réveillon, festas juninas, casamentos e chá revelação. Não há evidência clara de venda B2B recorrente para revendas/lojistas, distribuição, indústria/importação ou abastecimento de estoque. Como MQL errado ensina a mídia a buscar mais leads fora do ICP, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+    'insight':'',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 71 98160-0933; site oficial publica WhatsApp corporativo +55 71 98160-0963. Não usado para contato externo porque o lead foi classificado como não-MQL.',
+    'whatsapp_publico':'Não usado; contato externo bloqueado por não-MQL.',
+  },
+  'joao.coracini@cinimetais.com.br': {
+    'slug':'cinimetais-joao-coracini', 'mql': True,
+    'empresa_real':'CiniMetais — fornecedora/distribuidora de ferro e aço para indústria, construção civil e serralheria, com operação em Vargem Grande do Sul/SP.',
+    'dominio_site':'cinimetais.com.br redireciona para www.cinimetais.com.br — site oficial ativo com título “Aço para indústria e construção civil - CiniMetais”. O acesso direto confirmou linhas de Indústria e Serralheria, Construção Civil e Ferragem Armada, produtos como cantoneiras, perfis I/U/UDC, barras, chapas, tubos retangulares/quadrados/redondos, arame MIG/eletrodo, vergalhão, treliças, tela soldada, arame recozido e pregos; também mostra WhatsApp público +55 19 99770-7701 e atendimento/orçamento.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo, então foi feito fallback por urllib/curl direto em https://cinimetais.com.br e www.cinimetais.com.br. O site oficial retornou HTTP 200, confirmou empresa de aço para indústria e construção civil, catálogo de produtos, endereço Rua Gervásio Rotta 05, Vargem Grande do Sul/SP, telefone (19) 3641-4280, WhatsApp (19) 99770-7701 e e-mail vendas@cinimetais.com.br. Bing/DuckDuckGo trouxeram pouco sinal útil/challenge, então a fonte confiável usada foi o domínio oficial e os campos do formulário.',
+    'segmento':'Distribuidora/fornecedora de ferro e aço para construtoras, serralherias, indústria e construção civil; produto físico de reposição e projeto com catálogo, medidas, barras, perfis, tubos, chapas, vergalhões, telas e ferragem armada, dependente de orçamento, disponibilidade, preço e atendimento comercial.',
+    'motivo':'Passa no crivo MQL acirrado: formulário informa venda para construtoras e serralherias, ERP Omie, faturamento de R$1 milhão a R$5 milhões/ano, 1 a 10 pessoas, 2 a 5 vendedores internos, venda por indicação e prospecção por telefone, dor de escalar sem contratar mais gente e crença de que alguns produtos poderiam ser comprados sozinhos. A pesquisa pública confirmou domínio oficial ativo, catálogo de aço para indústria/construção/serralheria e WhatsApp/orçamento comercial. Há fit claro para digitalizar catálogo, tabela, preço, disponibilidade e pedidos/orçamentos recorrentes de construtoras e serralherias sem depender de cada ligação.',
+    'insight':'construtoras e serralherias consultarem medidas, preço e disponibilidade de perfis, tubos, chapas e vergalhões para montar orçamentos e pedidos sem depender de cada ligação',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 19 99329-7981; site oficial publica WhatsApp comercial +55 19 99770-7701.',
+    'whatsapp_publico':'Usar primeiro o celular válido recebido no HubSpot/formulário: +55 19 99329-7981.',
+  },
+  'rodolfo@trendsell.com.br': {
+    'slug':'kimax-produtos-limpeza-rodolfo-garcia', 'mql': True,
+    'empresa_real':'Kimax / kimax.com.br — marca/loja online de produtos de limpeza, saneantes e utilidades, com catálogo próprio e venda recorrente para pequenos e médios mercados e supermercados conforme formulário.',
+    'dominio_site':'kimaxbr.com.br redireciona para www.kimax.com.br — site oficial ativo em plataforma de e-commerce. O acesso direto no ciclo confirmou loja Kimax, conta/carrinho, categorias Limpeza, Banheiro, Para Cozinha, Desengordurante, Limpeza pesada, Lava Roupas, Limpeza Geral, Álcool e Limpa Pisos, além de produtos como gel querosene, lava roupas, cloro gel, desinfetante, gel sanitário e links de telefone/WhatsApp 14 99732-0919.',
+    'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing externo, então foi feito fallback por urllib/curl direto em trendsell.com.br, kimaxbr.com.br e www.kimax.com.br. O domínio trendsell.com.br mostrou site de coaching e não foi usado como prova operacional da empresa; já kimaxbr.com.br respondeu e redirecionou para o e-commerce oficial Kimax, com catálogo, carrinho, categorias e WhatsApp público. Não foram inventados dados de volume além dos campos do formulário.',
+    'segmento':'Fornecedor/marca de produtos de limpeza e saneantes para pequenos e médios mercados e supermercados, com catálogo de itens físicos de reposição recorrente, preço/disponibilidade, venda por representante comercial e loja virtual.',
+    'motivo':'Passa no crivo MQL acirrado: formulário declara venda para pequenos e médios mercados e supermercados, faturamento de R$5 a R$10 milhões/ano, venda via representante comercial, loja virtual ativa, ERP Outro e dor de escalar sem contratar mais gente. A pesquisa pública confirmou site oficial/e-commerce Kimax com catálogo de produtos de limpeza, saneantes e utilidades de reposição recorrente, carrinho e WhatsApp. Há fit claro para digitalizar catálogo, tabela, preço, disponibilidade e pedidos recorrentes de abastecimento para mercados/supermercados sem depender de cada representante.',
+    'insight':'mercados e supermercados consultarem catálogo, preço e disponibilidade de produtos de limpeza para repor estoque e montar pedidos sem depender de cada atendimento do representante',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 14 99732-0919; o site oficial Kimax também publica telefone/WhatsApp +55 14 99732-0919 e telefone alternativo +55 14 99880-2003.',
+    'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário e confirmado no site oficial: +55 14 99732-0919.',
+  },
+  'contato@industriakoche.com.br': {
+    'slug':'koche-automotiva-rafael-silveira', 'mql': True,
+    'empresa_real':'Kóche Automotiva / Indústria Kóche — fabricante nacional da máquina FT-100 para troca de óleo de câmbio automático e acessórios/flanges para oficinas automotivas.',
+    'dominio_site':'industriakoche.com.br redireciona para kocheautomotiva.com.br — site oficial ativo. O acesso direto no ciclo confirmou “KÓCHE - Máquina para Troca de Óleo de Câmbio Automático”, produto 100% nacional, “compre direto da fábrica”, loja com flanges/acessórios, carrinho, preços, treinamento e suporte para oficinas.',
+    'redes':'Pesquisa pública real neste ciclo: Firecrawl/web_search falhou por billing externo, então foi feito fallback por urllib/curl direto em https://industriakoche.com.br, www e http. O domínio respondeu HTTP 200 e redirecionou para kocheautomotiva.com.br, confirmando catálogo/loja, telefone de ajuda 19 99441-7505, proposta para oficinas, mais de 300 oficinas atendidas e produto nacional direto do fabricante. Busca textual via Bing trouxe ruído e não foi usada como fonte principal.',
+    'segmento':'Indústria/fabricante de equipamento automotivo e acessórios para oficinas mecânicas, com venda recorrente de máquinas/flanges/peças, loja virtual, tabela/preço, estoque e atendimento por WhatsApp para oficinas e clientes comerciais de reposição automotiva.',
+    'motivo':'Passa no crivo MQL acirrado: formulário informa mecânicas automotivas, ERP Olist/Tiny, faturamento de R$5 a R$10 milhões/ano, 21 a 100 pessoas, 2 a 5 vendedores internos, venda hoje por WhatsApp, loja virtual ativa e empresa crê que cliente poderia comprar sozinho 24h. A pesquisa pública confirmou domínio oficial ativo, fabricante nacional, compra direta da fábrica, catálogo/loja de produtos físicos e foco em oficinas automotivas. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedidos de oficinas sem depender de cada atendimento manual.',
+    'insight':'oficinas consultarem máquinas, flanges e acessórios com preço e disponibilidade para montar pedidos sem depender de cada atendimento por WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 19 99950-7130; site oficial também publica ajuda/WhatsApp 19 99441-7505.',
+    'whatsapp_publico':'Usar primeiro o celular válido recebido no HubSpot/formulário: +55 19 99950-7130.',
+  },
+  'lucas@coturnoatalaia.com.br': {
+    'slug':'atalaia-calcados-militares-lucas-gibram', 'mql': True,
+    'empresa_real':'Coturno Atalaia / Atalaia Calçados Militares — marca/loja de coturnos militares, botas táticas, linha exército/PRF/PMSC e acessórios, com e-commerce próprio.',
+    'dominio_site':'coturnoatalaia.com.br redireciona para loja.coturnoatalaia.com.br — site oficial/e-commerce ativo. O acesso direto no ciclo confirmou “Coturno Atalaia - Só existe um: o melhor coturno do Brasil”, WhatsApp/telefone (35) 99774-6859, carrinho, conta, pedidos, categorias PMSC, Botas Táticas, Coturnos Exército, Padrão PRF, acessórios, numeração especial e vários produtos com preço.',
+    'redes':'Pesquisa pública real neste ciclo: Firecrawl/web_search falhou por billing externo, então foi feito fallback por urllib/curl direto em https://coturnoatalaia.com.br, www e http. O domínio respondeu HTTP 200 e redirecionou para loja.coturnoatalaia.com.br, confirmando catálogo/e-commerce de produto físico, WhatsApp de atendimento, SKUs, preços e categorias militares/táticas. Busca textual via Bing retornou ruído genérico de coturnos e não foi usada como fonte principal.',
+    'segmento':'Comércio/marca de calçados militares e acessórios com e-commerce e atacado no WhatsApp informado no formulário; produto físico com grade/numeração, estoque, preço, disponibilidade e potencial de recompra por lojas de artigos militares, equipes e compradores recorrentes.',
+    'motivo':'Passa no crivo MQL acirrado: formulário informa lojas de artigos militares, venda por varejo online e atacado no WhatsApp, ERP Bling, faturamento de R$500 mil a R$1 milhão/ano, 2 a 5 vendedores internos, loja virtual ativa, cliente compraria sozinho 24h e dor de pedidos desorganizados por WhatsApp/telefone/planilha. A pesquisa pública confirmou e-commerce ativo com catálogo, preços, SKUs, WhatsApp e mix de coturnos/acessórios. Há fit para digitalizar tabela, grade, estoque e pedidos de atacado/recorrência sem depender de WhatsApp manual.',
+    'insight':'lojistas e compradores recorrentes consultarem grade, preço e disponibilidade de coturnos e acessórios para montar pedidos de atacado sem depender de cada conversa no WhatsApp',
+    'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 35 99888-9190; site oficial publica WhatsApp/telefone (35) 99774-6859.',
+    'whatsapp_publico':'Usar primeiro o celular válido recebido no HubSpot/formulário: +55 35 99888-9190.',
+  },
   'thiago@secchiautopecas.com.br': {
     'slug':'secchi-autopecas-thiago-secchi', 'mql': True,
     'empresa_real':'Secchi Auto Peças / Secchi Autopeças — empresa de autopeças com domínio oficial secchiautopecas.com.br, catálogo público amplo e envio para todo o Brasil.',
@@ -2054,7 +2332,68 @@ RESEARCH = {
    'telefone_publico':'Telefone celular válido informado no HubSpot/formulário e confirmado em registro público Inmetro 000181/2026: +55 11 98545-1415. Registro Inmetro 000815/2022 também publica fixo corporativo +55 11 4634-8855.',
    'whatsapp_publico':'Usar o celular válido informado no HubSpot/formulário: +55 11 98545-1415; fonte pública coincidente: Registro Inmetro 000181/2026.',
  },
+ 'renato.machado@beertopiaimport.com': {
+   'slug':'btp-distribuidora-beertopia-renato-machado',
+   'mql': True,
+   'empresa_real':'Beertopia Import / BTP Distribuidora Ltda — importadora e distribuidora de cervejas especiais e bebidas premium em São Paulo, com domínio corporativo beertopiaimport.com e atuação declarada para restaurantes, bares, empórios e supermercados.',
+   'dominio_site':'beertopiaimport.com — domínio corporativo do e-mail; acesso direto por curl/urllib no ciclo retornou 406/500, provável bloqueio/WAF ou indisponibilidade momentânea. A existência pública foi validada por pesquisa delegada ao Claude Code/WebSearch: LinkedIn Beertopia em São Paulo, Food & Beverage, 2-10 funcionários, endereço Rua Manoel da Nóbrega 354; Facebook Beertopia Import; referências públicas à importação oficial da Pilsner Urquell no Brasil.',
+   'redes':'Pesquisa real neste ciclo: web_search gerenciado falhou por billing externo, então houve fallback por terminal/curl no domínio e delegação ao Claude Code com WebSearch/WebFetch. Fontes públicas retornadas: LinkedIn da Beertopia, Facebook Beertopia Import e referências públicas de operação de importação/distribuição de cervejas especiais. O formulário recente confirmou os sinais comerciais principais: área restaurantes, bares, empórios e supermercados; ERP Omie; faturamento R$500 mil a R$1 milhão/ano; 1 a 10 pessoas; 2 a 5 vendedores; venda por vendedor/telefone/WhatsApp; dor de escalar sem contratar mais gente.',
+   'segmento':'Importadora e distribuidora B2B de cervejas especiais/bebidas premium para bares, restaurantes, empórios e supermercados; produto físico de reposição e abastecimento de estoque, com tabela, preço, disponibilidade e pedidos recorrentes por telefone/WhatsApp.',
+   'motivo':'Passa no crivo MQL acirrado: operação declarada e validada como importadora/distribuidora de bebidas para restaurantes, bares, empórios e supermercados, ERP Omie, equipe comercial pequena com 2 a 5 vendedores, venda por telefone/WhatsApp e dor explícita de escalar sem contratar. Há fit claro para digitalizar catálogo, tabela, preço, disponibilidade e pedidos recorrentes de abastecimento dos pontos de venda.',
+   'insight':'bares, restaurantes, empórios e supermercados consultarem catálogo, preço e disponibilidade de cervejas especiais para repor estoque e montar pedidos sem depender de cada atendimento por telefone ou WhatsApp',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98399-0807.',
+   'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 98399-0807.',
+ },
+ 'jean@corujabrindes.com.br': {
+   'slug':'coruja-brindes-jean-souza',
+   'mql': True,
+   'empresa_real':'Coruja Brindes / Coruja Doces e Brindes — operação B2B de brindes promocionais personalizados com loja virtual ativa em corujabrindes.com.br, CNPJ 20.016.030/0001-01, endereço em São Paulo e venda para empresas.',
+   'dominio_site':'corujabrindes.com.br — site oficial/e-commerce ativo. Acesso direto a /api/shop retornou JSON da loja: Coruja Brindes, Coruja Doces e Brindes, CNPJ 20.016.030/0001-01, endereço Rua Franklin do Amaral 397 Fundos, Vila Nova Cachoeirinha, São Paulo/SP, WhatsApp 11 91496-3277, e-mail louise@corujabrindes.com.br, plataforma Sablier, carrinho/checkout e redes sociais.',
+   'redes':'Pesquisa real neste ciclo: web_search gerenciado falhou por billing externo; fallback por terminal acessou corujabrindes.com.br e /api/shop, confirmando e-commerce, CNPJ, endereço, WhatsApp, e-mail e redes. Claude Code também localizou presença de Coruja Brindes em marketplace Elo7. O formulário recente informou B2B em geral, ERP Outro, faturamento R$5 a R$10 milhões/ano, 11 a 25 pessoas, 2 a 5 vendedores, loja virtual ativa, venda por WhatsApp/site e dor de depender de poucos clientes grandes.',
+   'segmento':'Fornecedor B2B estruturado de brindes promocionais personalizados para empresas, com e-commerce, catálogo, orçamento, pedidos corporativos recorrentes, clientes recorrentes e necessidade de diversificar carteira além de poucos clientes grandes.',
+   'motivo':'Passa como MQL pelo formulário forte e pela validação pública: empresa real com CNPJ, domínio próprio, e-commerce ativo, faturamento de R$5 a R$10 milhões/ano, 11 a 25 pessoas, 2 a 5 vendedores e venda declarada B2B. Embora brindes não seja distribuição clássica de alto giro, a operação vende produto físico personalizado para empresas, depende de carteira corporativa e já tem maturidade digital; a oportunidade é organizar catálogo/orçamento/atendimento para ampliar e diversificar clientes B2B.',
+   'insight':'empresas consultarem opções de brindes, montar cotações e repetir pedidos corporativos pelo canal digital, reduzindo a dependência de poucos clientes grandes e de atendimento manual no WhatsApp',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 99254-7634; site oficial publica WhatsApp +55 11 91496-3277.',
+   'whatsapp_publico':'Usar primeiro o celular válido recebido no HubSpot/formulário: +55 11 99254-7634.',
+ },
+ 'stefano@zimbras.com.br': {
+   'slug':'zimbras-plumas-e-penas-stefano-volpi',
+   'mql': True,
+   'empresa_real':'Zimbras Importação e Exportação Agropecuária Ltda / Plumas e Penas — operação de e-commerce/catálogo de plumas, penas, franjas, estolas, itens para carnaval, artesanato, decoração e linha pet, com domínio corporativo zimbras.com.br redirecionando para a loja Plumas e Penas.',
+   'dominio_site':'zimbras.com.br — domínio do e-mail redireciona para plumasepenas.com.br, site oficial/e-commerce ativo. O acesso direto por terminal confirmou loja com carrinho, categorias Plumas, Penas, Franjas e Estolas, brinquedos para gatos, espanadores, cocar indígena, bolinhas, ráfia e cola quente; página informa entrega para todo o Brasil, parcelamento, Pix e certificado SSL.',
+   'redes':'Pesquisa pública real neste ciclo: web_search/web_extract gerenciados falharam por billing, então foi usado fallback via urllib/curl ao domínio zimbras.com.br/www, que redirecionou para https://www.plumasepenas.com.br/. Buscas textuais via Bing para Plumas e Penas localizaram resultado orgânico do próprio site e loja Shopee “plumasepenas”, descrita como Plumas e Penas Fantasias e Pet/fabricante, além de categorias públicas de plumas e penas. O formulário HubSpot complementa com ERP Olist/Tiny, loja virtual ativa, faturamento R$1 a R$5 milhões/ano, 11 a 25 pessoas, 2 a 5 vendedores, venda por WhatsApp, cliente compra sozinho 24h e dor de pedidos desorganizados.',
+   'segmento':'Importadora/comércio multicanal de produtos físicos para carnaval, artesanato, decoração e pet, com catálogo e e-commerce; venda para lojistas/revendas e compradores recorrentes de estoque, com preço, disponibilidade, mix, tabela e pedidos B2B por WhatsApp/loja virtual.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário informa lojistas, ERP Olist/Tiny, faturamento de R$1 a R$5 milhões/ano, 11 a 25 pessoas, 2 a 5 vendedores internos, loja virtual ativa, venda atual por WhatsApp, crença de compra autônoma 24h e dor de pedidos desorganizados. A pesquisa pública confirmou domínio próprio redirecionando para e-commerce ativo com catálogo amplo de produto físico, carrinho, categorias de plumas/penas/franjas/itens de carnaval/artesanato/pet, entrega nacional e presença em marketplace. Há fit claro para digitalizar catálogo, preço, disponibilidade e pedidos recorrentes de lojistas/revendas sem depender de cada atendimento no WhatsApp.',
+   'insight':'lojistas e compradores recorrentes consultarem catálogo, preço e disponibilidade de plumas, penas e acessórios para montar pedidos de reposição sem depender de cada conversa no WhatsApp',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 11 98782-0087; não foi necessário substituir por telefone público.',
+   'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 11 98782-0087.',
+ },
+ 'contato@sqimports.com.br': {
+   'slug':'sq-imports-goncalo-santana',
+   'mql': True,
+   'empresa_real':'SQ Imports / SQ Áudio — distribuidora nacional de áudio automotivo ligada à loja instaladora SQ Áudio, com domínio oficial sqimports.com.br e formulário recente de reentrada para lojas de autopeças.',
+   'dominio_site':'sqimports.com.br — site oficial ativo. O acesso direto por terminal retornou HTTP 200 e confirmou o título “SQ Imports - Excelência em Áudio Automotivo”; a meta description informa que a SQ Imports nasceu do trabalho da loja instaladora SQ Áudio e de uma distribuidora de mesmo nome que atua em todo o Brasil.',
+   'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por billing externo; fallback por urllib/curl acessou https://sqimports.com.br, www e http com HTTP 200, extraindo título e meta description oficiais. Busca textual via Bing retornou pouco sinal útil e ruído de outras marcas “SQ”, então a decisão usa o site oficial acessível e os campos do formulário HubSpot: área lojas de autopeças, ERP Bling, faturamento de R$1 milhão a R$5 milhões/ano, 1 a 10 pessoas, 2 a 5 vendedores internos, venda hoje por telefone/WhatsApp, dor de perda de venda pela demora no atendimento, cliente compraria sozinho 24h e reentrada recente por Facebook Lead Ads.',
+   'segmento':'Distribuidora/fornecedora de áudio automotivo para lojas de autopeças e clientes comerciais automotivos; produto físico de reposição e mix técnico, com catálogo, preço, disponibilidade e pedidos recorrentes por telefone/WhatsApp.',
+   'motivo':'Passa no crivo MQL acirrado: o formulário declara lojas de autopeças, ERP Bling, faturamento de R$1 a R$5 milhões/ano, 2 a 5 vendedores, venda por telefone/WhatsApp, cliente compraria sozinho 24h e dor de perder vendas pela demora no atendimento. A pesquisa pública confirmou domínio oficial ativo e distribuidora SQ Imports atuando em todo o Brasil no nicho de áudio automotivo. Há fit claro para digitalizar catálogo, tabela, disponibilidade e pedidos recorrentes de lojas/compradores automotivos, reduzindo demora de atendimento e perda de venda.',
+   'insight':'lojas de autopeças e compradores automotivos consultarem catálogo, preço e disponibilidade de áudio automotivo para montar pedidos de reposição sem depender de cada atendimento por telefone ou WhatsApp',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 19 99801-8999.',
+   'whatsapp_publico':'Usar o celular válido recebido no HubSpot/formulário: +55 19 99801-8999.',
+ },
+ 'woodspot.adm@wood.com': {
+   'slug':'woodspot-jose',
+   'mql': False,
+   'empresa_real':'WoodSpot — loja/marca de produtos personalizados em madeira, com domínio oficial woodspot.com.br, foco público em tábuas, petisqueiras, porta-copos, porta-guardanapos, decoração e presentes personalizados com gravação a laser.',
+   'dominio_site':'woodspot.com.br — site oficial ativo. O acesso direto por terminal retornou HTTP 200, schema.org e meta description: “Produtos exclusivos em madeira personalizados com gravação a laser: tábuas personalizadas, pestiqueiras, utilidades e decorações”. A página lista início, personalizados, serviços, catálogo de Natal, produtos em madeira, comentários de Mercado Livre/Shopee e e-mail woodspot.adm@gmail.com.',
+   'redes':'Pesquisa pública real neste ciclo: web_search gerenciado falhou por billing externo; fallback por urllib/curl acessou woodspot.com.br/www com HTTP 200 e extraiu JSON-LD, meta description e texto da página. O site oficial confirma produto físico e personalização, mas o posicionamento público é de presentes/decoração/tábuas/petisqueiras e marketplaces, sem prova de atacado/distribuição, indústria T1, revenda recorrente ou abastecimento de estoque para lojistas. O formulário informa venda por marketplace e WhatsApp, faturamento até R$250 mil/ano, 1 vendedor, 1 a 10 pessoas, ERP Olist/Tiny, dor de pedidos desorganizados e público “lojistas, decorações, restaurantes”.',
+   'segmento':'Operação pequena de produtos personalizados em madeira e decoração, com marketplace/WhatsApp e possível venda pontual para lojistas/restaurantes, mas sem evidência segura de atacado/distribuição/indústria/importação ou recompra recorrente de abastecimento.',
+   'motivo':'Não passa no crivo MQL acirrado/fail-closed: embora seja lead válido de Facebook, com Olist/Tiny e alguma declaração B2B, o site oficial e o formulário apontam operação pequena de tábuas/petisqueiras/decoração personalizada, faturamento até R$250 mil/ano, 1 vendedor e venda por marketplace/WhatsApp. Não há evidência clara de distribuidor, indústria, atacado ou canal de revenda recorrente com abastecimento de estoque. Como MQL errado ensina o Facebook a buscar mais leads fora do ICP, a decisão segura é não marcar MQL e não enviar diagnóstico ao lead.',
+   'insight':'',
+   'telefone_publico':'Telefone celular válido recebido no HubSpot/formulário: +55 47 98836-8560; não usado para contato externo porque o lead foi classificado como não-MQL.',
+   'whatsapp_publico':'Não usado; contato externo bloqueado por não-MQL.',
+ },
 }
+
 
 
 def token():
@@ -2114,7 +2453,7 @@ def is_form_reentry_event(props):
     non_form_tokens = (
         'meetings link', 'meeting link', 'meeting', 'reuniao', 'reunioes',
         'agenda', 'calendly', 'conversations', 'conversation', 'whatsapp',
-        'whats app', 'chat', 'inbox',
+        'whats app', 'chat', 'inbox', 'offline', 'offline sources', 'call',
     )
     return not any(tok in norm for tok in non_form_tokens)
 
@@ -2159,6 +2498,15 @@ def load_wpp():
 
 CONFLICT_NON_MQL_STATUSES = {
     'nao_mql_grupo',
+    'enviado_nao_mql_legitimo',
+    'nao_mql_legitimo_tratativa',
+}
+# Tratativas Não-MQL REAIS ao lead (mensagem externa para o destino do lead).
+# `nao_mql_grupo` fica DE FORA de propósito: é aviso interno enviado ao grupo
+# pela Mariana/porta de notificação, então seu bridge_port NÃO representa o chip
+# que falou com o lead. Usar essa row como referência de chip original trocaria
+# o comunicador no Não-MQL→MQL. Só estes status valem como chip original.
+EXTERNAL_NON_MQL_LEAD_STATUSES = {
     'enviado_nao_mql_legitimo',
     'nao_mql_legitimo_tratativa',
 }
@@ -2208,6 +2556,43 @@ def prior_classification_conflict(envios, email, target_status, manual_hubspot_m
             return f"bloqueado: já havia anúncio/ação Não-MQL para {email} ({st})"
         if target_status == 'nao_mql' and st in CONFLICT_MQL_STATUSES:
             return f"bloqueado: já havia anúncio/envio MQL para {email} ({st})"
+    return None
+
+
+def prior_non_mql_action_for_lead(envios, email='', contact_id='', phone=''):
+    """Retorna a última tratativa Não-MQL REAL ao lead, se existir.
+
+    Rafael: quando um Não-MQL vira MQL por conversa, o diagnóstico precisa sair
+    pelo mesmo chip/comunicador que já estava falando com o lead. Esta função
+    detecta esse histórico para tornar `force_bridge_port` obrigatório.
+
+    Endurecido: só considera tratativas EXTERNAS reais ao lead
+    (`EXTERNAL_NON_MQL_LEAD_STATUSES`). Avisos internos de grupo (`nao_mql_grupo`)
+    são ignorados porque seu `bridge_port` é o da notificação ao grupo, não o do
+    chip que conversou com o lead. Sem tratativa externa real anterior, retorna
+    None (fail-closed) — não inventa chip a partir de row de grupo.
+    """
+    email = (email or '').lower().strip()
+    contact_id = str(contact_id or '').strip()
+    phone_keys = {normalize_br_phone(phone or ''), only_digits(phone or '')}
+    phone_keys.discard('')
+    for e in reversed([x for x in envios if isinstance(x, dict)]):
+        st = str(e.get('status') or e.get('msg_type') or '').lower().strip()
+        if st not in EXTERNAL_NON_MQL_LEAD_STATUSES:
+            continue
+        # Fail-closed: destino tem que ser o lead, nunca o grupo interno.
+        to = str(e.get('to') or e.get('jid') or e.get('lead_jid') or '')
+        if to.endswith('@g.us'):
+            continue
+        e_email = str(e.get('email') or '').lower().strip()
+        e_contact = str(e.get('contact_id') or '').strip()
+        e_phone_keys = {
+            normalize_br_phone(e.get('to') or ''), only_digits(e.get('to') or ''),
+            normalize_br_phone(e.get('phone') or ''), only_digits(e.get('phone') or ''),
+        }
+        e_phone_keys.discard('')
+        if (email and e_email == email) or (contact_id and e_contact == contact_id) or (phone_keys and phone_keys.intersection(e_phone_keys)):
+            return e
     return None
 
 
@@ -2326,7 +2711,47 @@ GROUP_NOTIFY_STATUSES = {
 }
 
 
-def existing_group_notification(envios, email='', contact_id='', slug=''):
+# Marcador `grupo_notificacao_em_andamento` sem prova de envio só protege contra
+# corrida entre crons por uma janela curta. Incidente Kóche/Atalaia: o processo
+# gravava o marker e morria antes do `/send` real, deixando o grupo travado para
+# sempre. Depois desta janela o marker inflight puro é tratado como stale.
+GROUP_INFLIGHT_STALE_SECONDS = 10 * 60
+
+
+def _group_inflight_confirms_sent(e):
+    """True quando o marcador inflight já carrega prova de envio real no grupo."""
+    if e.get('messageId') or e.get('group_message_id'):
+        return True
+    resp = e.get('group_summary_response')
+    if isinstance(resp, dict):
+        if resp.get('success') is True:
+            return True
+        if resp.get('messageId') or resp.get('message_id'):
+            return True
+    return False
+
+
+def _group_inflight_is_stale(e, now=None):
+    """Marcador inflight só vale por uma janela curta de corrida.
+
+    Se já tem prova de envio (success/messageId) ou resposta/porta do grupo, não
+    é um marcador puro de corrida e continua bloqueando. Caso contrário, passada a
+    janela curta, considera stale (processo morreu após gravar o marker) para não
+    travar o grupo para sempre.
+    """
+    if _group_inflight_confirms_sent(e):
+        return False
+    if e.get('group_summary_response') or e.get('group_bridge_port'):
+        return False
+    dt = envio_datetime_brt(e)
+    if dt is None:
+        # Sem timestamp confiável: trata como recente (conservador, mantém bloqueio).
+        return False
+    now = now or datetime.now(ZoneInfo('America/Sao_Paulo'))
+    return (now - dt).total_seconds() > GROUP_INFLIGHT_STALE_SECONDS
+
+
+def existing_group_notification(envios, email='', contact_id='', slug='', now=None):
     """Evita mandar duas vezes no grupo interno para o mesmo lead/evento.
 
     O grupo não pode receber espelho do lead nem duplicata. Usamos marcador
@@ -2341,6 +2766,9 @@ def existing_group_notification(envios, email='', contact_id='', slug=''):
             continue
         # Para enviado_lead, só conta como grupo notificado se havia tentativa de resumo.
         if st == 'enviado_lead' and not (e.get('group_summary') or e.get('group_summary_response') or e.get('group_bridge_port')):
+            continue
+        # Marcador inflight puro só trava por uma janela curta de corrida; stale libera novo envio.
+        if st == 'grupo_notificacao_em_andamento' and _group_inflight_is_stale(e, now=now):
             continue
         if email and str(e.get('email') or '').lower().strip() == email:
             return True, f'grupo já notificado para email ({st})'
@@ -2359,8 +2787,10 @@ def append_group_inflight(envios, email, slug, contact_id='', group_status='grup
         'contact_id': str(contact_id or ''),
         'slug': slug,
         'status': group_status,
-        'to': GROUP,
-        'note': 'Marcador idempotente gravado antes do aviso no grupo interno; não renderizar como envio final.',
+        'to': INTERNAL_NOTIFY_TARGET,
+        'internal_notify_label': INTERNAL_NOTIFY_LABEL,
+        'legacy_group': GROUP,
+        'note': 'Marcador idempotente gravado antes do aviso interno 1:1 para Mariana; não renderizar como envio final.',
     }
     envios.append(row)
     save_wpp(envios)
@@ -2421,9 +2851,96 @@ def port_within_external_limits(envios, port, max_per_hour=MAX_EXTERNAL_PER_PORT
     ok = hour < max_per_hour and day < max_per_day
     return ok, f'porta {port}: {hour}/{max_per_hour} na última hora, {day}/{max_per_day} hoje'
 
+def _central_nature_for_wpp_row(row):
+    st = str((row or {}).get('status') or '').lower()
+    mt = str((row or {}).get('msg_type') or '').lower()
+    to = str((row or {}).get('to') or '')
+    if to.endswith('@g.us') or st in {'nao_mql_grupo', 'grupo_notificacao_em_andamento', 'enviado_grupo'}:
+        return 'internal_group_alert', 'internal_only', 'cron_mql_classifier'
+    if st in {'enviado_nao_mql_legitimo', 'nao_mql_legitimo_tratativa'} or 'nao_mql_legitimo' in mt:
+        return 'non_mql_outreach', 'cold_outreach', 'cron_non_mql_legit_outreach'
+    if st == 'mql_diagnostico_em_andamento' or 'diagnostico_em_andamento' in mt:
+        return 'diagnostic_initial', 'post_diagnostic', 'cron_mql_diagnostic_pipeline'
+    if 'pdf' in mt or st in {'mql_diagnostico_rafael_pdf'}:
+        return 'diagnostic_pdf', 'post_diagnostic', 'cron_mql_diagnostic_pipeline'
+    if 'pergunta' in mt or 'question' in mt:
+        return 'diagnostic_question', 'post_diagnostic', 'cron_mql_diagnostic_pipeline'
+    if st in {'mql_agenda_sdr_apos_diagnostico'} or 'agenda' in mt:
+        return 'diagnostic_agenda_invite', 'scheduled_meeting', 'cron_mql_diagnostic_pipeline'
+    if st in {'enviado_lead', 'enviado_mql'} or 'diagnostico' in mt or 'diagnóstico' in mt:
+        return 'diagnostic_bundle', 'post_diagnostic', 'cron_mql_diagnostic_pipeline'
+    return None, None, None
+
+
+def enrich_wpp_rows(items):
+    out = []
+    for row in items or []:
+        if not isinstance(row, dict) or row.get('nature'):
+            out.append(row)
+            continue
+        nature, thread_state, origin = _central_nature_for_wpp_row(row)
+        if nature:
+            out.append(enrich_legacy_row(row, nature=nature, origin=origin, thread_state=thread_state, owner_uid=row.get('owner_sdr') or row.get('owner_id') or row.get('sdr')))
+        else:
+            out.append(row)
+    return out
+
+
 def save_wpp(items):
-    # Preserva o schema histórico {"envios": [...]}; alguns dashboards/relatórios esperam essa chave.
-    WPP.write_text(json.dumps({'envios': items}, ensure_ascii=False, indent=2), encoding='utf-8')
+    # Preserva o schema histórico {"envios": [...]}; escrita central com flock.
+    replace_wpp_envios_locked(enrich_wpp_rows(items), WPP)
+
+
+def trigger_non_mql_external_now(email, cid, props, research, deals, envios):
+    """Dispara imediatamente a tratativa externa Não-MQL para não depender só do aviso interno.
+
+    Regra Rafael 29/06: quando o definidor marca MQL=False, o sistema deve atuar no lead,
+    não apenas registrar/avisar o grupo. Esta chamada salva o ledger antes de acionar o
+    worker externo e recarrega depois para preservar o envio gravado pelo worker.
+    """
+    payload = {
+        'email': email,
+        'contact_id': str(cid),
+        'props': props,
+        'research': dict(research or {}, mql=False),
+        'slug': (research or {}).get('slug') or email.split('@')[0],
+        'phone': props.get('hs_searchable_calculated_phone_number') or props.get('hs_whatsapp_phone_number') or props.get('phone') or props.get('mobilephone') or '',
+        'deals': deals or [],
+    }
+    tmp = Path('/tmp') / f"zydon_non_mql_current_{str(cid).replace('/', '_')}.json"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+    env = os.environ.copy()
+    env.update({
+        'ZYDON_NON_MQL_IGNORE_HOURLY': '1',
+        'ZYDON_NON_MQL_IGNORE_DAILY': '1',
+    })
+    cmd = [sys.executable or 'python3', str(PROJ / 'scripts' / 'non_mql_legit_outreach.py'), '--send-current', str(tmp), '--sleep', '0']
+    try:
+        proc = subprocess.run(cmd, cwd=str(PROJ), env=env, text=True, capture_output=True, timeout=90)
+    except Exception as e:
+        return load_wpp(), f'tratativa externa Não-MQL pendente/erro ao acionar worker: {str(e)[:180]}'
+    out = (proc.stdout or '').strip()
+    err = (proc.stderr or '').strip()
+    if out.startswith('[SILENT]'):
+        return load_wpp(), 'tratativa externa Não-MQL pendente: outro envio externo em andamento; cron 10min retentará'
+    if proc.returncode != 0:
+        return load_wpp(), f'tratativa externa Não-MQL erro rc={proc.returncode}: {(err or out)[:240]}'
+    try:
+        data = json.loads(out or '{}')
+    except Exception:
+        return load_wpp(), f'tratativa externa Não-MQL retorno inesperado: {(out or err)[:240]}'
+    if not data.get('ok'):
+        return load_wpp(), f"tratativa externa Não-MQL não enviada: {data.get('error') or data.get('mode')}; {data.get('sender_errors') or ''}"
+    results = data.get('results') or []
+    for row in results:
+        res = row.get('result') or {}
+        if res.get('ok'):
+            return load_wpp(), f"tratativa externa Não-MQL enviada via {row.get('sender')}/{row.get('port')} msg={res.get('messageId')} task={res.get('task_id')}"
+        if res.get('skipped'):
+            return load_wpp(), f"tratativa externa Não-MQL pendente/bloqueada: {res.get('skipped')}"
+    skip = (data.get('skip_sample') or [{}])[0].get('skip') if data.get('skip_sample') else 'sem resultado'
+    return load_wpp(), f'tratativa externa Não-MQL não enviada: {skip}'
+
 
 def only_digits(x): return re.sub(r'\D','', x or '')
 
@@ -2731,7 +3248,7 @@ def sdr_opening_question(high_awareness):
     a primeira mensagem precisa terminar perguntando como a pessoa imagina que a
     Zydon pode ajudar. Não usar pergunta alternativa de curiosidade no diagnóstico.
     """
-    return 'Como você imagina que a Zydon poderia te apoiar?'
+    return MQL_INTENT_QUESTION_FIXED
 
 
 def group_erp_line(props):
@@ -2795,8 +3312,23 @@ def agenda_followup_for_lead(consultant_fallback, owner_id):
     else:
         line = f"Eu te chamo {timing} para seguir com um diagnóstico mais completo."
     if agenda:
-        line = f"Se quiser garantir o melhor horário para um diagnóstico completo, pode marcar direto aqui: {agenda}"
+        line = f"{MQL_AGENDA_PREFIX_FIXED} {agenda}"
     return line
+
+
+def should_send_agenda(replied_before_question, replied_after_question, agenda_already_sent=False):
+    """Decide se a agenda (etapa posterior, após o respiro de 20 min) deve ser enviada.
+
+    Etapa idempotente/retomável: o texto+PDF+pergunta já foram entregues e o grupo/
+    HubSpot/ledger já foram registrados antes do sleep longo. A agenda só sai se o
+    lead não respondeu (não passamos por cima da conversa) e se ainda não foi
+    enviada — assim uma retomada após queda não duplica a mensagem.
+    """
+    if agenda_already_sent:
+        return False, 'agenda já enviada'
+    if replied_before_question or replied_after_question:
+        return False, 'lead respondeu antes da agenda'
+    return True, 'enviar agenda'
 
 
 def lead_replied_after(port, jid, after_dt):
@@ -2865,18 +3397,36 @@ def bridge_me(port):
     except Exception as e:
         return False, str(e)
 
-def pick_online_port(owner_info, envios):
-    """Escolhe porta online menos usada, respeitando limite externo por chip.
-
-    Para Breno, usa somente 4605. Para rotação institucional, tenta o próximo
-    comunicador se a porta online menos usada já bateu o limite de aquecimento.
-    """
+def pick_online_port(owner_info, envios, jid=None, lead_key=None, dispatches=None):
+    """Escolhe porta online usando roteamento central + fallback por uso/limite."""
     ports = owner_info.get('portas') or [owner_info['porta']]
+    central_first = None
+    if jid and owner_info.get('owner_uid'):
+        if dispatches is None:
+            try:
+                from whatsapp_dispatch_queue import load_dispatches
+                dispatches = load_dispatches()
+            except Exception:
+                dispatches = None
+        try:
+            owner_uid = owner_info.get('owner_uid')
+            local_ports = {int(p): {'owner': owner_uid, 'role': 'sdr', 'label': owner_info.get('nome')} for p in ports}
+            local_users = {str(owner_uid): {'ports': [int(p) for p in ports], 'role': 'sdr'}}
+            decision = choose_outbound_port(owner_uid, jid, lead_key=lead_key or jid, rows=envios, dispatches=dispatches, ports=local_ports, users=local_users)
+            if decision.get('port') in ports:
+                central_first = int(decision.get('port'))
+        except Exception:
+            central_first = None
     def used_count(port):
         return sum(1 for e in envios if isinstance(e, dict) and e.get('bridge_port') == port)
     offline = []
     over_limit = []
-    for port in sorted(ports, key=lambda p: (used_count(p), p)):
+    # Para os avisos internos MQL/Não-MQL, obedecer ao rodízio por hora pedido
+    # pelo Rafael (4607 ↔ 4600), não ao menor uso histórico.
+    ordered_ports = _hourly_internal_notify_ports() if list(ports) == list(INTERNAL_NOTIFY_ROTATION_PORTS) else sorted(ports, key=lambda p: (used_count(p), p))
+    if central_first in ordered_ports:
+        ordered_ports = [central_first] + [p for p in ordered_ports if p != central_first]
+    for port in ordered_ports:
         ok, me = bridge_me(port)
         if not ok:
             offline.append(f'porta {port}: {me}')
@@ -2890,25 +3440,48 @@ def pick_online_port(owner_info, envios):
     return ports[0], False, detail or 'sem portas disponíveis dentro do limite', detail
 
 
+def _hourly_internal_notify_ports(now=None):
+    """Rafael 30/06: alternar por hora quem manda o aviso 1:1 para Mariana.
+
+    Hora par começa por Rafael (4607); hora ímpar começa por Mariana (4600).
+    Se o primeiro chip estiver offline, tenta o outro para não perder aviso.
+    """
+    now = now or datetime.now(ZoneInfo('America/Sao_Paulo'))
+    ports = list(INTERNAL_NOTIFY_ROTATION_PORTS)
+    if int(now.hour) % 2 == 1:
+        ports = list(reversed(ports))
+    return ports
+
+
+def internal_notify_target_for_port(port):
+    return INTERNAL_NOTIFY_TARGET_BY_PORT.get(int(port), (INTERNAL_NOTIFY_TARGET, INTERNAL_NOTIFY_LABEL))
+
+
 def post_group_with_rotation(text, envios):
-    """Envia ao grupo tentando comunicadores online; se forbidden/não membro, tenta o próximo."""
-    ports = NON_MQL_NOTIFY_OWNER.get('portas') or [NON_MQL_NOTIFY_OWNER['porta']]
+    """Compat legado: envia o resumo interno 1:1, não para grupo.
+
+    O nome ficou `post_group_with_rotation` para não reescrever todo o fluxo e os
+    status históricos. O destino real depende do chip remetente: Rafael -> Mariana
+    e Mariana -> Rafael.
+    """
+    ports = _hourly_internal_notify_ports()
     def used_count(port):
-        return sum(1 for e in envios if isinstance(e, dict) and (e.get('group_bridge_port') == port or (e.get('to') == GROUP and e.get('bridge_port') == port)))
+        target, _label = internal_notify_target_for_port(port)
+        return sum(1 for e in envios if isinstance(e, dict) and (e.get('group_bridge_port') == port or (e.get('to') == target and e.get('bridge_port') == port)))
     attempts = []
-    for group_port in sorted(ports, key=lambda p: (used_count(p), p)):
+    for group_port in sorted(ports, key=lambda p: (ports.index(p), used_count(p))):
         ok, me = bridge_me(group_port)
         if not ok:
             attempts.append({'port': group_port, 'status': 'offline', 'detail': me})
             continue
-        resp = post_bridge(group_port, '/send', {'to': GROUP, 'text': text})
-        attempts.append({'port': group_port, 'response': resp})
+        target, label = internal_notify_target_for_port(group_port)
+        resp = post_bridge(group_port, '/send', {'to': target, 'text': text})
+        attempts.append({'port': group_port, 'to': target, 'label': label, 'response': resp})
         if message_ok(resp):
+            if isinstance(resp, dict):
+                resp.setdefault('internal_notify_label', label)
             return group_port, resp, attempts
-        # Se a conta não está no grupo ou falhou, tenta outro comunicador.
-        if 'forbidden' in json.dumps(resp, ensure_ascii=False).lower() or 'not a participant' in json.dumps(resp, ensure_ascii=False).lower():
-            continue
-    return None, {'error': 'grupo não enviado por nenhum comunicador', 'attempts': attempts}, attempts
+    return None, {'error': 'aviso interno não enviado', 'attempts': attempts}, attempts
 
 
 def post_bridge(port, path, payload):
@@ -2918,6 +3491,33 @@ def message_ok(resp):
     txt=json.dumps(resp, ensure_ascii=False)
     # Nunca aceitar success:true sozinho; exigir messageId real ou status do WhatsApp.
     return ('messageId' in txt or '"status": 1' in txt or '"status":2' in txt or '"status": 2' in txt)
+
+
+def _is_external_lead_send_target(to):
+    target = str(to or '').strip()
+    if not target or target.endswith('@g.us'):
+        return False
+    internal = {GROUP, INTERNAL_NOTIFY_TARGET, '553484255965@s.whatsapp.net', '553496698718@s.whatsapp.net'}
+    internal.update(v[0] for v in INTERNAL_NOTIFY_TARGET_BY_PORT.values())
+    return target not in internal
+
+
+def _record_process_gate_shadow(port, path, payload):
+    if str(path or '') != '/send' or not isinstance(payload, dict):
+        return {'ok': False, 'skipped': True, 'reason': 'not_send_payload'}
+    to = payload.get('to') or payload.get('jid') or ''
+    if not _is_external_lead_send_target(to):
+        return {'ok': False, 'skipped': True, 'reason': 'internal_or_group_target'}
+    return record_dispatch_shadow(
+        origin='diagnostico',
+        nature='diagnostic_bundle',
+        thread_state='post_diagnostic',
+        to=to,
+        text=payload.get('text') or '',
+        port=port,
+        sender_role='diagnostico_mql',
+        lead_key=to,
+    )
 
 
 def post_bridge_with_retries(port, path, payload, attempts=3, delay=12):
@@ -2932,6 +3532,7 @@ def post_bridge_with_retries(port, path, payload, attempts=3, delay=12):
         resp = post_bridge(port, path, payload)
         responses.append({'attempt': attempt, 'response': resp})
         if message_ok(resp):
+            _record_process_gate_shadow(port, path, payload)
             return resp, responses
         # força leitura do estado da bridge e dá tempo do Baileys reconectar.
         try:
@@ -3214,7 +3815,10 @@ def strict_icp_check(props, research):
     corporate_recurring_b2b_signal = any(t in text for t in ['fornecedor b2b estruturado', 'soluções alimentares corporativas', 'solucoes alimentares corporativas', 'programas mensais recorrentes', 'benefícios corporativos', 'beneficios corporativos', 'empresas clientes', 'cliente empresa', 'rh']) and any(t in text for t in ['omie', 'site/whatsapp', 'whatsapp público', 'whatsapp publico', 'domínio corporativo', 'dominio corporativo']) and any(t in text for t in ['recorrentes', 'orçamento', 'orcamento', 'recompra', 'portal b2b', 'logística', 'logistica'])
     if corporate_recurring_b2b_signal:
         return True, 'B2B recorrente para empresas com domínio, ERP/WhatsApp e orçamento/logística; não depende de revenda literal'
-    apparel_factory_b2b_signal = any(t in text for t in ['fábrica', 'fabrica', 'confecção', 'confeccao', 'private label', 'tecidos esportivos']) and any(t in text for t in ['bling', 'b2b', '21 a 100 pessoas', 'atacado', 'revenda', 'grandes marcas'])
+    automotive_equipment_b2b_signal = any(t in text for t in ['mecânicas automotivas', 'mecanicas automotivas', 'oficinas automotivas', 'oficinas mecânicas', 'oficinas mecanicas']) and any(t in text for t in ['fabricante', 'fábrica', 'fabrica', 'indústria', 'industria', 'produto 100% nacional', 'direto da fábrica', 'direto da fabrica']) and any(t in text for t in ['máquina', 'maquina', 'equipamento', 'flanges', 'acessórios', 'acessorios', 'peças', 'pecas', 'catálogo', 'catalogo', 'loja virtual'])
+    if automotive_equipment_b2b_signal:
+        return True, 'fabricante B2B automotivo com produto físico, catálogo/loja e venda para oficinas; qualifica como MQL'
+    apparel_factory_b2b_signal = any(t in text for t in ['confecção', 'confeccao', 'private label', 'tecidos esportivos', 'moda fitness', 'vestuário', 'vestuario']) and any(t in text for t in ['bling', 'b2b', '21 a 100 pessoas', 'atacado', 'revenda', 'grandes marcas'])
     if apparel_factory_b2b_signal:
         return True, 'confecção/fábrica B2B com ERP, porte e canal para marcas/revendas; qualifica como MQL'
     erp = (props.get('qual_erp_utiliza_') or props.get('selecione_o_sistema_de_gesto_erp') or '').strip().lower()
@@ -3735,14 +4339,17 @@ def save_research(email, lead, research):
     (PESQ/(research['slug']+'_hubspot.json')).write_text(json.dumps(lead, ensure_ascii=False, indent=2), encoding='utf-8')
 
 GLOBAL_SEND_LOCK = '/tmp/zydon_external_whatsapp_send.lock'
+AGENDA_QUEUE = PROJ / 'controle' / 'agenda_queue.json'
 _GLOBAL_LOCK_FH = None
 
 
 def acquire_global_send_lock(blocking=True):
-    """Lock global entre diagnóstico/PDF e primeiro contato SDR.
+    """Lock global curto entre fluxos de envio externo.
 
-    Evita que dois crons externos decidam/enviem WhatsApp para o mesmo lead no
-    mesmo intervalo antes do ledger ser atualizado.
+    Compatível com o código legado: mantém um lock process-wide quando chamado
+    diretamente. O fluxo principal abaixo usa send_lock()/post_bridge_* para
+    segurar o lock apenas durante chamadas reais ao bridge, nunca durante sleeps
+    longos de cadência.
     """
     global _GLOBAL_LOCK_FH
     _GLOBAL_LOCK_FH = open(GLOBAL_SEND_LOCK, 'w')
@@ -3763,10 +4370,266 @@ def acquire_global_send_lock(blocking=True):
     return True
 
 
+class send_lock:
+    """Context manager para segurar o lock global só durante o envio real."""
+    def __init__(self, blocking=True):
+        self.blocking = blocking
+        self.fh = None
+        self.acquired = False
+    def __enter__(self):
+        self.fh = open(GLOBAL_SEND_LOCK, 'w')
+        flags = 0 if self.blocking else fcntl.LOCK_NB
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | flags)
+        except BlockingIOError:
+            try:
+                self.fh.close()
+            except Exception:
+                pass
+            return False
+        self.acquired = True
+        self.fh.write(f"process_gate_once send pid={os.getpid()} at={datetime.now(timezone.utc).isoformat()}\n")
+        self.fh.flush()
+        return True
+    def __exit__(self, exc_type, exc, tb):
+        if self.acquired and self.fh:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            if self.fh:
+                self.fh.close()
+        except Exception:
+            pass
+        return False
+
+
+def post_bridge_locked(port, path, payload):
+    with send_lock(blocking=True) as ok:
+        if not ok:
+            return {'skipped': True, 'reason': 'global_send_lock_busy'}
+        resp = post_bridge(port, path, payload)
+        if message_ok(resp):
+            _record_process_gate_shadow(port, path, payload)
+        return resp
+
+
+def post_bridge_with_retries_locked(port, path, payload, attempts=3, delay=12):
+    with send_lock(blocking=True) as ok:
+        if not ok:
+            return {'skipped': True, 'reason': 'global_send_lock_busy'}, []
+        return post_bridge_with_retries(port, path, payload, attempts=attempts, delay=delay)
+
+
+def enqueue_worker_owned_diagnostic_bundle(*, jid, port, msg, pdf_path, pdf_file_name, thumb_path=None,
+                                           question_text=None, email=None, contact_id=None, deal_id=None,
+                                           slug=None, company=None, phone=None, owner_id=None, owner_name=None,
+                                           sender_name=None, agenda_text=None, task_id=None, hubspot_file_id=None,
+                                           hubspot_file_error=None, group_summary=None, group_summary_response=None,
+                                           agenda_queue_key=None, question_sent_at=None, extra=None):
+    """Enfileira diagnóstico MQL completo para execução pelo worker central.
+
+    Não envia WhatsApp. Usar apenas quando o fluxo chamador NÃO fizer envio legado.
+    Mantém as três partes reais: texto curto, PDF e pergunta oficial.
+    """
+    question_text = question_text or MQL_INTENT_QUESTION_FIXED
+    parts = [
+        {'kind': 'text', 'text': msg},
+        {'kind': 'file', 'filePath': str(pdf_path), 'fileName': pdf_file_name, **({'thumbnailPath': thumb_path} if thumb_path else {})},
+        {'kind': 'text', 'text': question_text},
+    ]
+    payload = {
+        'origin': 'diagnostico',
+        'nature': 'diagnostic_bundle',
+        'thread_state': 'post_diagnostic',
+        'to': jid,
+        'text': '\n'.join([msg, str(pdf_file_name or pdf_path), question_text]),
+        'owner_uid': owner_id or owner_name,
+        'lead_key': deal_id or contact_id or email or jid,
+        'port': port,
+        'sender_role': sender_name or owner_name or 'diagnostico_mql',
+        'completion_type': 'diagnostic_bundle',
+        'parts': parts,
+        'delay_schedule': [TEXT_TO_PDF_DELAY_SECONDS, PDF_TO_QUESTION_DELAY_SECONDS],
+        'email': email,
+        'contact_id': contact_id,
+        'deal_id': deal_id,
+        'slug': slug,
+        'empresa': company,
+        'company': company,
+        'phone': phone,
+        'jid': jid,
+        'owner_id': owner_id,
+        'owner_name': owner_name,
+        'sender_name': sender_name or owner_name,
+        'question_text': question_text,
+        'agenda_text': agenda_text,
+        'pdf_path': str(pdf_path),
+        'hubspot_file_id': hubspot_file_id,
+        'hubspot_file_error': hubspot_file_error,
+        'task_id': task_id,
+        'group_summary': group_summary,
+        'group_summary_response': group_summary_response,
+        'agenda_queue_key': agenda_queue_key,
+        'question_sent_at': question_sent_at,
+        'cadence': {
+            'text_to_pdf_seconds': TEXT_TO_PDF_DELAY_SECONDS,
+            'pdf_to_question_seconds': PDF_TO_QUESTION_DELAY_SECONDS,
+            'question_to_agenda_seconds': QUESTION_TO_AGENDA_DELAY_SECONDS,
+        },
+    }
+    if extra:
+        payload.update(extra)
+    return record_dispatch_worker_owned(**payload)
+
+
+def build_mql_group_summary(*, company, first, email, props, lead, research, original_sdr, sdr):
+    """Resumo interno de qualificação MQL (mesmo texto no legado e no worker_owned).
+
+    Extraído em helper único para o caminho legado (/send direto) e o caminho
+    worker_owned (bundle na fila central) produzirem exatamente o mesmo aviso 1:1.
+    """
+    return (f"✅ Lead qualificado\n"
+            f"Empresa: {company}\n"
+            f"Contato: {first}\n"
+            f"Email: {email}\n"
+            f"{group_erp_line(props)}"
+            f"Entrada: {fmt_created_brt(props.get('recent_conversion_date') or props.get('createdate') or lead.get('createdate'))}\n"
+            f"Criativo/origem: {traffic_creative_line(props)}\n\n"
+            f"Por que qualificou:\n{group_reason_bullets(research, mql=True)}\n\n"
+            f"Responsável: {original_sdr or 'consultor responsável'}\n"
+            f"Diagnóstico enviado por: {sdr}\n"
+            f"Cadência: texto curto, PDF após 1 min, pergunta após 30s, agenda após 20 min")
+
+
+def dispatch_diagnostic_worker_owned(*, envios, email, cid, slug, deals, primary_deal_id,
+                                     owner, owner_name, sdr, company, phone, jid, port,
+                                     pdf, pretty, thumb, msg, intent_question, agenda_msg,
+                                     group_summary, queue_item=None, owner_actions=None,
+                                     file_name=None):
+    """Caminho worker_owned do diagnóstico MQL (cutover por flag).
+
+    NÃO chama /send nem /send-file para o lead: as três partes reais
+    (texto, PDF, pergunta) são enfileiradas em um único bundle para o worker
+    central. Aqui só resolvemos o que não depende do transporte do lead: aviso
+    do grupo institucional (idempotente), upload do PDF no HubSpot e task.
+
+    A agenda e o ledger `enviado_lead` NÃO são gravados aqui: eles ficam a cargo
+    do completion `diagnostic_bundle` do worker, para não mandar agenda antes do
+    envio real e não duplicar o diagnóstico.
+    """
+    owner_actions = owner_actions if owner_actions is not None else []
+    file_name = file_name or f'{company} - Potencial de Digitalizacao B2B.pdf'
+    # Grupo institucional: mesmo contrato idempotente do fluxo legado.
+    latest_envios = load_wpp()
+    group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=slug)
+    if group_blocked:
+        group_port, g_resp, _group_attempts = None, {'skipped': True, 'reason': group_reason}, []
+    else:
+        append_group_inflight(latest_envios, email, slug, contact_id=cid)
+        envios[:] = latest_envios
+        group_port, g_resp, _group_attempts = post_group_with_rotation(group_summary, envios)
+    # Anexo no HubSpot usa o arquivo canônico (sem acentos/espaços) para nome.
+    file_id, upload_err = upload_pdf_to_hubspot(pdf, slug)
+    file_url = hubspot_file_url(file_id) if file_id else ''
+    task_body = (f'Diagnóstico enfileirado para {jid} pela porta {port} ({sdr}). '
+                 f'Transporte real (texto, PDF após 1 min, pergunta após 30s) executado pelo worker central; '
+                 f'agenda é etapa posterior automática e só sai se o lead não responder.')
+    if file_id:
+        task_body += f'\nPDF do diagnóstico: {file_url}' if file_url else ''
+        task_body += f'\nArquivo anexado no HubSpot Files: {file_id}.'
+    elif upload_err:
+        task_body += f'\nPDF salvo local/Drive, mas não anexado no HubSpot: {upload_err}.'
+    tid = create_task(cid, deals, "WhatsApp — Diagnóstico 'Potencial de Digitalização B2B' enfileirado para o lead.", task_body, owner or None, [file_id] if file_id else None)
+    due_at = time.time() + QUESTION_TO_AGENDA_DELAY_SECONDS
+    agenda_queue_key = f"agenda:{email}:{slug}:{port}:{jid}"
+    enqueue_result = enqueue_worker_owned_diagnostic_bundle(
+        jid=jid,
+        port=port,
+        msg=msg,
+        pdf_path=pretty,
+        pdf_file_name=file_name,
+        thumb_path=thumb,
+        question_text=intent_question,
+        email=email,
+        contact_id=cid,
+        deal_id=primary_deal_id,
+        slug=slug,
+        company=company,
+        phone=phone,
+        owner_id=owner,
+        owner_name=owner_name,
+        sender_name=sdr,
+        agenda_text=agenda_msg,
+        task_id=tid,
+        hubspot_file_id=file_id,
+        hubspot_file_error=upload_err,
+        group_summary=group_summary,
+        group_summary_response=g_resp,
+        agenda_queue_key=agenda_queue_key,
+        extra={
+            'agenda_due_at_epoch': due_at,
+            'agenda_due_at_iso': datetime.fromtimestamp(due_at, timezone.utc).isoformat(),
+            'pretty_pdf_path': str(pretty),
+        },
+    )
+    # Fila de garantia: PDF gerado + enfileiramento worker_owned + HubSpot/grupo.
+    if queue_item:
+        try:
+            q = load_queue()
+            mark_step(q, queue_item['execution_id'], 'pdf_generated', 'done', path=str(pretty))
+            mark_step(q, queue_item['execution_id'], 'whatsapp_enqueued_worker_owned', 'done', chip=port, jid=jid, response=enqueue_result)
+            if file_id:
+                mark_step(q, queue_item['execution_id'], 'hubspot_attached', 'done', file_id=file_id, task_id=tid)
+            elif upload_err:
+                mark_step(q, queue_item['execution_id'], 'hubspot_attached', 'failed', error=upload_err, task_id=tid)
+            if group_port or (isinstance(g_resp, dict) and g_resp.get('skipped')):
+                mark_step(q, queue_item['execution_id'], 'group_notified', 'done' if group_port else 'skipped_duplicate', group_bridge_port=group_port, response=g_resp)
+            save_queue(q)
+        except Exception as e:
+            owner_actions.append(f"fila de garantia: não consegui marcar enfileiramento worker_owned: {str(e)[:120]}")
+    return {
+        'enqueue_result': enqueue_result,
+        'file_id': file_id,
+        'upload_err': upload_err,
+        'task_id': tid,
+        'group_port': group_port,
+        'group_summary_response': g_resp,
+        'agenda_queue_key': agenda_queue_key,
+        'agenda_due_at_epoch': due_at,
+    }
+
+
+def enqueue_agenda_followup(item):
+    """Persiste envio de agenda para dreno posterior idempotente.
+
+    O zydon-agenda-queue-sender-1min lê esta fila e só envia após due_at; se o
+    lead responder entre a pergunta e o vencimento, ele pula a agenda.
+    """
+    try:
+        AGENDA_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(AGENDA_QUEUE.read_text(encoding='utf-8')) if AGENDA_QUEUE.exists() else {'items': []}
+    except Exception:
+        data = {'items': []}
+    if not isinstance(data, dict):
+        data = {'items': []}
+    items = data.setdefault('items', [])
+    key = str(item.get('key') or '')
+    for existing in items:
+        if key and existing.get('key') == key and existing.get('status') == 'pending':
+            existing.update(item)
+            existing['status'] = 'pending'
+            existing['updated_at'] = datetime.now(timezone.utc).isoformat()
+            AGENDA_QUEUE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            return 'updated'
+    item.setdefault('status', 'pending')
+    item.setdefault('created_at', datetime.now(timezone.utc).isoformat())
+    items.append(item)
+    AGENDA_QUEUE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    return 'created'
+
 def main():
-    if not acquire_global_send_lock(blocking=True):
-        print('[SILENT]')
-        return
     gate=json.loads(GATE.read_text())
     reports=[]; envios=load_wpp(); processed=load_processed(); cycle_seen_emails=set()
     for lead in gate.get('leads',[]):
@@ -3778,6 +4641,16 @@ def main():
         # Override explícito/manual (Rafael/Marketing): precisa furar processed/Não-MQL
         # anterior para gerar diagnóstico quando a classificação foi corrigida.
         manual_hubspot_mql = lead.get('gate_trigger') == 'manual_hubspot_mql'
+        prior_non_mql = prior_non_mql_action_for_lead(envios, email=email, contact_id=cid, phone=phone)
+        if manual_hubspot_mql and prior_non_mql:
+            forced_port = lead.get('force_bridge_port')
+            prior_port = prior_non_mql.get('bridge_port')
+            if not forced_port:
+                reports.append(f"{email} | BLOQUEADO Não-MQL→MQL: faltou force_bridge_port do comunicador original; não enviei diagnóstico para não trocar chip")
+                continue
+            if prior_port and int(forced_port) != int(prior_port):
+                reports.append(f"{email} | BLOQUEADO Não-MQL→MQL: force_bridge_port={forced_port} difere do chip original {prior_port}; não enviei diagnóstico")
+                continue
         r=RESEARCH.get(email)
         if not r:
             reports.append(f'{email} | ERRO sem pesquisa Claude')
@@ -3884,22 +4757,25 @@ def main():
             latest_envios = load_wpp()
             group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=r['slug'])
             if group_blocked:
-                reports.append(f"{r['slug']} | MQL não | PULADO grupo/idempotência: {group_reason}; sem contato ao lead")
-                envios = latest_envios
+                envios, outreach_note = trigger_non_mql_external_now(email, cid, props, r, deals, latest_envios)
+                reports.append(f"{r['slug']} | MQL não | PULADO grupo/idempotência: {group_reason}; {outreach_note}")
                 continue
             append_group_inflight(latest_envios, email, r['slug'], contact_id=cid)
             envios = latest_envios
-            resp=post_bridge(port,'/send', {'to':GROUP,'text':text})
-            # Task de não-MQL NÃO é atribuída ao SDR (owner do lead); usa o owner de notificação (Mariana).
+            notify_target, notify_label = internal_notify_target_for_port(port)
+            resp=post_bridge(port,'/send', {'to':notify_target,'text':text})
+            # Task de não-MQL NÃO é atribuída ao SDR (owner do lead); usa o owner de notificação (Mariana/Rafael).
             task_body = text + (("\n\nHubSpot: " + '; '.join(invalid_stage_actions)) if invalid_stage_actions else '')
             tid=create_task(cid, deals, "Qualificação Zydon — lead não-MQL", task_body, NON_MQL_NOTIFY_OWNER['owner_id'])
             append_processed(email, r['slug'], 'nao_mql_grupo', phone, company)
 
-            # Regra do ciclo autônomo atual: Não-MQL NÃO recebe mensagem externa.
-            # Apenas resumo interno no grupo + task de qualificação.
-            outreach_summary = 'não enviado ao lead; somente aviso interno conforme regra do ciclo'
-            envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':r['slug'], 'status':'nao_mql_grupo', 'to':GROUP, 'bridge_port':port, 'response':resp, 'task_id':tid, 'hubspot_invalid_stage_actions': invalid_stage_actions, 'non_mql_outreach': outreach_summary})
-            reports.append(f"{r['slug']} | MQL não | lifecycle não alterado ({lifecycle_before or 'vazio'}) | owner sincronizado: {'; '.join(owner_actions)} | grupo interno enviado; sem contato ao lead")
+            # Rafael 2026-07-01: Não-MQL deste ciclo NÃO envia mensagem externa ao lead.
+            # Este fluxo apenas classifica, avisa internamente, cria task e registra o
+            # ledger; tratativas externas legítimas pertencem a cron separado.
+            outreach_summary = f'aviso interno 1:1 registrado para {notify_label}; sem WhatsApp externo ao lead neste fluxo'
+            envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':r['slug'], 'status':'nao_mql_grupo', 'to':notify_target, 'legacy_group':GROUP, 'internal_notify_label':notify_label, 'bridge_port':port, 'response':resp, 'task_id':tid, 'hubspot_invalid_stage_actions': invalid_stage_actions, 'non_mql_outreach': outreach_summary})
+            save_wpp(envios)
+            reports.append(f"{r['slug']} | MQL não | lifecycle não alterado ({lifecycle_before or 'vazio'}) | owner sincronizado: {'; '.join(owner_actions)} | aviso interno 1:1 para {INTERNAL_NOTIFY_LABEL}; sem WhatsApp externo ao lead")
             continue
         if not lead.get('phone_valid', True):
             local_variants = phone_variants_with_optional_9(phone or props.get('phone') or props.get('mobilephone') or props.get('hs_searchable_calculated_phone_number'))
@@ -3965,11 +4841,12 @@ def main():
                         continue
                     append_group_inflight(latest_envios, email, r['slug'], contact_id=cid)
                     envios = latest_envios
-                    resp=post_bridge(port,'/send', {'to':GROUP,'text':group_summary})
+                    notify_target, notify_label = internal_notify_target_for_port(port)
+                    resp=post_bridge(port,'/send', {'to':notify_target,'text':group_summary})
                     tid=create_task(cid, deals, "Qualificação Zydon — MQL com telefone inválido/fixo", group_summary + "\n\nHubSpot: " + '; '.join(invalid_stage_actions), owner or None)
                     append_processed(email, r['slug'], 'mql_telefone_invalido_grupo', phone, company)
-                    envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':r['slug'], 'status':'mql_telefone_invalido_grupo', 'to':GROUP, 'bridge_port':port, 'owner_id':owner, 'phone':phone, 'phone_invalid_reason':invalid_reason, 'hubspot_invalid_stage_actions':invalid_stage_actions, 'public_phone_lookup':'not_found', 'group_summary':group_summary, 'response':resp, 'task_id':tid})
-                    reports.append(f"{r['slug']} | MQL sim | lifecycle {lifecycle_mark} | telefone inválido/fixo | busca pública sem achado seguro | Leads Inválidos: {'; '.join(invalid_stage_actions)} | só-grupo")
+                    envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':r['slug'], 'status':'mql_telefone_invalido_grupo', 'to':notify_target, 'legacy_group':GROUP, 'internal_notify_label':notify_label, 'bridge_port':port, 'owner_id':owner, 'phone':phone, 'phone_invalid_reason':invalid_reason, 'hubspot_invalid_stage_actions':invalid_stage_actions, 'public_phone_lookup':'not_found', 'group_summary':group_summary, 'response':resp, 'task_id':tid})
+                    reports.append(f"{r['slug']} | MQL sim | lifecycle {lifecycle_mark} | telefone inválido/fixo | busca pública sem achado seguro | Leads Inválidos: {'; '.join(invalid_stage_actions)} | aviso interno para {INTERNAL_NOTIFY_LABEL}")
                     continue
         # MQL confirmado: só agora pode nascer HTML/PDF do diagnóstico.
         # A trava abaixo impede diagnóstico pré-MQL ou por lifecycle solto/manual sem contexto.
@@ -4006,7 +4883,7 @@ def main():
             envios = latest_envios
             group_port, g_resp, _group_attempts = post_group_with_rotation(group_summary, envios)
             tid=create_task(cid, deals, "MQL bloqueado — sem SDR dono no HubSpot", group_summary + "\n\nOwner sync: " + '; '.join(owner_actions), None)
-            envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'mql_bloqueado_sem_sdr_dono', 'to':GROUP, 'group_bridge_port': group_port, 'owner_id':owner, 'phone':phone, 'empresa':company, 'reason':block_reason, 'owner_sync_notes':owner_actions, 'group_summary':group_summary, 'group_summary_response':g_resp, 'task_id':tid, 'pdf_path': str(pretty)})
+            envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'mql_bloqueado_sem_sdr_dono', 'to':INTERNAL_NOTIFY_TARGET, 'legacy_group':GROUP, 'internal_notify_label':INTERNAL_NOTIFY_LABEL, 'group_bridge_port': group_port, 'owner_id':owner, 'phone':phone, 'empresa':company, 'reason':block_reason, 'owner_sync_notes':owner_actions, 'group_summary':group_summary, 'group_summary_response':g_resp, 'task_id':tid, 'pdf_path': str(pretty)})
             reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | BLOQUEADO sem SDR dono: {'; '.join(owner_actions)}")
             continue
         # Regra Rafael 23/06:
@@ -4019,6 +4896,8 @@ def main():
         hubspot_owner_info=OWNER_MAP.get(owner)
         original_sdr = hubspot_owner_info['nome'] if hubspot_owner_info else None
         force_bridge_port = lead.get('force_bridge_port')
+        phone_variants = phone_variants_with_optional_9(phone) or [only_digits(phone)]
+        jid = jid_from_phone(phone_variants[0])
         if force_bridge_port:
             # Conversas reclassificadas de Não-MQL devem continuar no mesmo
             # comunicador/chip que já falou com o lead. O SDR dono continua sendo
@@ -4034,7 +4913,7 @@ def main():
             use_sdr_for_lead = bool(hubspot_owner_info) and is_work_hours_brt()
             if use_sdr_for_lead:
                 lead_owner_info=hubspot_owner_info
-                port, ok, me, offline_detail = pick_online_port(lead_owner_info, envios)
+                port, ok, me, offline_detail = pick_online_port(lead_owner_info, envios, jid=jid, lead_key=cid or jid)
                 if ok:
                     owner_info=lead_owner_info; sdr=owner_info['nome']; consultant_fallback=False
                     # Quando o diagnóstico sai pelo próprio SDR dono, a mensagem deve falar em
@@ -4078,7 +4957,7 @@ def main():
         greeting_line = f"{greeting}, {first}, tudo bem?" if first else f"{greeting}, tudo bem?"
         agenda_msg = agenda_followup_for_lead(consultant_fallback, owner)
         msg=(f"{greeting_line} {owner_info['assinatura']}.\n\n"
-             f"Fiz uma análise prévia do potencial da digitalização B2B do seu negócio.")
+             f"{MQL_DIAGNOSTIC_TEXT_FIXED}")
         (PESQ/(slug+'_msg.txt')).write_text(msg, encoding='utf-8')
         phone_variants = phone_variants_with_optional_9(phone) or [only_digits(phone)]
         jid = jid_from_phone(phone_variants[0])
@@ -4109,6 +4988,29 @@ def main():
             'classification': {'mql': True, 'reason': r.get('motivo') or '', 'evidence': ['formulario', 'site/pesquisa']},
             'dedupe_keys': dedupe_keys(contact_id=cid, deal_id=primary_deal_id, phone=phone, email=email),
         })
+        if diagnostic_worker_owned_enabled():
+            # Cutover por flag: o transporte das três partes reais (texto, PDF e
+            # pergunta) e a agenda passam a ser executados pelo worker central.
+            # Aqui NÃO chamamos /send nem /send-file para o lead: só marcamos o
+            # inflight idempotente, montamos o aviso interno + HubSpot/task e
+            # enfileiramos o bundle worker_owned. O ledger `enviado_lead` e a
+            # agenda ficam a cargo do completion `diagnostic_bundle` do worker.
+            group_summary = build_mql_group_summary(company=company, first=first, email=email, props=props, lead=lead, research=r, original_sdr=original_sdr, sdr=sdr)
+            append_mql_inflight(latest_envios, email, slug, jid, port, owner, phone, company, contact_id=cid)
+            envios = latest_envios
+            wo = dispatch_diagnostic_worker_owned(
+                envios=envios, email=email, cid=cid, slug=slug, deals=deals,
+                primary_deal_id=primary_deal_id, owner=owner, owner_name=original_sdr or sdr,
+                sdr=sdr, company=company, phone=phone, jid=jid, port=port, pdf=pdf,
+                pretty=pretty, thumb=thumb, msg=msg, intent_question=intent_question,
+                agenda_msg=agenda_msg, group_summary=group_summary, queue_item=queue_item,
+                owner_actions=owner_actions,
+                file_name=f'{company} - Potencial de Digitalizacao B2B.pdf')
+            append_processed(email, slug, 'mql_diagnostico_em_andamento', phone, company)
+            reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado: {'; '.join(owner_actions)} | worker_owned: diagnóstico (texto+PDF+pergunta) enfileirado para o worker central; aviso interno para {INTERNAL_NOTIFY_LABEL}+HubSpot registrados; agenda no completion ({sdr}/porta {port})" + (f" | {fallback_note}" if fallback_note else ""))
+            envios = load_wpp()
+            time.sleep(1)
+            continue
         append_mql_inflight(latest_envios, email, slug, jid, port, owner, phone, company, contact_id=cid)
         envios = latest_envios
         resp1, lead_text_attempts = post_bridge_with_retries(port,'/send', {'to':jid,'text':msg}, attempts=3, delay=12)
@@ -4116,7 +5018,7 @@ def main():
             variant_errors = [{'jid': jid, 'resp': resp1}]
             for alt_phone in phone_variants[1:]:
                 alt_jid = jid_from_phone(alt_phone)
-                alt_resp, alt_attempts = post_bridge_with_retries(port,'/send', {'to':alt_jid,'text':msg}, attempts=2, delay=10)
+                alt_resp, alt_attempts = post_bridge_with_retries_locked(port,'/send', {'to':alt_jid,'text':msg}, attempts=2, delay=10)
                 lead_text_attempts += alt_attempts
                 if message_ok(alt_resp):
                     jid = alt_jid
@@ -4148,9 +5050,9 @@ def main():
                 fallback_note = (fallback_note + f'; fallback institucional após falha no envio SDR: {fallback_resp}') if fallback_note else f'fallback institucional após falha no envio SDR: {fallback_resp}'
                 agenda_msg = agenda_followup_for_lead(True, owner)
                 msg=(f"{greeting_line} {owner_info['assinatura']}.\n\n"
-                     f"Fiz uma análise prévia do potencial da digitalização B2B do seu negócio.")
+                     f"{MQL_DIAGNOSTIC_TEXT_FIXED}")
                 (PESQ/(slug+'_msg.txt')).write_text(msg, encoding='utf-8')
-                resp1, fallback_text_attempts = post_bridge_with_retries(port,'/send', {'to':jid,'text':msg}, attempts=2, delay=10)
+                resp1, fallback_text_attempts = post_bridge_with_retries_locked(port,'/send', {'to':jid,'text':msg}, attempts=2, delay=10)
         if not message_ok(resp1):
             reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado | ERRO texto lead sem messageId/status: {resp1}"); continue
         # Rafael pediu: cadência natural em quatro passos.
@@ -4158,7 +5060,7 @@ def main():
         # 3) 30s depois do PDF manda a pergunta oficial,
         # 4) só 20 minutos depois manda agenda/continuidade do SDR.
         time.sleep(TEXT_TO_PDF_DELAY_SECONDS)
-        resp2, lead_file_attempts = post_bridge_with_retries(port,'/send-file', {'to':jid,'filePath':pretty,'fileName':f'{company} - Potencial de Digitalizacao B2B.pdf','thumbnailPath':thumb}, attempts=3, delay=12)
+        resp2, lead_file_attempts = post_bridge_with_retries_locked(port,'/send-file', {'to':jid,'filePath':pretty,'fileName':f'{company} - Potencial de Digitalizacao B2B.pdf','thumbnailPath':thumb}, attempts=3, delay=12)
         if not message_ok(resp2):
             reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado | ERRO PDF lead sem messageId/status após retentativas: {lead_file_attempts}"); continue
         try:
@@ -4177,28 +5079,16 @@ def main():
             question_sent_at = pdf_sent_at
         else:
             question_sent_at = datetime.now(timezone.utc)
-            resp_question, question_attempts = post_bridge_with_retries(port, '/send', {'to': jid, 'text': intent_question}, attempts=3, delay=12)
+            resp_question, question_attempts = post_bridge_with_retries_locked(port, '/send', {'to': jid, 'text': intent_question}, attempts=3, delay=12)
             if not message_ok(resp_question):
                 reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado | ERRO pergunta lead sem messageId/status: {question_attempts}"); continue
-        time.sleep(QUESTION_TO_AGENDA_DELAY_SECONDS)
-        replied, replies = lead_replied_after(port, jid, question_sent_at)
-        agenda_attempts = []
-        if replied or replied_before_question:
-            resp3 = {'skipped': True, 'reason': 'lead_replied_before_agenda', 'replies': (replies_before_question if replied_before_question else replies)}
-        else:
-            resp3, agenda_attempts = post_bridge_with_retries(port, '/send', {'to': jid, 'text': agenda_msg}, attempts=3, delay=12)
+        # Commit do diagnóstico ANTES do respiro longo: texto+PDF+pergunta já foram
+        # entregues ao lead, então grupo, HubSpot e ledger `enviado_lead` são
+        # registrados agora. Eles NÃO podem depender do sleep de 20 min: se o processo
+        # cair/for morto durante o respiro, o time e o CRM já estão atualizados e a
+        # fila de garantia já fica `completed`. A agenda vira etapa posterior idempotente.
         # grupo: NÃO recebe o texto do lead nem PDF — apenas resumo curto de status (sem send-file)
-        group_summary=(f"✅ Lead qualificado\n"
-                       f"Empresa: {company}\n"
-                       f"Contato: {first}\n"
-                       f"Email: {email}\n"
-                       f"{group_erp_line(props)}"
-                       f"Entrada: {fmt_created_brt(props.get('recent_conversion_date') or props.get('createdate') or lead.get('createdate'))}\n"
-                       f"Criativo/origem: {traffic_creative_line(props)}\n\n"
-                       f"Por que qualificou:\n{group_reason_bullets(r, mql=True)}\n\n"
-                       f"Responsável: {original_sdr or 'consultor responsável'}\n"
-                       f"Diagnóstico enviado por: {sdr}\n"
-                       f"Cadência: texto curto, PDF após 1 min, pergunta após 30s, agenda após 20 min")
+        group_summary=build_mql_group_summary(company=company, first=first, email=email, props=props, lead=lead, research=r, original_sdr=original_sdr, sdr=sdr)
         latest_envios = load_wpp()
         group_blocked, group_reason = existing_group_notification(latest_envios, email=email, contact_id=cid, slug=slug)
         if group_blocked:
@@ -4210,11 +5100,7 @@ def main():
         # Upload no HubSpot usa o arquivo canônico sem acentos/espaços no nome.
         # O arquivo bonito (`pretty`) continua sendo usado só no WhatsApp para o lead.
         file_id, upload_err = upload_pdf_to_hubspot(pdf, slug)
-        task_body = f'Enviado texto + PDF para {jid} pela porta {port} ({sdr}). Cadência: texto, PDF após 1 min, pergunta após 30s e agenda após 20 min.'
-        if resp3.get('skipped'):
-            task_body += f"\nAgenda automática após 20 min NÃO enviada porque o lead respondeu antes. Continuar a conversa pelo contexto da resposta. Respostas detectadas: {json.dumps(resp3.get('replies') or [], ensure_ascii=False)}"
-        else:
-            task_body += ' Agenda enviada após 20 min.'
+        task_body = f'Enviado texto + PDF + pergunta para {jid} pela porta {port} ({sdr}). Cadência: texto, PDF após 1 min, pergunta após 30s e agenda após 20 min. Agenda é etapa posterior automática e só sai se o lead não responder.'
         file_url = hubspot_file_url(file_id) if file_id else ''
         if file_id:
             task_body += f'\nPDF do diagnóstico: {file_url}' if file_url else ''
@@ -4234,8 +5120,37 @@ def main():
         except Exception as e:
             owner_actions.append(f"fila de garantia: não consegui marcar HubSpot/grupo: {str(e)[:120]}")
         append_processed(email, slug, 'enviado_lead', phone, company)
-        envios.append({'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'enviado_lead', 'to':jid, 'group':GROUP, 'bridge_port':port, 'group_bridge_port': group_port if 'group_port' in locals() else None, 'owner_id':owner, 'fallback_note': fallback_note, 'text': msg, 'question_text': intent_question, 'agenda_text': agenda_msg, 'cadence': {'text_to_pdf_seconds': TEXT_TO_PDF_DELAY_SECONDS, 'pdf_to_question_seconds': PDF_TO_QUESTION_DELAY_SECONDS, 'question_to_agenda_seconds': QUESTION_TO_AGENDA_DELAY_SECONDS}, 'group_summary': group_summary, 'pdf_path': str(pretty), 'hubspot_file_id': file_id, 'hubspot_file_error': upload_err, 'text_response':resp1, 'file_response':resp2, 'question_response':resp_question, 'agenda_response':resp3, 'group_summary_response':g_resp, 'task_id':tid})
-        reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado: {'; '.join(owner_actions)} | disparado ({sdr}/porta {port})" + (f" | {fallback_note}" if fallback_note else ""))
+        notify_final_to = g_resp.get('to') if isinstance(g_resp, dict) and g_resp.get('to') else INTERNAL_NOTIFY_TARGET
+        notify_final_label = g_resp.get('internal_notify_label') if isinstance(g_resp, dict) and g_resp.get('internal_notify_label') else INTERNAL_NOTIFY_LABEL
+        diag_record = {'date': datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M'), 'email':email, 'slug':slug, 'status':'enviado_lead', 'to':jid, 'group':notify_final_to, 'legacy_group':GROUP, 'internal_notify_label':notify_final_label, 'bridge_port':port, 'group_bridge_port': group_port if 'group_port' in locals() else None, 'owner_id':owner, 'fallback_note': fallback_note, 'text': msg, 'question_text': intent_question, 'agenda_text': agenda_msg, 'cadence': {'text_to_pdf_seconds': TEXT_TO_PDF_DELAY_SECONDS, 'pdf_to_question_seconds': PDF_TO_QUESTION_DELAY_SECONDS, 'question_to_agenda_seconds': QUESTION_TO_AGENDA_DELAY_SECONDS}, 'group_summary': group_summary, 'pdf_path': str(pretty), 'hubspot_file_id': file_id, 'hubspot_file_error': upload_err, 'text_response':resp1, 'file_response':resp2, 'question_response':resp_question, 'agenda_pending': True, 'agenda_response': None, 'question_sent_at': question_sent_at.isoformat(), 'group_summary_response':g_resp, 'task_id':tid}
+        envios.append(diag_record)
+        save_wpp(envios)
+        reports.append(f"{slug} | MQL sim | lifecycle {lifecycle_mark} | owner sincronizado: {'; '.join(owner_actions)} | diagnóstico+aviso interno para {INTERNAL_NOTIFY_LABEL}+HubSpot registrados; agenda em etapa posterior ({sdr}/porta {port})" + (f" | {fallback_note}" if fallback_note else ""))
+        # Etapa posterior retomável/idempotente: agenda só depois do respiro de 20 min,
+        # sem manter este processo dormindo nem segurar o lock global de WhatsApp.
+        due_at = time.time() + QUESTION_TO_AGENDA_DELAY_SECONDS
+        question_mid = None
+        if isinstance(resp_question, dict):
+            question_mid = resp_question.get('messageId') or resp_question.get('id') or resp_question.get('key', {}).get('id')
+        queue_status = enqueue_agenda_followup({
+            'key': f"agenda:{email}:{slug}:{port}:{jid}",
+            'email': email,
+            'slug': slug,
+            'company': company,
+            'contact_id': cid,
+            'port': port,
+            'jid': jid,
+            'text': agenda_msg,
+            'due_at': due_at,
+            'due_at_iso': datetime.fromtimestamp(due_at, timezone.utc).isoformat(),
+            'question_sent_at': question_sent_at.isoformat() if hasattr(question_sent_at, 'isoformat') else str(question_sent_at),
+            'question_message_id': question_mid,
+            'source': 'process_gate_once',
+        })
+        diag_record['agenda_pending'] = True
+        diag_record['agenda_queue_status'] = queue_status
+        diag_record['agenda_due_at'] = datetime.fromtimestamp(due_at, ZoneInfo('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M')
+        save_wpp(envios)
         time.sleep(1)
     save_wpp(envios)
     print('\n'.join(reports) if reports else '[SILENT]')

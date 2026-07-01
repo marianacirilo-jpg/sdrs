@@ -28,13 +28,17 @@ import os
 import re
 from datetime import datetime, timezone, timedelta
 from scripts.whatsapp_safe_send import safe_send_text
+from scripts.whatsapp_send_orchestrator import enrich_legacy_row
+from scripts.whatsapp_routing import choose_outbound_port
+from scripts.zydon_operational_queues import append_wpp_envio_locked, replace_wpp_envios_locked
+from scripts.whatsapp_dispatch_flow import record_dispatch_shadow_from_row, record_dispatch_worker_owned
 
 # ─── Config ───
 BRIDGES = {
-    'breno': {'port': 4605, 'ports': [4605], 'owner_id': '86265630', 'owner_name': 'Breno'},
-    # Sarah usa somente a principal/4601; 4604 foi removida/desativada.
-    'sarah': {'port': 4601, 'ports': [4601], 'owner_id': '88063842', 'owner_name': 'Sarah'},
-    'lucas': {'port': 4603, 'owner_id': '85778446', 'owner_name': 'Lucas Batista'},
+    'breno': {'port': 4611, 'ports': [4611, 4605], 'owner_id': '86265630', 'owner_name': 'Breno', 'owner_uid': 'breno'},
+    # Sarah 2 recém-conectada fica prioritária; 4601 continua como fallback/afinidade.
+    'sarah': {'port': 4612, 'ports': [4612, 4601], 'owner_id': '88063842', 'owner_name': 'Sarah', 'owner_uid': 'sarah'},
+    'lucas': {'port': 4603, 'ports': [4603], 'owner_id': '85778446', 'owner_name': 'Lucas Batista', 'owner_uid': 'lucas_batista'},
 }
 
 def _load_hubspot_token():
@@ -56,9 +60,22 @@ HS_HEADERS = {"Authorization": f"Bearer {PAT}", "Content-Type": "application/jso
 PIPELINE = '671008549'
 STAGE_LEAD_SEM_CONTATO = '984052829'
 STAGE_PRIMEIRO_CONTATO = '1214320997'
+STAGE_RETORNO_CONTATO = '998099482'
 FIRST_5_STAGES = ['984052829', '1214320997', '998099482', '1151853491', '1376131958']
+# Rafael 30/06: nunca regredir lead em Introdução ou etapa superior para Retorno/Primeiro.
+PROTECTED_ADVANCED_STAGES = {
+    '1269308723',  # Introdução
+    '1269710168',  # Diagnóstico EC
+    '990617426',   # Apresentação Comercial
+    '1269308724',  # Apresentação Técnica
+    '984052831',   # Proposta / Negociação
+    '1213797817',  # Termos e condições
+    '984052834',   # Fechado
+    '984052835',   # Perdido
+}
 
 WPP_ENVIOS = '/root/.hermes/zydon-prospeccao/controle/wpp_envios.json'
+OUTBOUND_AUDIT = '/root/.hermes/zydon-prospeccao/controle/channel_outbound_audit.jsonl'
 GLOBAL_SEND_LOCK = '/tmp/zydon_external_whatsapp_send.lock'
 _GLOBAL_LOCK_FH = None
 DELAY_SEGUNDOS = 300  # 5min entre envios: cadência mais humana, menor risco no WhatsApp Business
@@ -109,19 +126,49 @@ def load_envios():
 
 
 def save_envios(envios):
-    """Grava a LISTA no formato real {"envios": [...]}."""
-    with open(WPP_ENVIOS, 'w') as f:
-        json.dump({"envios": envios}, f, ensure_ascii=False, indent=2)
+    """Grava a LISTA no formato real {"envios": [...]} sob lock central."""
+    replace_wpp_envios_locked(envios, WPP_ENVIOS)
+
+
+def _central_nature_for_registro(registro):
+    msg_type = str((registro or {}).get('msg_type') or '').lower()
+    status = str((registro or {}).get('status') or '').lower()
+    campaign = str((registro or {}).get('campaign_id') or '').lower()
+    try:
+        attempt = int((registro or {}).get('attempt_number') or 0)
+    except Exception:
+        attempt = 0
+    if 'mql_followup1' in msg_type or 'pos_diagnostico' in msg_type or 'pós-diagn' in msg_type:
+        return 'followup_f1_postdiag', 'post_diagnostic'
+    if 'cadencia_primeiro_contato' in campaign or 'primeiro_contato_cadencia' in msg_type:
+        return f'followup_f{attempt}' if attempt in (1, 2, 3, 4) else 'followup_f1', 'cold_outreach'
+    if 'primeiro_contato' in msg_type or 'primeiro_contato' in status:
+        return 'first_contact', 'cold_outreach'
+    if 'diagnostic' in msg_type or 'diagnostico' in msg_type or 'diagnóstico' in msg_type:
+        return 'diagnostic_bundle', 'post_diagnostic'
+    return 'first_contact', 'cold_outreach'
 
 
 def registrar_envio(registro):
-    """READ-MODIFY-WRITE: relê a lista atual, faz APPEND do novo registro e
-    grava de volta. Nunca sobrescreve a lista inteira — preserva o histórico
-    dos outros crons (gate/ciclo)."""
-    envios = load_envios()
-    envios.append(registro)
-    save_envios(envios)
-    return envios
+    """Append centralizado no ledger WhatsApp, preservando histórico sob flock."""
+    nature, thread_state = _central_nature_for_registro(registro)
+    dispatch_origin = 'followup' if str(nature).startswith('followup_') else ('diagnostico' if 'diagnostic' in nature or 'diagnostico' in nature else 'proatividade')
+    registro = enrich_legacy_row(
+        registro,
+        nature=nature,
+        origin=str((registro or {}).get('campaign_id') or (registro or {}).get('msg_type') or 'disparo_dinamico'),
+        thread_state=thread_state,
+        owner_uid=(registro or {}).get('owner_sdr') or (registro or {}).get('sdr') or (registro or {}).get('owner_id'),
+    )
+    record_dispatch_shadow_from_row(
+        registro,
+        origin=dispatch_origin,
+        nature=nature,
+        thread_state=thread_state,
+        owner_uid=(registro or {}).get('owner_sdr') or (registro or {}).get('sdr') or (registro or {}).get('owner_id'),
+    )
+    data = append_wpp_envio_locked(registro, WPP_ENVIOS)
+    return data.get('envios', []) if isinstance(data, dict) else []
 
 
 def normalize_phone(value):
@@ -134,6 +181,48 @@ def normalize_phone(value):
     if len(digits) in (12, 13) and digits.startswith('55'):
         digits = digits[2:]
     return digits
+
+
+def phone_key_variants(value):
+    """Equivalências BR com/sem nono dígito para dedupe real WhatsApp.
+
+    Baileys/onWhatsApp pode canonicalizar +55 DDD 9xxxx-xxxx para +55 DDD xxxx-xxxx
+    (ou o inverso). Se o ledger só comparar a chave exata, o mesmo lead aparece em
+    dois chats/chips. Sempre compare interseção desse conjunto.
+    """
+    k = normalize_phone(value) if not isinstance(value, str) or '@' in value or not value.isdigit() else normalize_phone(value)
+    vals = {k} if k else set()
+    if len(k) == 11 and k[2] == '9':
+        vals.add(k[:2] + k[3:])
+    elif len(k) == 10 and k[2] in '6789':
+        vals.add(k[:2] + '9' + k[2:])
+    return {v for v in vals if v}
+
+
+def same_phone_key(a, b):
+    return bool(phone_key_variants(str(a or '')) & phone_key_variants(str(b or '')))
+
+
+def sender_first_name(sender_name):
+    name = str(sender_name or '').strip()
+    return name.split()[0] if name else 'Rafael'
+
+
+def presentation_line_for_sender(sender_name):
+    return f"{sender_first_name(sender_name)} da Zydon aqui, plataforma de ecommerce B2B."
+
+
+def add_sender_presentation(text, sender_name):
+    line = presentation_line_for_sender(sender_name)
+    raw = str(text or '').strip()
+    if not raw or 'plataforma de ecommerce b2b' in raw.lower():
+        return raw
+    paras = [p.strip() for p in re.split(r'\n\s*\n+', raw) if p.strip()]
+    if not paras:
+        return line
+    if len(paras) == 1:
+        return paras[0] + '\n\n' + line
+    return '\n\n'.join([paras[0], line] + paras[1:])
 
 
 def history_outgoing_exists(phone_key, ports):
@@ -162,7 +251,7 @@ def history_outgoing_exists(phone_key, ports):
             raw = m.get('rawKey') or {}
             if isinstance(raw, dict):
                 vals += [raw.get('remoteJid'), raw.get('remoteJidAlt'), raw.get('participant')]
-            if any(normalize_phone(str(v or '')) == phone_key for v in vals):
+            if any(same_phone_key(str(v or ''), phone_key) for v in vals):
                 return True
     return False
 
@@ -189,7 +278,7 @@ def _history_messages_for_phone(phone_key, ports):
             raw = m.get('rawKey') or {}
             if isinstance(raw, dict):
                 vals += [raw.get('remoteJid'), raw.get('remoteJidAlt'), raw.get('participant')]
-            if any(normalize_phone(str(v or '')) == phone_key for v in vals):
+            if any(same_phone_key(str(v or ''), phone_key) for v in vals):
                 mm = dict(m)
                 try:
                     mm['_ts'] = float(m.get('timestamp') or 0)
@@ -224,19 +313,20 @@ def history_incoming_after_outgoing(phone_key, ports):
 def envios_phone_set(envios):
     """Anti-loop do fluxo SDR de primeiro follow-up.
 
-    Regra Rafael: diagnóstico/PDF, mesmo respondido, NÃO muda fase e NÃO bloqueia
-    o primeiro contato/follow-up do SDR. Aqui bloqueamos somente mensagens SDR já
-    enviadas, para não repetir a primeira abordagem do SDR.
+    Regra pós-incidente Atalaia 30/06: diagnóstico/PDF enviado por um chip também
+    bloqueia novo primeiro contato por outro chip. O próximo passo precisa seguir
+    pelo mesmo contexto/chip ou por fluxo de agenda/follow-up idempotente; nunca
+    criar uma segunda conversa de "primeiro contato" para o mesmo telefone.
     """
     chaves = set()
-    sdr_statuses = {'enviado', 'sent'}
-    sdr_msg_types = {'primeiro_contato', 'primeiro_contato_backlog_institucional', 'primeiro_contato_cadencia', 'mql_sdr_followup'}
+    sdr_statuses = {'enviado', 'sent', 'enviado_lead', 'enviado_mql', 'mql_diagnostico_em_andamento'}
+    sdr_msg_types = {'primeiro_contato', 'primeiro_contato_backlog_institucional', 'primeiro_contato_cadencia', 'mql_sdr_followup', 'diagnostico_mql', 'mql_diagnostico'}
     for r in envios:
         if not isinstance(r, dict):
             continue
         status = str(r.get('status', '')).lower()
         msg_type = str(r.get('msg_type', '')).lower()
-        # enviado_lead/enviado_mql são diagnóstico/MQL: servem de contexto, não de bloqueio.
+        # Diagnóstico/MQL também bloqueiam nova abertura por outro chip para evitar duas conversas do mesmo lead.
         if msg_type not in sdr_msg_types and status not in sdr_statuses:
             continue
         for campo in PHONE_FIELDS:
@@ -245,7 +335,47 @@ def envios_phone_set(envios):
                 continue
             p = normalize_phone(raw)
             if p:
-                chaves.add(p)
+                chaves.update(phone_key_variants(p))
+    return chaves
+
+
+def outbound_audit_phone_set(uid_filter=None):
+    """Telefones já enviados segundo a auditoria real da bridge.
+
+    O incidente de 30/06 mostrou que o ledger `wpp_envios.json` pode ter o número
+    solicitado, enquanto a bridge canonicaliza para outro JID. Para anti-loop de
+    primeiro contato, qualquer envio SDR real no audit bloqueia novo disparo para
+    o telefone solicitado OU canonicalizado.
+    """
+    chaves = set()
+    try:
+        with open(OUTBOUND_AUDIT, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception:
+        return chaves
+    allowed_uids = set(uid_filter or ['disparo_dinamico', 'fix_partial_followup'])
+    for line in lines[-10000:]:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get('event') != 'send':
+            continue
+        uid = str(r.get('uid') or '')
+        if uid not in allowed_uids:
+            continue
+        vals = [r.get('targetJid'), r.get('chatOriginal')]
+        bridge = r.get('bridge') or {}
+        vals += [bridge.get('to'), bridge.get('requestedTo')]
+        canon = bridge.get('canonicalization') or {}
+        vals += [canon.get('jid'), canon.get('requested')]
+        for v in vals:
+            s = str(v or '')
+            if s.endswith('@g.us'):
+                continue
+            p = normalize_phone(s)
+            if p:
+                chaves.update(phone_key_variants(p))
     return chaves
 
 
@@ -261,7 +391,7 @@ def diagnostico_ports_for_phone(envios, phone_key):
         if status not in {'enviado_lead', 'enviado_mql'} and msg_type not in {'diagnostico_mql', 'mql_diagnostico'}:
             continue
         vals = [str(r.get(c) or '') for c in PHONE_FIELDS]
-        if not any(normalize_phone(v) == phone_key for v in vals):
+        if not any(same_phone_key(v, phone_key) for v in vals):
             continue
         for field in ('bridge_port', 'port', 'sender_port'):
             try:
@@ -285,7 +415,7 @@ def diagnostico_context_for_phone(envios, phone_key):
         if status not in {'enviado_lead', 'enviado_mql'} and msg_type not in {'diagnostico_mql', 'mql_diagnostico'}:
             continue
         vals = [str(r.get(c) or '') for c in PHONE_FIELDS]
-        if not any(normalize_phone(v) == phone_key for v in vals):
+        if not any(same_phone_key(v, phone_key) for v in vals):
             continue
         text = str(r.get('text') or r.get('group_summary') or r.get('summary') or '').strip()
         if text:
@@ -374,7 +504,7 @@ def diagnostico_recente_hours(envios, phone_key, min_hours=20):
         if status not in {'enviado_lead', 'enviado_mql'} and msg_type not in {'diagnostico_mql', 'mql_diagnostico'}:
             continue
         vals = [str(r.get(c) or '') for c in PHONE_FIELDS]
-        if not any(normalize_phone(v) == phone_key for v in vals):
+        if not any(same_phone_key(v, phone_key) for v in vals):
             continue
         dt = parse_envio_datetime(r)
         if dt and (latest is None or dt > latest):
@@ -823,9 +953,47 @@ def primeiro_nome_valido(nome):
     return nome
 
 
+def empresa_parece_endereco(empresa):
+    """Evita usar endereço digitado no campo empresa como se fosse nome comercial.
+
+    Exemplo real: lead preencheu `Rua Pedro Gusso, 1540, Cidade Industrial...`
+    e a mensagem saiu `cadastro da Rua...`. Quando o campo parece endereço,
+    ele deve ser tratado como desconhecido; é melhor dizer apenas "seu cadastro"
+    do que personalizar errado.
+    """
+    text = re.sub(r'\s+', ' ', str(empresa or '')).strip()
+    if not text:
+        return False
+    low = text.lower()
+    address_prefixes = (
+        'rua ', 'r. ', 'avenida ', 'av ', 'av. ', 'rodovia ', 'estrada ', 'travessa ',
+        'alameda ', 'praça ', 'praca ', 'largo ', 'quadra ', 'qd ', 'qd. ',
+        'lote ', 'lt ', 'lt. ', 'bairro ', 'cep ',
+    )
+    if low.startswith(address_prefixes):
+        return True
+    address_words = (
+        ' cidade industrial', ' distrito industrial', ' jardim ', ' bairro ',
+        ' cep', ' cep:', ' lote ', ' quadra ', ' km ', ' nº', ' n°', ' numero ', ' número ',
+    )
+    if any(w in low for w in address_words) and re.search(r'\d{2,}', low):
+        return True
+    # Padrão típico: logradouro + número + cidade/UF/CEP. Evita pegar nomes
+    # comerciais comuns que tenham um único número pequeno.
+    if ',' in text and re.search(r'\b\d{3,}\b', text) and re.search(r'\b[A-Z]{2}\b|\b\d{5}-?\d{3}\b', text, re.I):
+        return True
+    return False
+
+
 def empresa_valida(empresa):
     empresa = (empresa or '').strip()
-    if not empresa or empresa.lower() in ('sem nome', 'sem empresa'):
+    # HubSpot usa sufixos internos como "- Nova oportunidade" no nome do negócio.
+    # Isso é etiqueta operacional e nunca deve aparecer na mensagem para o lead.
+    empresa = re.sub(r'\s*[-–—]\s*nova\s+oportunidade\s*$', '', empresa, flags=re.I).strip()
+    empresa = re.sub(r'\s+', ' ', empresa).strip()
+    if not empresa or empresa.lower() in ('sem nome', 'sem empresa', 'nova oportunidade'):
+        return ''
+    if empresa_parece_endereco(empresa):
         return ''
     return empresa
 
@@ -1025,6 +1193,8 @@ def greeting_from_intro(first_para):
     # Se já vier no formato aprovado (Bom dia/Boa tarde/Boa noite, Nome. Tudo bem?), preserva.
     m0 = re.match(r'^(Bom dia|Boa tarde|Boa noite),\s*([^.!?\n,]{2,40})\.\s*Tudo bem\??$', text, re.I)
     if m0:
+        # Rafael: o template é fixo, mas o cumprimento é variável operacional.
+        # Ao dividir em bolhas, ajustar Bom dia/Boa tarde/Boa noite conforme horário BRT.
         name0 = m0.group(2).strip()
         return f"{greeting_period_brt()}, {name0}. Tudo bem?"
     # Pega o nome antes da primeira vírgula em aberturas tipo
@@ -1160,19 +1330,62 @@ def send_whatsapp_sequence(port, jid, text, pause_seconds=12.0, final_pause_seco
     }
 
 
-def escolher_porta_online(bridge, envios):
-    """Retorna a porta online menos usada para o SDR.
+def enqueue_worker_owned_first_contact(lead, port, msg, *, owner_id, owner_name, sender_label='', sender_phone=''):
+    parts = split_whatsapp_text(msg, max_parts=3)
+    delay_schedule = [delay_before_next_part(i, len(parts), pause_seconds=12.0, final_pause_seconds=60.0) for i in range(1, len(parts))]
+    res = record_dispatch_worker_owned(
+        origin='proatividade',
+        nature='first_contact',
+        thread_state='cold_outreach',
+        to=lead['jid'],
+        text=msg,
+        owner_uid=lead.get('owner_uid') or owner_name,
+        lead_key=lead.get('deal_id') or lead.get('contact_id') or lead['jid'],
+        port=port,
+        sender_role=sender_label or owner_name,
+        completion_type='first_contact',
+        parts=parts,
+        delay_schedule=delay_schedule,
+        deal_id=lead.get('deal_id'),
+        contact_id=lead.get('contact_id'),
+        owner_id=owner_id,
+        owner_name=owner_name,
+        lead_name=lead.get('nome'),
+        tel_fmt=lead.get('tel_fmt'),
+        empresa=lead.get('empresa'),
+        slug=slugify(lead.get('empresa') or ''),
+        sender_name=sender_label or owner_name,
+        sender_phone=sender_phone,
+        campaign_id='lead_sem_contato_follow1',
+        msg_type='primeiro_contato',
+        attempt_number=1,
+    )
+    return {'ok': bool(res.get('ok')), 'deduped': bool(res.get('deduped')), 'dispatch_id': res.get('dispatch_id'), 'skipped': res.get('skipped'), 'reason': res.get('reason')}
 
-    Breno usa 4605; Sarah usa 4601. Algumas instâncias Baileys
-    ficam com /status stale (connected=false/needsQR=true) logo após o scan,
-    enquanto /me já retorna id/nome/phone válidos. Nessa condição, tratar como
-    online para NÃO perder a sessão recém-conectada nem excluir o chip da rotação.
+
+def escolher_porta_online(bridge, envios, jid=None, lead_key=None):
+    """Retorna a porta online para o SDR usando roteamento central + fallback legado.
+
+    Regra nova: se o lead já conversa por um chip do SDR, testar esse chip
+    primeiro; lead novo segue distribuição central. Se o chip escolhido estiver
+    offline, mantém fallback antigo de menor uso entre portas online.
     """
     ports = bridge.get('ports') or [bridge['port']]
+    central_first = None
+    if jid:
+        try:
+            decision = choose_outbound_port(bridge.get('owner_uid') or '', jid, lead_key=lead_key or jid, rows=envios)
+            if decision.get('port') in ports:
+                central_first = int(decision.get('port'))
+        except Exception:
+            central_first = None
     def used_count(port):
         return sum(1 for e in envios if isinstance(e, dict) and e.get('bridge_port') == port)
+    ordered = sorted(ports, key=lambda p: (used_count(p), p))
+    if central_first in ordered:
+        ordered = [central_first] + [p for p in ordered if p != central_first]
     erros = []
-    for port in sorted(ports, key=lambda p: (used_count(p), p)):
+    for port in ordered:
         try:
             url = f"http://localhost:{port}/status"
             req = urllib.request.Request(url)
@@ -1269,9 +1482,28 @@ def is_direct_external_envio(e):
     return bool(e.get('text_status') or e.get('messageId') or msg_type or status in {'enviado_lead','enviado_mql','enviado','sent'})
 
 
+def envio_external_contact_key(e):
+    """Chave do lead/pessoa para limites de WhatsApp.
+
+    Regra Rafael 30/06: limite operacional conta pessoa/lead único, não quantidade
+    de bolhas/partes enviadas para a mesma pessoa. Uma sequência com saudação,
+    apresentação e CTA continua valendo 1 unidade se for o mesmo telefone/JID.
+    """
+    if not isinstance(e, dict):
+        return ''
+    for field in PHONE_FIELDS:
+        raw = str(e.get(field) or '').strip()
+        if not raw or raw.endswith('@g.us'):
+            continue
+        key = normalize_phone(raw)
+        if key:
+            return key
+    return ''
+
+
 def envios_porta_periodo(envios, port, seconds=None, same_day=False):
     agora = datetime.now(timezone(timedelta(hours=-3)))
-    total = 0
+    contacts = set()
     for e in envios:
         if not is_direct_external_envio(e):
             continue
@@ -1288,8 +1520,16 @@ def envios_porta_periodo(envios, port, seconds=None, same_day=False):
             continue
         if same_day and dt.date() != agora.date():
             continue
-        total += 1
-    return total
+        key = envio_external_contact_key(e)
+        if key:
+            variants = phone_key_variants(key) or {key}
+            # Um telefone com/sem 9º dígito precisa cair na MESMA unidade.
+            contacts.add(sorted(variants, key=lambda v: (len(v), v))[0])
+        else:
+            # Fallback conservador quando não há telefone no registro: conta o
+            # próprio registro para não liberar envio sem rastreabilidade.
+            contacts.add(f"registro:{id(e)}")
+    return len(contacts)
 
 
 def port_within_external_limits(envios, port, max_per_hour=MAX_EXTERNAL_PER_PORT_HOUR, max_per_day=MAX_EXTERNAL_PER_PORT_DAY):
@@ -1300,7 +1540,21 @@ def port_within_external_limits(envios, port, max_per_hour=MAX_EXTERNAL_PER_PORT
     return ok, reason
 
 
+def current_deal_stage(deal_id):
+    if not deal_id:
+        return ''
+    res = hs_request(f'https://api.hubapi.com/crm/v3/objects/deals/{deal_id}?properties=dealstage')
+    return str(((res or {}).get('properties') or {}).get('dealstage') or '')
+
+
+def is_protected_advanced_stage(stage):
+    return str(stage or '') in PROTECTED_ADVANCED_STAGES
+
+
 def create_retorno_task(deal_id, contact_id, owner_id, owner_name, lead_name, tel, incoming_messages):
+    if is_protected_advanced_stage(current_deal_stage(deal_id)):
+        # Rafael 30/06: não criar atividade para leads fora das primeiras 6 etapas.
+        return None
     snippets = []
     for m in (incoming_messages or [])[-5:]:
         txt = re.sub(r'\s+', ' ', str(m.get('text') or '')).strip()
@@ -1352,6 +1606,9 @@ def resposta_fraca_whatsapp(incoming_messages):
 
 
 def create_hubspot_task(deal_id, contact_id, owner_id, owner_name, lead_name, tel, bridge_port=None, sender_phone=None, sender_label=None, message_id=None):
+    if is_protected_advanced_stage(current_deal_stage(deal_id)):
+        # Rafael 30/06: atividades automáticas só nas primeiras 6 etapas.
+        return None
     url = "https://api.hubapi.com/crm/v3/objects/tasks"
     sender_label = sender_label or owner_name
     sender_phone = sender_phone or ''
@@ -1413,7 +1670,8 @@ def acquire_global_send_lock(blocking=False):
 def main():
     args = sys.argv[1:]
     dry_run_requested = '--dry-run' in args
-    if not dry_run_requested and not acquire_global_send_lock(blocking=False):
+    worker_owned = str(os.environ.get('ZYDON_DISPARO_DINAMICO_WORKER_OWNED') or '').lower() in {'1', 'true', 'yes', 'on'}
+    if not dry_run_requested and not worker_owned and not acquire_global_send_lock(blocking=False):
         # Outro fluxo externo está enviando/registrando agora (diagnóstico/PDF ou outro SDR).
         # Sair sem enviar evita corrida; cron tenta de novo no próximo tick.
         print("🕒 Lock global de envio ocupado; pulando este ciclo para evitar duplicidade com diagnóstico/SDR.")
@@ -1474,9 +1732,22 @@ def main():
     if stage_scope in ('lead_sem_contato', 'lead-sem-contato', 'lsc'):
         search_stages = [STAGE_LEAD_SEM_CONTATO]
         stage_label = 'Lead Sem Contato'
+        # Regra padrão: a régua automática só olha Primeiro Contato. Exceção
+        # operacional explícita do Rafael (01/07): iniciar os leads que ainda estão
+        # em Lead Sem Contato pelos chips recém-conectados de Sarah/Breno. Mantém
+        # opt-in por variável para o cron principal não reabrir LSC sozinho.
+        allow_lsc_send = str(os.environ.get('ZYDON_ALLOW_LEAD_SEM_CONTATO_SEND') or '').lower() in ('1', 'true', 'yes', 'sim')
+        if not dry_run and not allow_lsc_send:
+            print('🛑 Regra Rafael 01/07: automação padrão só envia se o negócio estiver em Primeiro Contato. Lead Sem Contato exige autorização explícita por execução.')
+            return
+    elif stage_scope in ('primeiro_contato', 'primeiro-contato', 'pc'):
+        search_stages = [STAGE_PRIMEIRO_CONTATO]
+        stage_label = 'Primeiro Contato'
     else:
-        search_stages = FIRST_5_STAGES
-        stage_label = '5 primeiras etapas'
+        # Fail-closed: não varrer 5 etapas para envio automático. O escopo de
+        # WhatsApp SDR agora é somente Primeiro Contato.
+        search_stages = [STAGE_PRIMEIRO_CONTATO]
+        stage_label = 'Primeiro Contato'
 
     bridge = BRIDGES[sdr_key]
     owner_id = bridge['owner_id']
@@ -1491,8 +1762,9 @@ def main():
 
     # 1. Carregar envios (anti-loop) — fonte ÚNICA compartilhada (lista)
     envios = load_envios()
-    enviados_keys = envios_phone_set(envios)
+    enviados_keys = envios_phone_set(envios) | outbound_audit_phone_set()
     print(f"   {len(envios)} registros de envio carregados (controle compartilhado).")
+    print(f"   {len(enviados_keys)} telefones bloqueados por anti-loop ledger/audit.")
 
     if max_per_hour is not None:
         usados_ultima_hora = envios_sdr_ultima_hora(envios, owner_name)
@@ -1618,15 +1890,18 @@ def main():
                     else:
                         print(f"   ↪️  {dealname}: resposta fraca detectada; NÃO movido para Retorno. Task={task_id} ({len(incoming)} msg).")
                 else:
-                    try:
-                        hs_request(
-                            f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
-                            'PATCH',
-                            {'properties': {'dealstage': '998099482'}},
-                        )
-                        print(f"   ↪️  {dealname}: resposta com sinal/contexto; movido para Retorno Contato. Task={task_id} ({len(incoming)} msg).")
-                    except Exception as e:
-                        print(f"   ⚠️  {dealname}: resposta detectada, task={task_id}, mas falhou mover para Retorno Contato: {e}")
+                    if dealstage in PROTECTED_ADVANCED_STAGES:
+                        print(f"   ↪️  {dealname}: resposta detectada, mas negócio já está em etapa avançada ({dealstage}); NÃO movido para Retorno. Task={task_id} ({len(incoming)} msg).")
+                    else:
+                        try:
+                            hs_request(
+                                f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}",
+                                'PATCH',
+                                {'properties': {'dealstage': STAGE_RETORNO_CONTATO}},
+                            )
+                            print(f"   ↪️  {dealname}: resposta com sinal/contexto; movido para Retorno Contato. Task={task_id} ({len(incoming)} msg).")
+                        except Exception as e:
+                            print(f"   ⚠️  {dealname}: resposta detectada, task={task_id}, mas falhou mover para Retorno Contato: {e}")
             ja_enviado += 1
             continue
 
@@ -1648,7 +1923,7 @@ def main():
             else:
                 print(f"   ⏳ {dealname}: diagnóstico enviado há {recent_diag_hours:.2f}h; aguardando antes do follow SDR para não repetir contato colado.")
             continue
-        if phone_key in enviados_keys or (history_outgoing_exists(phone_key, bridge_ports) and not diag_context):
+        if phone_key in enviados_keys or history_outgoing_exists(phone_key, bridge_ports):
             ja_enviado += 1
             if dealstage == STAGE_LEAD_SEM_CONTATO and not dry_run:
                 try:
@@ -1723,7 +1998,7 @@ def main():
         # Escolhe a porta a cada mensagem para alternar entre chips ativos
         # (ex.: rotação entre portas quando houver múltiplos chips ativos).
         envios_rotacao = load_envios()
-        port, status, port_errors = escolher_porta_online(bridge, envios_rotacao)
+        port, status, port_errors = escolher_porta_online(bridge, envios_rotacao, jid=lead['jid'], lead_key=lead.get('deal_id') or lead.get('contact_id') or lead['jid'])
         if not port:
             print(f"     ❌ Nenhuma porta online no momento. Abortando lote para proteger os chips.")
             for err in port_errors:
@@ -1741,6 +2016,9 @@ def main():
         except Exception:
             pass
 
+        if not history_outgoing_exists(normalize_phone(lead['jid']), [port]):
+            msg = add_sender_presentation(msg, sender_label)
+
         # Recheca a fonte compartilhada IMEDIATAMENTE antes de enviar. Isso cobre
         # a corrida em que o diagnóstico acabou de registrar o mesmo telefone entre
         # a montagem dos candidatos e este ponto, e também aplica teto global por chip.
@@ -1749,7 +2027,12 @@ def main():
             print("     ↪️ Pulado: telefone apareceu no ledger compartilhado antes do envio.")
             enviados_keys.add(normalize_phone(lead['jid']))
             continue
-        port_ok, port_reason = port_within_external_limits(envios_finais, port)
+        port_ok, port_reason = port_within_external_limits(
+            envios_finais,
+            port,
+            max_per_hour=max_per_hour or MAX_EXTERNAL_PER_PORT_HOUR,
+            max_per_day=max_per_day or MAX_EXTERNAL_PER_PORT_DAY,
+        )
         if not port_ok:
             print(f"     🛑 Limite global do chip atingido: {port_reason}. Pulando este envio.")
             continue
@@ -1758,6 +2041,25 @@ def main():
             print("     🧪 DRY-RUN: não envia WhatsApp, não cria task, não move etapa.")
             enviados += 1
             continue
+
+        if worker_owned:
+            res = enqueue_worker_owned_first_contact(
+                lead,
+                port,
+                msg,
+                owner_id=owner_id,
+                owner_name=owner_name,
+                sender_label=sender_label,
+                sender_phone=sender_phone,
+            )
+            if res.get('ok') or res.get('deduped'):
+                print(f"     🧾 Enfileirado worker_owned: {res.get('dispatch_id') or 'dedupe'}")
+                enviados += 1
+                enviados_keys.add(normalize_phone(lead['jid']))
+                continue
+            print(f"     ❌ Falha ao enfileirar worker_owned: {res}")
+            falhas += 1
+            break
 
         ok, resp = send_whatsapp_sequence(port, lead['jid'], msg)
         if ok:

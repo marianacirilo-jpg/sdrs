@@ -1,5 +1,0 @@
-{"ts": "2026-06-24T21:14:27.949702-03:00", "uid": "lucas_batista", "dealId": "61544004906", "action": "tratar_d0_real", "note": "teste local", "previousSanitationBucket": "reconciliar_hubspot"}
-{"ts": "2026-06-24T21:14:27.959810-03:00", "uid": "lucas_batista", "dealId": "61544004906", "action": "limpar", "note": "", "previousSanitationBucket": ""}
-{"ts": "2026-06-24T21:15:44.687760-03:00", "uid": "rafael", "dealId": "61463150954", "action": "limpar", "note": "", "previousSanitationBucket": "d0_real"}
-{"ts": "2026-06-24T21:15:44.703549-03:00", "uid": "rafael", "dealId": "61463150954", "action": "confirmar_d0", "note": "teste automatizado limpar em seguida", "previousSanitationBucket": "d0_real"}
-{"ts": "2026-06-24T21:15:44.731220-03:00", "uid": "rafael", "dealId": "61463150954", "action": "limpar", "note": "", "previousSanitationBucket": "d0_real"}

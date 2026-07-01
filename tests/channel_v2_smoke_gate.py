@@ -4,8 +4,10 @@
 Starts no services by default; expects 8280/8791 already running.
 Fails if core routes/APIs are slow or broken.
 """
+import html
 import importlib.util
 import json
+import re
 import sys
 import time
 import urllib.parse
@@ -38,15 +40,88 @@ def check(cond, msg):
     else:
         print('OK:', msg)
 
+def visible_text_from_html(raw_html):
+    """Approximate text users can see without counting JS/CSS/internal code."""
+    raw_html = re.sub(r'<script\b[^>]*>.*?</script>', ' ', raw_html, flags=re.I | re.S)
+    raw_html = re.sub(r'<style\b[^>]*>.*?</style>', ' ', raw_html, flags=re.I | re.S)
+    raw_html = re.sub(r'<!--.*?-->', ' ', raw_html, flags=re.S)
+    text = re.sub(r'<[^>]+>', ' ', raw_html)
+    return re.sub(r'\s+', ' ', html.unescape(text)).strip().lower()
+
 # Health
 for port in (8280, 8791):
     code, body, ms = fetch(f'http://127.0.0.1:{port}/health', timeout=3)
     check(code == 200 and ms < 1000, f'health {port} {ms}ms')
 
 # Direct routes
-for route in ('/conversas', '/foco', '/gestao'):
+route_bodies = {}
+for route in ('/conversas', '/foco', '/gestao', '/agendas'):
     code, body, ms = fetch(f'http://127.0.0.1:8280{route}', timeout=8)
+    route_bodies[route] = body.decode('utf-8', errors='replace')
     check(code == 200 and b'Inbox comercial' in body and ms < 2000, f'route {route} {ms}ms')
+
+# Visible copy guard: users should see operação/comercial context, not internal provenance.
+forbidden_visible_terms = ('auditoria', 'ledger', 'debug', 'evento técnico', 'fonte interna', 'log técnico')
+for route, raw_html in route_bodies.items():
+    visible = visible_text_from_html(raw_html)
+    bad = [term for term in forbidden_visible_terms if term in visible]
+    check(not bad, f'no internal/audit copy visible on {route}')
+
+# Visual dark-mode guard: Rafael flagged a white native tab bar in /foco.
+# Keep this in smoke gate (not only unittest) so a bad candidate cannot promote.
+foco_html = route_bodies.get('/foco', '')
+if '.focus-subtabs{' in foco_html:
+    idx = foco_html.index('.focus-subtabs{')
+    focus_tabs_css = foco_html[idx:idx+1400].lower()
+    check('rgba(16,25,19,.86)' in focus_tabs_css and 'background:white' not in focus_tabs_css and 'background:#fff' not in focus_tabs_css and 'background:#ffffff' not in focus_tabs_css,
+          'foco subtab dark visual guard')
+else:
+    check(False, 'foco subtab dark visual guard')
+
+# Gestão SDR / Saúde da máquina: APIs read-only e rápidas precisam estar vivas no gate.
+code, body, ms = fetch('http://127.0.0.1:8280/api/ops-health-summary', timeout=5)
+ops = json.loads(body)
+check(code == 200 and ops.get('mutates') is False and ops.get('risk') in ('ok', 'attention', 'critical') and ms < 1000,
+      f'ops health summary risk={ops.get("risk")} {ms}ms')
+check(bool(ops.get('watchdog')) and ops.get('watchdog', {}).get('label'),
+      'ops health exposes monitoramento signal')
+
+code, body, ms = fetch('http://127.0.0.1:8280/api/sdr-orchestrator-summary', timeout=8)
+orch = json.loads(body)
+check(code == 200 and orch.get('configured') is True and len(orch.get('sdrCards') or []) >= 3 and ms < 5000,
+      f'sdr orchestrator cards={len(orch.get("sdrCards") or [])} {ms}ms')
+check('approachPerformance' in orch and 'taskHygienePreview' in orch,
+      'sdr orchestrator exposes approach performance and hygiene preview')
+
+# Central Dexter: Gestão deve materializar crons/contextos em um endpoint read-only.
+code, body, ms = fetch('http://127.0.0.1:8280/api/dexter-center?days=7&limit=20', timeout=6)
+dexter = json.loads(body)
+check(code == 200 and dexter.get('ok') is True and dexter.get('summary', {}).get('cronsTotal', 0) >= 1
+      and isinstance(dexter.get('crons'), list) and isinstance(dexter.get('contexts'), list) and ms < 2000,
+      f'dexter center crons={dexter.get("summary", {}).get("cronsTotal")} contexts={len(dexter.get("contexts") or [])} {ms}ms')
+
+# Controle de agendas: endpoint read-only precisa estar vivo e rápido.
+code, body, ms = fetch('http://127.0.0.1:8280/api/agendas?days=7', timeout=6)
+agendas = json.loads(body)
+check(code == 200 and agendas.get('ok') is True and isinstance(agendas.get('rows'), list)
+      and isinstance(agendas.get('summary'), dict) and ms < 2000,
+      f'agendas endpoint rows={len(agendas.get("rows") or [])} {ms}ms')
+
+# Centralizador Dexter (subabas Crons/Contextos da rota /agendas): read-only e rápido.
+code, body, ms = fetch('http://127.0.0.1:8280/api/dexter-center?days=14&limit=20', timeout=6)
+dexter = json.loads(body)
+check(code == 200 and dexter.get('ok') is True and isinstance(dexter.get('crons'), list)
+      and isinstance(dexter.get('contexts'), list) and isinstance(dexter.get('summary'), dict)
+      and ms < 2000,
+      f'dexter-center endpoint crons={len(dexter.get("crons") or [])} contexts={len(dexter.get("contexts") or [])} {ms}ms')
+# Privacidade: o resumo do centralizador nunca carrega o prompt completo do cron.
+check(all('prompt' not in c for c in (dexter.get('crons') or [])),
+      'dexter-center never exposes full cron prompt')
+
+code, body, ms = fetch('http://127.0.0.1:8280/api/chips', timeout=6)
+chips_payload = json.loads(body)
+check(code == 200 and len(chips_payload.get('chips') or []) >= 8 and ms < 2500,
+      f'chips endpoint count={len(chips_payload.get("chips") or [])} {ms}ms')
 
 # Conversations endpoint: first call may compute, cached calls must be fast
 code, body, ms = fetch('http://127.0.0.1:8280/api/conversations', timeout=12)
@@ -62,7 +137,9 @@ known = [
     '4610::5555997175688@s.whatsapp.net',  # Boutique Gustavo PDF
     # 4607::5555997175688 era espelho de group_bridge_port, não envio real ao lead.
     # Incidente King Talhas 26/06: não exigir/mostrar falso remetente do comunicador.
-    '4607::5534992492012@s.whatsapp.net',  # BIOCOM Rafael/Sarah
+    # 4607::5534992492012 é caso de card operacional sem bolha real no device; pelo
+    # contrato atual, a listagem pode existir, mas o detalhe não deve inventar mensagem.
+    '4607::5585988903132@s.whatsapp.net',  # Rafael institucional com bolhas reais verificadas
     '4605::5511987045720@s.whatsapp.net',  # Lunar/Breno: print com loading lento
 ]
 for conv in known:

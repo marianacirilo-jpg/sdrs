@@ -18,6 +18,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from whatsapp_safe_send import safe_send_text
 
 ROOT = Path('/root/.hermes/zydon-prospeccao')
 DISPARO = ROOT / 'disparo_dinamico.py'
@@ -45,9 +46,11 @@ SENDERS = [
 ]
 
 OWNER_MAP = {
-    '86265630': {'key': 'breno', 'name': 'Breno', 'phone_digits': '5534984472414', 'phone_display': '34 98447-2414'},
-    '88063842': {'key': 'sarah', 'name': 'Sarah', 'phone_digits': '5534984095632', 'phone_display': '34 98409-5632'},
-    '85778446': {'key': 'lucas', 'name': 'Lucas Batista', 'phone_digits': '5534984295409', 'phone_display': '34 98429-5409'},
+    # Telefones dos SDRs devem ser os chips que estão na automação/bridge.
+    # Rafael corrigiu em 29/06: não usar os números antigos de ligação.
+    '86265630': {'key': 'breno', 'name': 'Breno', 'phone_digits': '553484325076', 'phone_display': '34 8432-5076'},
+    '88063842': {'key': 'sarah', 'name': 'Sarah', 'phone_digits': '553484095632', 'phone_display': '34 8409-5632'},
+    '85778446': {'key': 'lucas', 'name': 'Lucas Batista', 'phone_digits': '553484295409', 'phone_display': '34 8429-5409'},
 }
 
 NATIVE_ERPS = {'bling', 'omie', 'olist', 'tiny', 'olist/tiny', 'sankhya'}
@@ -321,13 +324,7 @@ def write_preview(leads):
 
 
 def send_whatsapp(port, jid, text):
-    body = json.dumps({'to': jid, 'text': text}).encode()
-    req = urllib.request.Request(f'http://127.0.0.1:{port}/send', data=body, headers={'Content-Type':'application/json'}, method='POST')
-    try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            return True, json.loads(resp.read().decode())
-    except Exception as e:
-        return False, {'error': str(e)}
+    return safe_send_text(port, jid, text, uid='sumico_inicio_funil', timeout=35)
 
 
 def create_task(lead, sender, msg, resp):

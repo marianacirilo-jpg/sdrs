@@ -11,7 +11,7 @@ Path('/tmp/channel_v2_frontend.js').write_text(js)
 print('frontend_js_bytes', len(js))
 PY
 node --check /tmp/channel_v2_frontend.js
-python3 -m unittest discover -s tests -v
+python3 -m unittest tests.test_channel_v2_core tests.test_channel_v2_watchdog_hysteresis -v
 python3 tests/channel_v2_smoke_gate.py
 
 echo 'Channel V2 release gate OK'

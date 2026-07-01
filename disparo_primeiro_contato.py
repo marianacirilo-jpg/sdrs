@@ -46,7 +46,9 @@ PAT = _load_hubspot_token()
 HUBSPOT_HEADERS = {"Authorization": f"Bearer {PAT}", "Content-Type": "application/json"}
 
 LEADS_FILE = '/tmp/sdr_primeiro_contato_enriquecido.json'
-WPP_ENVIOS = '/root/.hermes/zydon-prospeccao/wpp_envios.json'
+# Ledger compartilhado que o Channel observa em /api/conversations.
+# Não gravar no root do projeto: esse caminho não é observado pela tela.
+WPP_ENVIOS = '/root/.hermes/zydon-prospeccao/controle/wpp_envios.json'
 DELAY_SEGUNDOS = 30  # delay entre envios para evitar flag de spam
 
 

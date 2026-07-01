@@ -1,5 +1,3 @@
-# SDRs / Channel Zydon
+# Zydon SDRs
 
-Snapshot sanitizado do projeto SDR/Channel V2 e automações comerciais Zydon.
-
-Segredos, sessões, logs, backups, PDFs gerados e bases operacionais pesadas não são versionados aqui.
+Export sanitizado do sistema SDR/Channel Zydon. Dados operacionais, leads, logs, credenciais, mídias, PDFs, pesquisas e tokens não são versionados.

@@ -2,14 +2,24 @@
 # -*- coding: utf-8 -*-
 """Tratativa WhatsApp para leads legítimos, mas Não-MQL.
 
-- Usa os comunicadores Lucas Resende (4606), Mariana (4600) e Rafael (4607).
-- Fail-closed: só envia quando há e-mail corporativo/domínio não-gratuito, empresa real,
-  telefone BR normalizável e nenhuma evidência local de envio anterior da campanha.
-- Registra wpp_envios.json e task COMPLETED no HubSpot.
+Processo rígido aprovado por Rafael (30/06): texto, comunicadores, janela e
+defaults ficam fixos em constantes no código, sem LLM/modelo variável.
+
+- Comunicadores fixos: Lucas Resende (4606), Mariana (4600) e Rafael (4607).
+- Texto WhatsApp 100% fixo nas constantes APPROVED_* (build_message só varia
+  primeiro nome, comunicador e a linha de contexto padrão/mismatch).
+- Janela rígida de envio externo: todos os dias, 07h-22h BRT (fail-closed).
+  Fora da janela, --send sai [SILENT] sem enviar; --dry-run continua liberado
+  para auditoria.
+- Gating fail-closed por envio (e-mail gratuito NÃO bloqueia mais): lifecycle
+  atual no HubSpot exatamente "lead", telefone BR normalizável, empresa segura,
+  dedupe local e nenhum envio MQL posterior.
+- Defaults fixos: --limit 999, --sleep 10.
+- Registra wpp_envios.json e cria task no HubSpot.
 
 Uso:
-  python3 scripts/non_mql_legit_outreach.py --dry-run --limit 9
-  python3 scripts/non_mql_legit_outreach.py --send --limit 9
+  python3 scripts/non_mql_legit_outreach.py --dry-run
+  python3 scripts/non_mql_legit_outreach.py --send
   python3 scripts/non_mql_legit_outreach.py --send-current /tmp/non_mql_current.json
 """
 import argparse
@@ -28,8 +38,43 @@ from zoneinfo import ZoneInfo
 PROJ = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJ / 'scripts'))
 import process_gate_once as p  # noqa: E402
+from whatsapp_safe_send import safe_post_bridge  # noqa: E402
+from whatsapp_send_orchestrator import enrich_legacy_row  # noqa: E402
+from whatsapp_dispatch_flow import record_dispatch_shadow_from_row, record_dispatch_worker_owned  # noqa: E402
 
+DISPATCH_QUEUE = PROJ / 'controle' / 'whatsapp_dispatch_queue.json'
+
+PROCESS_ID = 'zydon-nao-mql-tratativa-legitima'
+PROCESS_VERSION = 'rafael-approved-2026-06-30-v1'
 CAMPAIGN = 'nao_mql_legitimo_tratativa'
+MIN_NON_MQL_LEDGER_AGE_HOURS = 0
+FIXED_BRT_TIMEZONE = 'America/Sao_Paulo'
+FIXED_SEND_WEEKDAYS_BRT = (0, 1, 2, 3, 4, 5, 6)  # todos os dias
+FIXED_SEND_START_HOUR_BRT = 7
+FIXED_SEND_END_HOUR_BRT = 22  # exclusivo: 22:00 já bloqueia envio
+DEFAULT_SEND_LIMIT = 999
+DEFAULT_SLEEP_SECONDS = 10
+
+APPROVED_CONTEXT_LINE_STANDARD = (
+    "Vi que vocês demonstraram interesse na Zydon e quis te chamar por aqui para entender melhor."
+)
+APPROVED_CONTEXT_LINE_MISMATCH = (
+    "Vi que vocês demonstraram interesse na Zydon, mas alguns dados do cadastro ficaram desencontrados, "
+    "principalmente nome da empresa e domínio do e-mail. Quis te chamar por aqui para confirmar melhor o contexto."
+)
+APPROVED_PRODUCT_LINE = (
+    "A Zydon é voltada para indústrias, distribuidores e atacadistas que vendem para outras empresas "
+    "e querem organizar pedidos recorrentes em um portal B2B próprio."
+)
+APPROVED_FIT_LINE = (
+    "Pelo que conseguimos entender até aqui, não ficou tão claro se esse é o momento ou o tipo de operação de vocês."
+)
+APPROVED_CTA_LINE = "Como você imagina que a Zydon poderia te ajudar hoje?"
+SENDER_LABELS = {
+    'Rafael': 'o Rafael',
+    'Mariana': 'a Mariana',
+    'Lucas Resende': 'o Lucas Resende',
+}
 SENDERS = [
     {'port': 4606, 'name': 'Lucas Resende', 'intro': 'Aqui é o Lucas Resende, da Zydon, plataforma de eCommerce B2B.'},
     {'port': 4600, 'name': 'Mariana', 'intro': 'Aqui é a Mariana, da Zydon, plataforma de eCommerce B2B.'},
@@ -45,7 +90,23 @@ CONTACT_PROPS = [
 
 
 def now_brt():
-    return datetime.now(ZoneInfo('America/Sao_Paulo'))
+    return datetime.now(ZoneInfo(FIXED_BRT_TIMEZONE))
+
+
+def within_fixed_send_window(dt=None):
+    """Janela rígida aprovada para envio externo Não-MQL.
+
+    O agendador pode acordar mais vezes, mas o próprio código fica fail-closed:
+    nenhum WhatsApp externo sai fora de 07:00-21:59 BRT, todos os dias.
+    """
+    dt = dt or now_brt()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(FIXED_BRT_TIMEZONE))
+    dt = dt.astimezone(ZoneInfo(FIXED_BRT_TIMEZONE))
+    return (
+        dt.weekday() in FIXED_SEND_WEEKDAYS_BRT
+        and FIXED_SEND_START_HOUR_BRT <= dt.hour < FIXED_SEND_END_HOUR_BRT
+    )
 
 
 def load_envios():
@@ -91,9 +152,36 @@ def already_sent(envios, email=None, cid=None, phone=None):
         # Qualquer diagnóstico/MQL posterior ao não-MQL bloqueia para não mandar mensagem contraditória.
         if email and str(e.get('email','')).lower() == email.lower():
             st = str(e.get('status') or e.get('msg_type') or '').lower()
-            if st in {'enviado_lead','primeiro_contato','primeiro_contato_backlog_institucional','primeiro_contato_cadencia'}:
+            if st in {
+                'enviado_lead', 'enviado_mql',
+                'mql_diagnostico_rafael_texto', 'mql_diagnostico_rafael_pdf', 'mql_agenda_sdr_apos_diagnostico',
+                'primeiro_contato', 'primeiro_contato_backlog_institucional', 'primeiro_contato_cadencia',
+            }:
                 return True, f'bloqueado por envio posterior existente: {st}'
     return False, ''
+
+
+def hs_retry(method, path, payload=None, attempts=5, base_sleep=1.8):
+    """HubSpot wrapper local para evitar gargalo 429 SECONDLY derrubando o cron.
+
+    O process_gate_once.hs levanta RuntimeError em 429. Para esta régua de
+    backfill, é melhor esperar poucos segundos e seguir do que quebrar a rodada
+    inteira e repetir o mesmo lote no próximo tick.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            if i:
+                time.sleep(base_sleep * i)
+            return p.hs(method, path, payload)
+        except RuntimeError as e:
+            last = e
+            msg = str(e)
+            if '-> 429:' not in msg and 'RATE_LIMIT' not in msg and 'SECONDLY' not in msg:
+                raise
+            if i == attempts - 1:
+                raise
+    raise last
 
 
 def search_contact_by_email(email):
@@ -102,7 +190,7 @@ def search_contact_by_email(email):
         'properties': CONTACT_PROPS,
         'limit': 10,
     }
-    data = p.hs('POST', '/crm/v3/objects/contacts/search', payload)[1]
+    data = hs_retry('POST', '/crm/v3/objects/contacts/search', payload)[1]
     results = data.get('results') or []
     if not results:
         return None
@@ -138,35 +226,22 @@ def first_name(props):
 
 def build_message(props, research, sender):
     nome = first_name(props)
-    company = safe_company(props, research)
     greeting = f"Oi {nome}, tudo bem?" if nome else "Oi, tudo bem?"
-    empresa_line = f"Pelo que entendemos da {company}, talvez a gente não conseguiria ajudar agora." if company else "Pelo que entendemos, talvez a gente não conseguiria ajudar agora."
-    # Variação determinística por remetente, sem travessão/emoji/reticências.
-    if sender['name'] == 'Mariana':
-        return (
-            f"{greeting}\n\n"
-            f"{sender['intro']}\n\n"
-            "Obrigado pelo interesse de vocês na Zydon. Talvez a gente não tenha conseguido deixar claro o nosso foco.\n\n"
-            "A Zydon atende principalmente indústrias, distribuidores e atacadistas que vendem para outras empresas e querem transformar esse processo em um portal B2B próprio.\n\n"
-            f"{empresa_line}\n\n"
-            "Se nossa leitura estiver errada, me responde aqui que a gente entende melhor o negócio de vocês."
-        )
-    if sender['name'] == 'Rafael':
-        return (
-            f"{greeting}\n\n"
-            f"{sender['intro']}\n\n"
-            "Analisamos o interesse de vocês e acho importante te dar um retorno transparente.\n\n"
-            "Nosso foco é ajudar empresas que vendem para outras empresas, como indústrias, distribuidores e atacadistas, a digitalizar pedidos recorrentes em um portal próprio.\n\n"
-            f"{empresa_line}\n\n"
-            "Se entendemos errado, me chama aqui que a gente conversa melhor."
-        )
+    sender_label = SENDER_LABELS.get(sender['name'], sender['name'])
+    reason_blob = ' '.join(str(research.get(k) or '') for k in ('motivo', 'dominio_site', 'redes', 'segmento')).lower()
+    domain_or_name_mismatch = any(term in reason_blob for term in (
+        'domínio do e-mail', 'dominio do e-mail', 'domínio não bate', 'dominio não bate',
+        'domínio nao bate', 'dominio nao bate', 'nome não bate', 'nome nao bate',
+        'não pertence', 'nao pertence', 'não corresponde', 'nao corresponde',
+    ))
+    context_line = APPROVED_CONTEXT_LINE_MISMATCH if domain_or_name_mismatch else APPROVED_CONTEXT_LINE_STANDARD
     return (
         f"{greeting}\n\n"
-        f"{sender['intro']}\n\n"
-        "Poxa, talvez a gente não tenha conseguido explicar tão bem o foco da Zydon.\n\n"
-        "Hoje ajudamos principalmente indústrias, distribuidores e atacadistas que vendem para outras empresas e querem digitalizar pedidos recorrentes em um portal próprio.\n\n"
-        f"{empresa_line}\n\n"
-        "Se nossa leitura estiver errada, me responde aqui que a gente entende melhor o negócio de vocês."
+        f"Aqui é {sender_label}, da Zydon, plataforma de eCommerce B2B.\n\n"
+        f"{context_line}\n\n"
+        f"{APPROVED_PRODUCT_LINE}\n\n"
+        f"{APPROVED_FIT_LINE}\n\n"
+        f"{APPROVED_CTA_LINE}"
     )
 
 
@@ -217,7 +292,7 @@ def choose_sender(senders, envios, planned):
         pd = planned.get((s['port'], 'day'), 0)
         if hour + ph >= p.MAX_EXTERNAL_PER_PORT_HOUR and not os.environ.get('ZYDON_NON_MQL_IGNORE_HOURLY'):
             continue
-        if day + pd >= p.MAX_EXTERNAL_PER_PORT_DAY:
+        if day + pd >= p.MAX_EXTERNAL_PER_PORT_DAY and not os.environ.get('ZYDON_NON_MQL_IGNORE_DAILY'):
             continue
         candidates.append((s, hour + ph, day + pd))
     if not candidates:
@@ -226,20 +301,43 @@ def choose_sender(senders, envios, planned):
     return candidates[0][0]
 
 
+def is_test_or_dummy_lead(email, props, research):
+    blob = ' '.join(str(x or '') for x in (
+        email,
+        props.get('firstname') if isinstance(props, dict) else '',
+        props.get('company') if isinstance(props, dict) else '',
+        props.get('phone') if isinstance(props, dict) else '',
+        props.get('hs_searchable_calculated_phone_number') if isinstance(props, dict) else '',
+        research.get('empresa_real') if isinstance(research, dict) else '',
+        research.get('slug') if isinstance(research, dict) else '',
+    )).lower()
+    digits = p.only_digits(blob)
+    return any(tok in blob for tok in ('joao@empresa.com.br', 'empresa ltda', 'leo testes', 'leonardo tester')) or '11999999999' in digits or '5511999999999' in digits
+
+
 def candidate_from_research(email, research, envios):
     if research.get('mql') is not False:
         return None, 'não é Não-MQL na pesquisa'
     dom = corporate_domain(email, research)
     if not dom:
-        return None, 'sem domínio corporativo seguro'
+        # Correção Rafael 29/06: a tratativa Não-MQL é retorno para TODO lead
+        # que não é MQL real. E-mail gratuito/sem domínio corporativo não bloqueia
+        # mais; continua bloqueando apenas lifecycle diferente de lead, telefone
+        # ausente/inválido, dedupe ou envio MQL posterior.
+        dom = email_domain(email) or 'sem-dominio-corporativo'
     contact = search_contact_by_email(email)
     if not contact:
         return None, 'contato não encontrado no HubSpot'
     cid = str(contact.get('id'))
     props = contact.get('properties') or {}
+    if is_test_or_dummy_lead(email, props, research):
+        return None, 'base teste/dummy bloqueada'
     lifecycle = (props.get('lifecyclestage') or '').strip().lower()
     # Regra Rafael: só tratar Não-MQL legítimo se o ciclo de vida atual no HubSpot ainda for exatamente LEAD.
+    # Opportunity é oportunidade comercial: NÃO recebe régua Não-MQL; deve seguir/reativar fluxo de diagnóstico/follow-up.
     # Não enviar para subscriber/vazio nem para MQL/SQL/Oportunidade/Cliente, porque pode ter revisão manual ou estágio diferente.
+    if lifecycle == 'opportunity':
+        return None, 'lifecycle opportunity: tratar como nova oportunidade de diagnóstico/follow-up, não como Não-MQL'
     if lifecycle != 'lead':
         return None, f'lifecycle atual bloqueia: {lifecycle or "vazio"}'
     phone = props.get('hs_searchable_calculated_phone_number') or props.get('hs_whatsapp_phone_number') or props.get('phone') or props.get('mobilephone') or ''
@@ -267,9 +365,58 @@ def candidate_from_research(email, research, envios):
     }, ''
 
 
+def _ledger_dt_key(e):
+    dt = p.envio_datetime_brt(e)
+    return dt.isoformat() if dt else str(e.get('date') or '')
+
+
+def ledger_non_mql_research_items(envios):
+    """Puxa Não-MQLs recentes registrados pelo cron de definição mesmo quando não estão no RESEARCH estático.
+
+    Rafael pediu que esta régua olhe a base que o outro cron pontuou como Não-MQL,
+    sempre conferindo o lifecycle atual no HubSpot antes de enviar.
+    """
+    items = []
+    seen = set(p.RESEARCH.keys())
+    cutoff_ts = now_brt().timestamp() - (MIN_NON_MQL_LEDGER_AGE_HOURS * 3600)
+    for e in sorted([x for x in envios if isinstance(x, dict)], key=_ledger_dt_key, reverse=True):
+        email = str(e.get('email') or '').lower().strip()
+        if not email or email in seen:
+            continue
+        status = str(e.get('status') or '').lower()
+        if status != 'nao_mql_grupo':
+            continue
+        dt = p.envio_datetime_brt(e)
+        if dt and dt.timestamp() > cutoff_ts:
+            # Com MIN_NON_MQL_LEDGER_AGE_HOURS=0, só ignora registros com horário futuro
+            # por relógio/log inconsistente. O controle de madrugada/noite fica no cron.
+            continue
+        empresa = str(e.get('empresa') or '').strip()
+        slug = str(e.get('slug') or email.split('@')[0]).strip()
+        domain = email_domain(email)
+        research = {
+            'slug': slug,
+            'mql': False,
+            'empresa_real': empresa or email,
+            'dominio_site': domain,
+            'redes': 'Lead registrado como Não-MQL pelo cron de definição MQL; validar HubSpot em tempo real antes do envio.',
+            'segmento': 'Não-MQL registrado pelo cron de definição MQL',
+            'motivo': 'Lead avaliado como Não-MQL pelo cron de definição. Entrou na régua de tratativa respeitosa somente se o lifecycle atual no HubSpot ainda for lead.',
+            'insight': '',
+        }
+        seen.add(email)
+        items.append((email, research))
+    return items
+
+
 def all_backfill_candidates(limit, envios):
     rows, skips = [], []
-    for email, research in sorted(p.RESEARCH.items(), key=lambda kv: kv[1].get('slug') or kv[0]):
+    items = ledger_non_mql_research_items(envios) + sorted(p.RESEARCH.items(), key=lambda kv: kv[1].get('slug') or kv[0])
+    seen = set()
+    for email, research in items:
+        if email in seen:
+            continue
+        seen.add(email)
         cand, why = candidate_from_research(email, research, envios)
         if cand:
             rows.append(cand)
@@ -282,42 +429,52 @@ def all_backfill_candidates(limit, envios):
 
 def lead_jid(phone):
     d = p.only_digits(phone)
-    if len(d) == 11:
+    if len(d) in (10, 11):
         d = '55' + d
     return d + '@s.whatsapp.net'
 
 
 def post_bridge_short(port, payload, timeout=35):
-    req = urllib.request.Request(
-        f'http://127.0.0.1:{port}/send',
-        data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
-        method='POST',
+    return safe_post_bridge(port, '/send', payload, uid='non_mql_legit_outreach', timeout=timeout)
+
+
+def enqueue_worker_owned_non_mql(cand, sender, msg, jid):
+    alternate_jids = [lead_jid(v) for v in cand.get('phone_variants', [])[1:] if lead_jid(v) != jid]
+    res = record_dispatch_worker_owned(
+        origin='nao_mql',
+        nature='non_mql_outreach',
+        thread_state='cold_outreach',
+        to=jid,
+        text=msg,
+        owner_uid=sender.get('owner') or sender.get('name'),
+        lead_key=cand.get('contact_id') or cand.get('email') or jid,
+        port=sender['port'],
+        sender_role=sender.get('name'),
+        path=DISPATCH_QUEUE,
+        completion_type='non_mql',
+        alternate_jids=alternate_jids,
+        email=cand.get('email'),
+        contact_id=cand.get('contact_id'),
+        slug=cand.get('slug'),
+        empresa=cand.get('company'),
+        phone=cand.get('phone'),
+        sender_name=sender.get('name'),
+        campaign_id=CAMPAIGN,
+        msg_type=CAMPAIGN,
+        reason=cand.get('reason'),
+        deals=cand.get('deals') or [],
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            txt = resp.read().decode('utf-8', errors='replace')
-            try:
-                return json.loads(txt)
-            except Exception:
-                return {'raw': txt}
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors='replace')
-        try:
-            data = json.loads(body)
-        except Exception:
-            data = {'raw': body}
-        data['http_error'] = e.code
-        return data
-    except Exception as e:
-        return {'error': str(e), 'timeout_seconds': timeout}
+    return res
 
 
-def send_one(cand, sender, envios, dry_run=False):
+def send_one(cand, sender, envios, dry_run=False, worker_owned=False):
     msg = build_message(cand['props'], cand['research'], sender)
     jid = lead_jid(cand['phone'])
     if dry_run:
         return {'dry_run': True, 'to': jid, 'text': msg}
+    if worker_owned:
+        res = enqueue_worker_owned_non_mql(cand, sender, msg, jid)
+        return {'ok': bool(res.get('ok')), 'mode': 'worker_owned', 'to': jid, 'dispatch_id': res.get('dispatch_id'), 'deduped': bool(res.get('deduped')), 'text': msg}
     # Uma tentativa curta: se a bridge/Baileys travar para número sem WhatsApp,
     # não prender o cron de MQL por 5+ minutos nem repetir mensagem incerta.
     resp = post_bridge_short(sender['port'], {'to': jid, 'text': msg}, timeout=35)
@@ -333,13 +490,7 @@ def send_one(cand, sender, envios, dry_run=False):
             resp = alt_resp
     if not p.message_ok(resp):
         return {'ok': False, 'to': jid, 'response': resp, 'attempts': attempts, 'text': msg}
-    task_body = (
-        f"Tratativa Não-MQL legítimo enviada para {jid} pela porta {sender['port']} ({sender['name']}).\n\n"
-        f"Mensagem:\n{msg}\n\n"
-        f"Motivo interno da não qualificação:\n{cand['reason']}"
-    )
-    task_id = p.create_task(cand['contact_id'], cand['deals'], 'WhatsApp — tratativa lead legítimo, mas não-MQL', task_body, None)
-    entry = {
+    entry = enrich_legacy_row({
         'date': now_brt().strftime('%Y-%m-%d %H:%M:%S'),
         'date_tz': now_brt().isoformat(),
         'email': cand['email'],
@@ -354,11 +505,28 @@ def send_one(cand, sender, envios, dry_run=False):
         'msg_type': CAMPAIGN,
         'status': 'enviado_nao_mql_legitimo',
         'text': msg,
+        'messageId': resp.get('messageId') or resp.get('id'),
+        'send_status': resp.get('status'),
         'response': resp,
-        'task_id': task_id,
-    }
+        'task_id': None,
+        'note': 'Ledger salvo imediatamente após /send para impedir reenvio se HubSpot task demorar/falhar.',
+    }, nature='non_mql_outreach', origin='cron_non_mql_legit_outreach', thread_state='cold_outreach', owner_uid=sender.get('owner') or sender.get('name'))
+    record_dispatch_shadow_from_row(entry, origin='nao_mql', nature='non_mql_outreach', thread_state='cold_outreach')
     envios.append(entry)
     save_envios(envios)
+    task_id = None
+    try:
+        task_body = (
+            f"Tratativa Não-MQL legítimo enviada para {jid} pela porta {sender['port']} ({sender['name']}).\n\n"
+            f"Mensagem:\n{msg}\n\n"
+            f"Motivo interno da não qualificação:\n{cand['reason']}"
+        )
+        task_id = p.create_task(cand['contact_id'], cand['deals'], 'WhatsApp — tratativa lead legítimo, mas não-MQL', task_body, None)
+        entry['task_id'] = task_id
+        save_envios(envios)
+    except Exception as e:
+        entry['task_error'] = str(e)[:500]
+        save_envios(envios)
     return {'ok': True, 'to': jid, 'messageId': resp.get('messageId'), 'response': resp, 'task_id': task_id, 'text': msg}
 
 
@@ -370,6 +538,8 @@ def load_current(path, envios):
     if data.get('contact_id') and data.get('props'):
         props = data['props']
         lifecycle = (props.get('lifecyclestage') or '').strip().lower()
+        if lifecycle == 'opportunity':
+            return None, 'lifecycle opportunity: tratar como nova oportunidade de diagnóstico/follow-up, não como Não-MQL'
         if lifecycle != 'lead':
             return None, f'lifecycle atual bloqueia: {lifecycle or "vazio"}'
         phone = props.get('hs_searchable_calculated_phone_number') or props.get('hs_whatsapp_phone_number') or props.get('phone') or props.get('mobilephone') or data.get('phone') or ''
@@ -401,11 +571,16 @@ def main():
     mode.add_argument('--dry-run', action='store_true')
     mode.add_argument('--send', action='store_true')
     mode.add_argument('--send-current', metavar='JSON')
-    ap.add_argument('--limit', type=int, default=9)
-    ap.add_argument('--sleep', type=int, default=20)
+    ap.add_argument('--limit', type=int, default=DEFAULT_SEND_LIMIT)
+    ap.add_argument('--sleep', type=int, default=DEFAULT_SLEEP_SECONDS)
     args = ap.parse_args()
+    worker_owned = str(os.environ.get('ZYDON_NON_MQL_WORKER_OWNED') or '').lower() in {'1', 'true', 'yes', 'on'}
 
-    if not args.dry_run and not os.environ.get('ZYDON_SKIP_SEND_LOCK') and not p.acquire_global_send_lock(blocking=False):
+    if not args.dry_run and not within_fixed_send_window():
+        print('[SILENT] fora da janela fixa Não-MQL 07h-22h BRT todos os dias')
+        return
+
+    if not args.dry_run and not worker_owned and not os.environ.get('ZYDON_SKIP_SEND_LOCK') and not p.acquire_global_send_lock(blocking=False):
         print('[SILENT] lock ocupado')
         return
     envios = load_envios()
@@ -433,7 +608,7 @@ def main():
             continue
         planned[(sender['port'], 'hour')] = planned.get((sender['port'], 'hour'), 0) + 1
         planned[(sender['port'], 'day')] = planned.get((sender['port'], 'day'), 0) + 1
-        result = send_one(cand, sender, envios, dry_run=args.dry_run)
+        result = send_one(cand, sender, envios, dry_run=args.dry_run, worker_owned=worker_owned)
         results.append({
             'email': cand['email'], 'contact_id': cand['contact_id'], 'empresa': cand['company'],
             'slug': cand['slug'], 'sender': sender['name'], 'port': sender['port'], 'result': result,
@@ -443,6 +618,8 @@ def main():
 
     print(json.dumps({
         'ok': True,
+        'process_id': PROCESS_ID,
+        'process_version': PROCESS_VERSION,
         'mode': 'dry-run' if args.dry_run else 'send-current' if args.send_current else 'send',
         'eligible_count': len(candidates),
         'sender_errors': sender_errors,
